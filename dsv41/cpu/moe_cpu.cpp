@@ -256,9 +256,10 @@ static inline float pow2_ceil_log2(float a) {  // 2^ceil(log2 a)
 }
 
 // silu(gate)*up with clamps, times routing weight, bf16 rounding, then FP8 fake quant per 32 -> h (bf16)
-static void swiglu_quant_row(const float* gu, int inter, float wt, float limit, uint16_t* h) {
+// for columns [b0, b1) of one expert
+static void swiglu_quant_cols(const float* gu, int inter, float wt, float limit, uint16_t* h, int b0, int b1) {
     float tmp[32];
-    for (int b = 0; b < inter; b += 32) {
+    for (int b = b0; b < b1; b += 32) {
         float amax = 1e-4f;
         for (int j = 0; j < 32; ++j) {
             float g = gu[b + j], u = gu[inter + b + j];
@@ -315,11 +316,15 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
     }
     if (dbg) t2 = omp_get_wtime();
     // stage 2: h[e] = fp8(bf16(wt * silu(gate) * up)) (+ int8 quantization for the w2 GEMV)
-#pragma omp parallel for
-    for (int e = 0; e < E; ++e) {
-        pin_self();
-        swiglu_quant_row(gu + (size_t)e * N13, inter, wts[e], limit, h + (size_t)e * inter);
-        if (g_int8) quant_x_u8(h + (size_t)e * inter, inter, hu + (size_t)e * inter, sh + (size_t)e * (inter / 32));
+    {   // parallel over (expert, 256-column block); the int8 quantization of h is per 32 columns, so blocks are independent
+        const int CB = 256, nb = inter / CB;
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < E * nb; ++i) {
+            pin_self();
+            int e = i / nb, b0 = (i % nb) * CB;
+            swiglu_quant_cols(gu + (size_t)e * N13, inter, wts[e], limit, h + (size_t)e * inter, b0, b0 + CB);
+            if (g_int8) quant_x_u8(h + (size_t)e * inter + b0, CB, hu + (size_t)e * inter + b0, sh + (size_t)e * (inter / 32) + b0 / 32);
+        }
     }
     if (dbg) t3 = omp_get_wtime();
     // stage 3: out[n] = sum_e h[e] . w2[e][n]
