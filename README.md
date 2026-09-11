@@ -124,6 +124,9 @@ This is the `--offload-experts` mode. It has two variants:
   routing profile, `--route-stats` / `results/route_stats.pt`; on this text the top 20% of experts take
   82% of the hits) also live on the GPU and are computed there together with the shared expert while the
   CPU computes the cold ones; the two partial sums are added. Uses ~49 GB more GPU memory for 64/layer.
+  Measured: **21 tok/s** on an English prompt in the profile's domain (73% of expert hits on the GPU,
+  CPU 35-40 ms/token, GPU 21 ms/token); 11.7 tok/s on a Japanese prompt where only 20% hit. The profile is
+  static for now, so the next step is an adaptive (usage-based) replacement policy.
 - `--offload-experts gpu`: the experts are DMA'd from pinned RAM into a GPU staging buffer and computed on
   the GPU. 4.5 GB per token over PCIe 4.0 x16 (25 GB/s measured) → **2.3 tok/s**. Kept for reference.
 
