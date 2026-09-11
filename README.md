@@ -187,8 +187,20 @@ when its free memory is fragmented, and that node's threads run at half speed), 
 Several sequences at once (`--batch B`, the rows advance in lockstep; `--batch-prompts FILE` for distinct
 prompts): the dense weights are read once per step for all rows and the (token, expert) pairs are bucketed by
 expert on the device, so an expert's weights are read once for all the tokens routed to it. Aggregate
-throughput with identical prompts (the best case for bucketing): pipeline B=8 146 tok/s, B=16 169 tok/s;
-expert parallelism over 7 GPUs B=4 150, B=8 231, B=16 302 tok/s (53 ms per step).
+throughput with 16 / 32 distinct prompts (`dsv41/batch_prompts*.txt`), routing messages by copy engine for
+large batches:
+
+| configuration | B=1 | B=8 | B=16 | B=32 |
+|---|---|---|---|---|
+| 8-GPU layer pipeline | 52 | – | 201 | – |
+| expert parallelism, 8 GPUs | 64 | – | 397 (40 ms/step) | – |
+| expert parallelism, 4 GPUs (2,3,0,1) | 64 | 248 | 365 (44 ms) | 456 (70 ms) |
+| two independent 4-GPU replicas (all 8 GPUs) | – | – | 714 | **911 tok/s** |
+
+A 4-GPU group is as fast as an 8-GPU one per step (the per-layer critical path is the owner's attention
+and dense part, not the expert reads), so two 4-GPU replicas give twice the throughput of one 8-GPU
+group. With the measured DSpark acceptance (3.13 tokens per verified step) the two-replica B=32
+configuration would reach ~2,800 tok/s if verification were free; that verification step is the next thing to build.
 
 GPU time per token on the pipeline: FP8 dense 6.3 ms, FP4 experts 5.0 ms, the rest ~8 ms (attention,
 indexer top-k, small fused kernels). Prefill of a 1,413-token prompt: 4.8 s (296 tok/s). Load: ~70 s with
