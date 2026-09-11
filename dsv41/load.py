@@ -172,10 +172,16 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
         placement = [torch.device(f"cuda:{devices[min(i * nd // n_layers, nd - 1)]}") for i in range(n_layers)]
         E = cfg["n_routed_experts"]
         if ep_shards:
-            assert len(ep_shards) == nd and sum(ep_shards) == E, (ep_shards, E)
-            bounds = [sum(ep_shards[:j]) for j in range(nd + 1)]
+            if len(ep_shards) != nd or sum(ep_shards) != E:
+                raise ValueError(f"--ep-shards must list {nd} counts summing to {E} experts (got {ep_shards}, sum {sum(ep_shards)}); "
+                                 f"every expert lives on exactly one GPU in --ep mode")
         else:
-            bounds = [E * j // nd for j in range(nd + 1)]
+            # the last device also holds the output head, the logits and (with MTP) the 3 DSpark blocks (~7 GB):
+            # give it 12 experts fewer (4 x A100 80GB: 100,100,100,84)
+            n_last = max(1, E // nd - 12) if nd > 1 else E
+            rest, extra = divmod(E - n_last, max(nd - 1, 1))
+            ep_shards = [rest + (1 if j < extra else 0) for j in range(nd - 1)] + [n_last] if nd > 1 else [E]
+        bounds = [sum(ep_shards[:j]) for j in range(nd + 1)]
         ep_shards = [(torch.device(f"cuda:{devices[j]}"), bounds[j], bounds[j + 1] - bounds[j]) for j in range(nd)]
         print("expert shards:", {str(d): n for d, _, n in ep_shards}, flush=True)
     else:

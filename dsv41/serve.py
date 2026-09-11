@@ -162,10 +162,11 @@ def main():
     ap.add_argument("--hot-stats", default="", help="route stats .pt used to pick the hot experts (default: results/route_stats.pt)")
     ap.add_argument("--ep", action="store_true", help="expert parallelism: experts sharded over the devices (e.g. --devices 2,3,0,1 --ep-shards 100,100,100,84)")
     ap.add_argument("--ep-shards", default="", help="experts per device for --ep (default: even split)")
+    ap.add_argument("--mtp", type=int, default=0, help="speculative decoding: DSpark drafts verified per step (3-5; 0 = off)")
     a = ap.parse_args()
     kw = dict(devices=[int(d) for d in a.devices.split(",")], max_seq_len=a.max_seq_len, budgets=parse_budgets(a.budgets),
               use_graphs=not a.no_graphs, offload_experts=a.offload_experts, hot_experts=a.hot_experts, route_stats=a.hot_stats,
-              ep=a.ep, ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None)
+              ep=a.ep, ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None, mtp=a.mtp)
     ENGINE = Engine(a.ckpt, **kw) if a.ckpt else Engine(**kw)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print(f"serving OpenAI-compatible API on http://{a.host}:{a.port}/v1 (model '{ENGINE.model_name}')", flush=True)

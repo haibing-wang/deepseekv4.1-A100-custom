@@ -26,10 +26,11 @@ def main():
     ap.add_argument("--hot-stats", default="", help="route stats .pt used to pick the hot experts (default: results/route_stats.pt)")
     ap.add_argument("--ep", action="store_true", help="expert parallelism: experts sharded over the devices (e.g. --devices 2,3,0,1 --ep-shards 100,100,100,84)")
     ap.add_argument("--ep-shards", default="", help="experts per device for --ep (default: even split)")
+    ap.add_argument("--mtp", type=int, default=0, help="speculative decoding: DSpark drafts verified per step (3-5; 0 = off)")
     a = ap.parse_args()
     kw = dict(devices=[int(d) for d in a.devices.split(",")], max_seq_len=a.max_seq_len, budgets=parse_budgets(a.budgets),
               use_graphs=not a.no_graphs, thinking_mode="thinking" if a.thinking else "chat", offload_experts=a.offload_experts, hot_experts=a.hot_experts, route_stats=a.hot_stats,
-              ep=a.ep, ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None)
+              ep=a.ep, ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None, mtp=a.mtp)
     eng = Engine(a.ckpt, **kw) if a.ckpt else Engine(**kw)
     print("DeepSeek-V4.1-Flash on A100. /clear /system <text> /exit", flush=True)
     messages: list[dict] = []
@@ -69,7 +70,9 @@ def main():
         dt = time.time() - t0
         completion = "".join(text)
         messages.append(eng.parse_completion(completion))
-        print(f"\n[{n} tokens, {n / max(dt, 1e-9):.1f} tok/s, prompt {len(ids)} tokens]")
+        st = getattr(eng, "last_stats", {"prefill_s": 0.0, "tokens": n})
+        n_tok, pre = st["tokens"], st["prefill_s"]
+        print(f"\n[{n_tok} tokens, {n_tok / max(dt - pre, 1e-9):.1f} tok/s decode, prompt {len(ids)} tokens in {pre:.2f} s]")
 
 
 if __name__ == "__main__":
