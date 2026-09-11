@@ -196,16 +196,16 @@ def p2p_copy(dst: torch.Tensor, src: torch.Tensor, device: torch.device):
     launch(f, ((n16 + 255) // 256, 1, 1), (256, 1, 1), [ctypes.c_void_p(dst.data_ptr()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(n16)], device)
 
 
-def p2p_copy_row(dst_base: torch.Tensor, row_idx: torch.Tensor, src: torch.Tensor, device: torch.device):
-    """dst_base[b, row_idx] = src[b] for every batch row b (dst_base: [B, rows, D], src: [B, 1, D]; row index: int64 device scalar)."""
-    B = dst_base.shape[0]
+def p2p_copy_row(dst_base: torch.Tensor, row_idx: torch.Tensor, src: torch.Tensor, device: torch.device, seq: torch.Tensor):
+    """dst_base[seq[b], row_idx[b]] = src[b] for every row b (dst_base: [S, rows, D]; src: [B, 1, D]; row_idx, seq: int64 [B])."""
+    B = src.shape[0]
     n = src.numel() * src.element_size() // B
-    assert n % 16 == 0 and src.numel() == B * dst_base.shape[-1]
+    assert n % 16 == 0 and src.shape[-1] == dst_base.shape[-1]
     f = get_function("p2p.cu", "p2p_copy_row", device)
     row16 = n // 16
     bstride16 = dst_base.stride(0) * dst_base.element_size() // 16
     launch(f, ((row16 * B + 255) // 256, 1, 1), (256, 1, 1), [ctypes.c_void_p(dst_base.data_ptr()), ctypes.c_void_p(row_idx.data_ptr()), ctypes.c_void_p(src.data_ptr()),
-                                                            ctypes.c_int(row16), ctypes.c_int(B), ctypes.c_longlong(bstride16)], device)
+                                                            ctypes.c_int(row16), ctypes.c_int(B), ctypes.c_longlong(bstride16), ctypes.c_void_p(seq.data_ptr())], device)
 
 
 def p2p_sum_rows(dst: torch.Tensor, src: torch.Tensor, device: torch.device, groups: int = 1, dst_stride: int | None = None):

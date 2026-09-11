@@ -150,6 +150,11 @@ class Compressor:
             shape = (args.max_batch_size, self.ratio, args.head_dim)
             self.kv_state = torch.zeros(shape, dtype=torch.float32, device=device)
             self.score_state = torch.full(shape, -torch.inf, dtype=torch.float32, device=device)
+            # ring of the raw kv / score of the last RING positions per sequence (slot = position % RING): the static
+            # per-row path pools a pair from it, so several positions of one sequence can be in flight at once
+            self.RING = 8
+            self.kv_ring = torch.zeros(args.max_batch_size, self.RING, args.head_dim, dtype=torch.float32, device=device)
+            self.score_ring = torch.full((args.max_batch_size, self.RING, args.head_dim), -torch.inf, dtype=torch.float32, device=device)
 
     def __call__(self, x: torch.Tensor, start_pos: int) -> torch.Tensor | None:
         bsz, seqlen, _ = x.size()
@@ -158,6 +163,10 @@ class Compressor:
             return rmsnorm(F.linear(x, self.wkv), self.norm_w, self.eps)
         xf = x.float()
         kv, score = F.linear(xf, self.wkv), F.linear(xf, self.wgate)
+        n_ring = min(self.RING, seqlen)  # keep the last positions in the ring
+        for j in range(seqlen - n_ring, seqlen):
+            self.kv_ring[:bsz, (start_pos + j) % self.RING] = kv[:, j]
+            self.score_ring[:bsz, (start_pos + j) % self.RING] = score[:, j]
         if start_pos == 0:
             should = seqlen >= ratio
             rem = seqlen % ratio

@@ -8,13 +8,13 @@ extern "C" __global__ void p2p_copy(uint4* __restrict__ dst, const uint4* __rest
     if (i < n16) dst[i] = src[i];
 }
 
-// for every batch row b: copy row `row16` uint4 from src[b] into dst_base + b * bstride16 + row_idx * row16
+// for every row b: copy row `row16` uint4 from src[b] into dst_base + seq[b] * bstride16 + row_idx[b] * row16
 extern "C" __global__ void p2p_copy_row(uint4* __restrict__ dst_base, const long long* __restrict__ row_idx, const uint4* __restrict__ src,
-                                       int row16, int nb, long long bstride16) {
+                                       int row16, int nb, long long bstride16, const long long* __restrict__ seq) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= row16 * nb) return;
     int b = i / row16, j = i - b * row16;
-    dst_base[b * bstride16 + (long long)(*row_idx) * row16 + j] = src[i];
+    dst_base[seq[b] * bstride16 + row_idx[b] * row16 + j] = src[i];
 }
 
 // per group g (< groups): dst[g * dst_stride + i] = sum over `rows` rows of src[(g * rows + r) * n + i]

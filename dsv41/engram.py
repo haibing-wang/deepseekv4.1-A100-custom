@@ -99,6 +99,21 @@ class NgramHashState:
         self.cache = torch.empty(max_batch, max_seq, dtype=torch.int64, device=device)
 
     @torch.inference_mode()
+    def rows(self, input_ids: torch.Tensor, seq: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Per-row decode: input_ids [B] at positions pos [B] of sequences seq [B] -> hash ids [B, 1, n_layers, n_hash_cols]."""
+        B = input_ids.shape[0]
+        compressed = self.token_map[input_ids]
+        self.cache[seq, pos] = compressed
+        hist = self.cache[seq]  # [B, max_seq]
+        positions = pos.view(B, 1)
+        tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
+        for shift in range(self.layout.max_ngram_size):
+            source = hist.gather(1, (positions - shift).clamp_min(0))
+            blocked = blocked | (positions < shift) | (source == self.DEAD)
+            tokens.append(torch.where(blocked, self.pad_id, source))
+        tokens = torch.stack(tokens, dim=-1)  # [B, 1, max_ngram]
+        return self._hash(tokens)
+
     def __call__(self, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
         """input_ids [B, L] -> hash ids [B, L, n_engram_layers, n_hash_cols] (int64, on device)."""
         batch, seqlen = input_ids.shape
@@ -111,6 +126,9 @@ class NgramHashState:
             blocked = blocked | (positions < shift) | (source == self.DEAD)
             tokens.append(torch.where(blocked, self.pad_id, source))
         tokens = torch.stack(tokens, dim=-1)  # [B, L, max_ngram]
+        return self._hash(tokens)
+
+    def _hash(self, tokens: torch.Tensor) -> torch.Tensor:
         products = tokens.unsqueeze(2) * self.multipliers  # [B, L, n_layers, max_ngram]
         rolling, hashes = products[..., 0], []
         for i in range(1, self.layout.max_ngram_size):

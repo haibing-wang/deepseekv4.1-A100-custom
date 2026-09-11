@@ -44,9 +44,10 @@ class DecodeRuntime:
                 self.segments.append((blk.device, [blk]))
         self.devices = [d for d, _ in self.segments]
         hc, dim = self.cfg["hc_mult"], self.cfg["dim"]
-        B = self.B = args.max_batch_size  # sequences decoded together (all at the same position)
-        # per-batch-row positions (one value replicated: the rows advance in lockstep)
+        B = self.B = args.max_batch_size  # rows decoded together; row r is a token at position pos[r] of sequence seq[r]
         self.pos = {d: torch.zeros(B, dtype=torch.int64, device=d) for d in self.devices}
+        self.seq = {d: torch.arange(B, dtype=torch.int64, device=d) for d in self.devices}
+        self.pmax = {d: torch.zeros(B, dtype=torch.int64, device=d) for d in self.devices}  # newest position written to the row's sequence this step
         self.h_in = {d: torch.zeros(B, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devices}
         self.h_out = {d: torch.zeros(B, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devices}
         self.pre_in = {d: torch.zeros(B, 1, hc, dtype=torch.float32, device=d) for d in self.devices}
@@ -67,8 +68,8 @@ class DecodeRuntime:
         for blk in model.blocks:
             if blk.attn.is_kv_source:
                 d = blk.device
-                self.kv_row[blk.layer_id] = (torch.zeros(B, 1, self.cfg["head_dim"], dtype=torch.bfloat16, device=d), torch.zeros(1, dtype=torch.int64, device=d))
-                self.ik_row[blk.layer_id] = (torch.zeros(B, 1, self.cfg["index_head_dim"], dtype=torch.bfloat16, device=d), torch.zeros(1, dtype=torch.int64, device=d))
+                self.kv_row[blk.layer_id] = (torch.zeros(B, 1, self.cfg["head_dim"], dtype=torch.bfloat16, device=d), torch.zeros(B, dtype=torch.int64, device=d))
+                self.ik_row[blk.layer_id] = (torch.zeros(B, 1, self.cfg["index_head_dim"], dtype=torch.bfloat16, device=d), torch.zeros(B, dtype=torch.int64, device=d))
         self.arange_win = {d: torch.arange(self.win, device=d) for d in self.devices}
         # DSpark: the attention inputs of the target layers (mean over the hc copies), captured inside the graphs
         self.target_layers = list(self.cfg.get("dspark_target_layer_ids", []))
@@ -86,23 +87,22 @@ class DecodeRuntime:
     def attention2(self, A: Attention, x: torch.Tensor, xq: torch.Tensor, d: torch.device) -> torch.Tensor:
         """x: rmsnorm output bf16 [B, dim] (unquantized, for the compressor/indexer); xq: its fp8 fake-quantized copy."""
         B = x.shape[0]
-        pos = self.pos[d]
-        pos0 = pos[0]  # the rows share the position
+        pos, seq, pmax = self.pos[d], self.seq[d], self.pmax[d]
         rd, eps = self.rd, A.eps
         qr = norm_quant(linear_w(xq, A.wq_a), A.q_norm_w, eps)  # q_norm output, already fp8-rounded for wq_b / indexer
         q = linear_w(qr, A.wq_b).view(B, 1, A.n_heads, A.head_dim)
         rope_dev_(q, rd, A.cos, A.sin, pos)
-        kv_write(linear_w(xq, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps)
+        kv_write(linear_w(xq, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps, seq)
         if A.ratio:
             ratio = A.ratio
-            compress_len = torch.div(pos0 + 1, ratio, rounding_mode="floor")
+            compress_len = torch.div(pos + 1, ratio, rounding_mode="floor")  # [B]
             latent = None
             x3 = x.view(B, 1, -1)
             if A.is_kv_source:
                 self.kv_owner = A.layer_id
-                latent, should = self.compressor(A, x3, pos0)
+                latent, should = self.compressor2(A, x3, pos, seq)
                 cache = self.m.shared.compress_kv[(A.layer_id, d)]
-                row = torch.where(should, compress_len - 1, torch.full_like(compress_len, cache.shape[1] - 1))
+                row = torch.where(should, compress_len - 1, torch.full_like(compress_len, cache.shape[1] - 1))  # [B]
             if A.is_index_source:
                 idxs = self.indexer(A, x3, qr.view(B, 1, -1), latent, pos, compress_len, d, row if A.is_kv_source else None)
                 self.topk_buf[d].copy_(idxs)
@@ -112,14 +112,14 @@ class DecodeRuntime:
                 latent = latent.contiguous()
                 rope_dev_(latent, rd, A.cos, A.sin, pos, add=1 - ratio)
                 latent = fake_quant_fp4(latent, 16, scale_e4m3=True)
-                cache.index_copy_(1, row.view(1), latent)
+                cache[seq, row] = latent[:, 0]
                 val, idx = self.kv_row[A.layer_id]
                 val.copy_(latent)
-                idx.copy_(row.view(1))
+                idx.copy_(row)
             ckv = self.m.shared.compress_kv[(self.kv_owner, d)]
-            o = sattn2(q, A.window_kv_cache, ckv, idxs, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale)
+            o = sattn2(q, A.window_kv_cache, ckv, idxs, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale, seq, pmax)
         else:
-            o = sattn2(q, A.window_kv_cache, None, None, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale)
+            o = sattn2(q, A.window_kv_cache, None, None, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale, seq, pmax)
         o = oproj_a(o.view(B, 1, A.n_groups, -1), A.wo_a, A.n_groups, A.o_lora_rank)
         return linear_fp8(o, A.wo_b)
 
@@ -181,6 +181,28 @@ class DecodeRuntime:
         should = torch.remainder(pos + 1, C.ratio) == 0
         return rmsnorm(pooled.to(x.dtype), C.norm_w, C.eps), should
 
+    def compressor2(self, A: Attention, x: torch.Tensor, pos: torch.Tensor, seq: torch.Tensor):
+        """Per-row compressor: x [B, 1, dim] at positions pos of sequences seq. The raw kv / gate score of every position
+        go to the sequence's ring (slot = pos % RING); a row whose position closes a group pools the group's members
+        from the ring (ratio 2: this position and the previous one). Returns (latent [B, 1, D], should [B] bool)."""
+        C = A.compressor
+        B = x.shape[0]
+        if C.ratio == 1:
+            latent = rmsnorm(F.linear(x, C.wkv), C.norm_w, C.eps)
+            return latent, torch.ones(B, dtype=torch.bool, device=x.device)
+        assert C.ratio == 2
+        xf = x.float()
+        kv, score = F.linear(xf, C.wkv)[:, 0], F.linear(xf, C.wgate)[:, 0]
+        R = C.RING
+        C.kv_ring[seq, pos % R] = kv
+        C.score_ring[seq, pos % R] = score
+        prev = (pos - 1) % R
+        kv2 = torch.stack([C.kv_ring[seq, prev], kv], dim=1)  # [B, 2, D]
+        sc2 = torch.stack([C.score_ring[seq, prev], score], dim=1)
+        pooled = (kv2 * sc2.softmax(dim=1)).sum(dim=1, keepdim=True)
+        should = torch.remainder(pos + 1, C.ratio) == 0
+        return rmsnorm(pooled.to(x.dtype), C.norm_w, C.eps), should
+
     def indexer(self, A: Attention, x, qr, latent, pos, compress_len, d, row):
         I = A.indexer
         ratio, rd = I.ratio, self.rd
@@ -190,27 +212,34 @@ class DecodeRuntime:
             rope_dev_(k, rd, I.cos, I.sin, pos, add=1 - ratio)
             k = fake_quant_fp4(k, 32)
             cache = self.m.shared.index_k[(A.layer_id, d)]
-            cache.index_copy_(1, row.view(1), k)
+            if FUSED2:
+                cache[self.seq[d], row] = k[:, 0]
+            else:
+                cache.index_copy_(1, row.view(1), k)
             val, idx = self.ik_row[A.layer_id]
             val.copy_(k)
-            idx.copy_(row.view(1))
+            idx.copy_(row.view(-1))
+        B = qr.shape[0]
         q = linear_fp8(qr, I.wq_b).unflatten(-1, (I.n_heads, I.head_dim))
         rope_dev_(q, rd, I.cos, I.sin, pos)
         q = fake_quant_fp4(q, 32)
-        index_k = self.m.shared.index_k[(self.index_owner, d)]  # [1, max_c + 1, 128] (last row = dummy)
+        index_k = self.m.shared.index_k[(self.index_owner, d)]  # [S, max_c + 1, 128] (last row = dummy)
+        if FUSED2:
+            index_k = index_k.index_select(0, self.seq[d])  # the row's sequence
         weights = F.linear(x, I.weights_proj) * (I.softmax_scale * I.n_heads**-0.5)
         score = torch.einsum("bshd,btd->bsht", q.float(), index_k.float())
-        score = (score.relu_() * weights.float().unsqueeze(-1)).sum(dim=2)  # [1, 1, max_c + 1]
+        score = (score.relu_() * weights.float().unsqueeze(-1)).sum(dim=2)  # [B, 1, max_c + 1]
         n_pos = score.shape[-1]
-        score = score.masked_fill(torch.arange(n_pos, device=d) >= compress_len, -torch.inf)
+        cl = compress_len.view(-1, 1, 1) if compress_len.dim() else compress_len
+        score = score.masked_fill(torch.arange(n_pos, device=d) >= cl, -torch.inf)
         if I.is_candidate_source:
-            cand = select_candidate_blocks(score, compress_len, I.candidate_topk_blocks, I.candidate_block_size)
+            cand = select_candidate_blocks(score, cl, I.candidate_topk_blocks, I.candidate_block_size)
             self.cand_buf[d][..., :n_pos].copy_(cand)
         elif I.uses_candidates:
             score = score.masked_fill(~self.cand_buf[d][..., :n_pos], -torch.inf)
         idxs = score.topk(self.topk, dim=-1, sorted=False).indices.sort(dim=-1).values
         if FUSED2:
-            return torch.where(idxs < compress_len, idxs, -1).to(torch.int32)
+            return torch.where(idxs < cl, idxs, -1).to(torch.int32)
         return torch.where(idxs < compress_len, idxs + self.win, -1).to(torch.int32)
 
     # ------------------------------------------------------------------ block / segment
@@ -397,10 +426,10 @@ class DecodeRuntime:
             if lid in self.kv_row:
                 val, idx = self.kv_row[lid]
                 for dd in later:
-                    self.m.shared.compress_kv[(lid, dd)].index_copy_(1, idx.to(dd, non_blocking=True), val.to(dd, non_blocking=True))
+                    self.m.shared.compress_kv[(lid, dd)][self.seq[dd], idx.to(dd, non_blocking=True)] = val[:, 0].to(dd, non_blocking=True)
                 val, idx = self.ik_row[lid]
                 for dd in later:
-                    self.m.shared.index_k[(lid, dd)].index_copy_(1, idx.to(dd, non_blocking=True), val.to(dd, non_blocking=True))
+                    self.m.shared.index_k[(lid, dd)][self.seq[dd], idx.to(dd, non_blocking=True)] = val[:, 0].to(dd, non_blocking=True)
         nd = later[0]
         self.topk_buf[nd].copy_(self.topk_buf[d], non_blocking=True)
         self.cand_buf[nd].copy_(self.cand_buf[d], non_blocking=True)
@@ -423,24 +452,56 @@ class DecodeRuntime:
                 self.graphs[d] = g
         torch.cuda.synchronize()
 
-    @torch.inference_mode()
-    def step(self, token, pos: int) -> torch.Tensor:
-        """One decode step for the token(s) at `pos` (an int, or one per batch row); returns logits [B, vocab] on the last device."""
-        if isinstance(token, int):
-            self.tok.fill_(token)
-        else:
-            self.tok.copy_(torch.as_tensor(token, dtype=torch.int64).view(-1, 1))
+    def copy_seq(self, src: int, dst: int):
+        """Copy every per-sequence state (window rings, compressed caches, index keys, compressor rings, Engram history)
+        from sequence slot src to slot dst (used to prefill sequences one at a time into slot 0)."""
+        for blk in self.m.blocks:
+            A = blk.attn
+            A.window_kv_cache[dst].copy_(A.window_kv_cache[src])
+            C = A.compressor
+            if C is not None and C.ratio > 1:
+                for t in (C.kv_ring, C.score_ring, C.kv_state, C.score_state):
+                    t[dst].copy_(t[src])
+        for cache in list(self.m.shared.compress_kv.values()) + list(self.m.shared.index_k.values()):
+            cache[dst].copy_(cache[src])
+        if self.m.engram_hash is not None:
+            self.m.engram_hash.cache[dst].copy_(self.m.engram_hash.cache[src])
+
+    def set_rows(self, token, pos, seq=None, pmax=None):
+        """Fill the row tables: token(s), position(s), sequence id per row (default 0..B-1) and the newest position
+        written to each row's sequence this step (default: the row's own position). Ints are broadcast."""
+        B = self.B
+        as_rows = lambda v, dt: torch.full((B,), int(v), dtype=dt) if isinstance(v, int) else torch.as_tensor(v, dtype=dt).view(-1)
+        tok = as_rows(token, torch.int64)
+        self.tok.copy_(tok.view(-1, 1))
+        p = as_rows(pos, torch.int64)
+        sq = as_rows(seq, torch.int64) if seq is not None else torch.arange(B, dtype=torch.int64)
+        pm = as_rows(pmax, torch.int64) if pmax is not None else p
         for d in self.devices:
-            self.pos[d].fill_(pos)
+            self.pos[d].copy_(p)
+            self.seq[d].copy_(sq)
+            self.pmax[d].copy_(pm)
+        return tok, p, sq
+
+    def _engram_rows(self, tok, p, sq):
+        if self.m.engram_hash is None:
+            return
+        dev0 = self.devices[0]
+        hashes = self.m.engram_hash.rows(tok.to(dev0), sq.to(dev0), p.to(dev0))
+        for blk in self.m.blocks:
+            if blk.engram is not None:
+                emb = blk.engram.table.lookup(hashes[:, :, blk.engram.layer_hash_index, :], blk.device).flatten(-2)
+                self.eng_in[blk.layer_id].copy_(emb)
+
+    @torch.inference_mode()
+    def step(self, token, pos, seq=None, pmax=None) -> torch.Tensor:
+        """One decode step for B rows: token(s) at position(s) `pos` of sequence(s) `seq` (see set_rows);
+        returns logits [B, vocab] on the last device."""
+        tok, p, sq = self.set_rows(token, pos, seq, pmax)
         # the owner bookkeeping mirrors the eager path: sources set themselves as they run (in layer order)
         self.kv_owner = -1
         self.index_owner = -1
-        if self.m.engram_hash is not None:
-            hashes = self.m.engram_hash(self.tok, pos)
-            for blk in self.m.blocks:
-                if blk.engram is not None:
-                    emb = blk.engram.table.lookup(hashes[:, :, blk.engram.layer_hash_index, :], blk.device).flatten(-2)
-                    self.eng_in[blk.layer_id].copy_(emb)
+        self._engram_rows(tok, p, sq)
         for si, (d, _) in enumerate(self.segments):
             if self.use_graphs and d in self.graphs:
                 self.graphs[d].replay()

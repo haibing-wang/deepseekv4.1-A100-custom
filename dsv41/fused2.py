@@ -260,8 +260,9 @@ def norm_quant(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
 
 # --------------------------------------------------------------------------- kv: norm + rope + quant + ring write
 @triton.jit
-def _kv_write_kernel(X, W, COS, SIN, POS, CACHE, eps, WIN: tl.constexpr, D: tl.constexpr, RD: tl.constexpr):
+def _kv_write_kernel(X, W, COS, SIN, POS, SEQ, CACHE, eps, WIN: tl.constexpr, D: tl.constexpr, RD: tl.constexpr):
     row = tl.program_id(0)
+    seq = tl.load(SEQ + row)
     offs = tl.arange(0, D)
     x = tl.load(X + row * D + offs).to(tl.float32)
     var = tl.sum(x * x, axis=0) / D
@@ -282,34 +283,41 @@ def _kv_write_kernel(X, W, COS, SIN, POS, CACHE, eps, WIN: tl.constexpr, D: tl.c
     slot = pos % WIN
     r = tl.arange(0, D // 32)[:, None]
     cc = tl.arange(0, 32)[None, :]
-    tl.store(CACHE + (row * WIN + slot) * D + r * 32 + cc, q)
+    tl.store(CACHE + (seq * WIN + slot) * D + r * 32 + cc, q)
 
 
-def kv_write(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, pos: torch.Tensor, cache: torch.Tensor, rd: int, eps: float):
-    """x: bf16 [B, d] (wkv output); pos: int64 [B] (or 0-d). Writes kv_norm -> rope(pos) -> fp8 fake quant into cache[b, pos % win]."""
+def kv_write(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, pos: torch.Tensor, cache: torch.Tensor, rd: int, eps: float, seq: torch.Tensor):
+    """x: bf16 [B, d] (wkv output); pos, seq: int64 [B]. Writes kv_norm -> rope(pos) -> fp8 fake quant into cache[seq, pos % win]."""
     d = x.shape[-1]
     win = cache.shape[1]
     B = x.numel() // d
     with torch.cuda.device(x.device):
-        _kv_write_kernel[(B,)](x.contiguous(), w, cos, sin, pos, cache, eps, WIN=win, D=d, RD=rd, num_warps=4)
+        _kv_write_kernel[(B,)](x.contiguous(), w, cos, sin, pos, seq, cache, eps, WIN=win, D=d, RD=rd, num_warps=4)
 
 
 # --------------------------------------------------------------------------- sparse attention v2
 @triton.jit(do_not_specialize=["n_kvc", "topk"])
-def _sattn2_split_kernel(Q, KVW, KVC, IDX, POS, PM, PL, PACC, n_kvc, topk, scale,
+def _sattn2_split_kernel(Q, KVW, KVC, IDX, POS, SEQ, PMAX, PLIM, PM, PL, PACC, n_kvc, topk, scale,
                          H: tl.constexpr, HB: tl.constexpr, D: tl.constexpr, BLOCK_T: tl.constexpr,
                          NSPLIT: tl.constexpr, NWIN: tl.constexpr, WIN: tl.constexpr, HAS_C: tl.constexpr):
+    """Row b (a query at position POS[b] of sequence SEQ[b]) over the sequence's window ring (slot = position % WIN;
+    the ring holds the positions up to PMAX[b], the newest written for that sequence, so slots holding positions
+    beyond POS[b] are masked) and the compressed cache rows IDX[b]."""
     b = tl.program_id(0)
     hb = tl.program_id(1)
     sp = tl.program_id(2)
     hs = hb * HB + tl.arange(0, HB)
     dd = tl.arange(0, D)
+    seq = tl.load(SEQ + b)
     q = tl.load(Q + (b * H + hs)[:, None] * D + dd[None, :])
     if sp < NWIN:
         pos = tl.load(POS + b)
-        tt = ((sp * BLOCK_T + tl.arange(0, BLOCK_T) + pos % WIN + 1) % WIN).to(tl.int32)  # ring slots, oldest first
-        valid = (tt <= pos) | (pos >= WIN)
-        kv = tl.load(KVW + (b * WIN + tt)[:, None] * D + dd[None, :], mask=valid[:, None], other=0.0)
+        pmax = tl.load(PMAX + b)
+        plim = tl.load(PLIM + b)  # newest ring position this row may see (== pos for ordinary decode)
+        tt = (sp * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int32)
+        held = pmax - (((pmax - tt) % WIN + WIN) % WIN)  # the position slot tt holds
+        valid = (held >= 0) & (held <= plim) & (pos - held < WIN)
+        kv = tl.load(KVW + (seq * WIN + tt)[:, None] * D + dd[None, :], mask=valid[:, None], other=0.0)
     else:
         tt = (sp - NWIN) * BLOCK_T + tl.arange(0, BLOCK_T)
         if HAS_C:
@@ -317,7 +325,7 @@ def _sattn2_split_kernel(Q, KVW, KVC, IDX, POS, PM, PL, PACC, n_kvc, topk, scale
         else:
             idx = tl.full((BLOCK_T,), -1, tl.int32)
         valid = idx >= 0
-        kv = tl.load(KVC + (b * n_kvc + tl.maximum(idx, 0))[:, None] * D + dd[None, :], mask=valid[:, None], other=0.0)
+        kv = tl.load(KVC + (seq * n_kvc + tl.maximum(idx, 0))[:, None] * D + dd[None, :], mask=valid[:, None], other=0.0)
     s = tl.dot(q, tl.trans(kv)).to(tl.float32) * scale
     s = tl.where(valid[None, :], s, -1e30)
     m = tl.max(s, axis=1)
@@ -359,10 +367,10 @@ def _sattn2_combine_kernel(PM, PL, PACC, SINK, COS, SIN, POS, O, H: tl.constexpr
     tl.store(O + (b * H + h) * D + dd, tl.reshape(tl.join(yr, yi), (D,)))
 
 
-def sattn2(q, kv_win, kv_c, idx, pos, attn_sink, cos, sin, rd, softmax_scale, block_t: int = 64):
-    """q: [1, 1, h, d] bf16; kv_win: [1, win, d] ring (entries with slot > pos are empty while pos < win);
-    kv_c: [1, n, d] compressed cache or None; idx: [1, 1, t] int32 rows of kv_c (-1 = none) or None.
-    Returns the attention output with the inverse rope applied: [1, 1, h, d] bf16."""
+def sattn2(q, kv_win, kv_c, idx, pos, attn_sink, cos, sin, rd, softmax_scale, seq, pmax, block_t: int = 64, plim=None):
+    """q: [B, 1, h, d] bf16 (B query rows at positions pos [B] of sequences seq [B]); kv_win: [S, win, d] rings;
+    pmax [B]: newest position written to the row's ring; kv_c: [S, n, d] compressed caches or None;
+    idx: [B, 1, t] int32 rows of kv_c (-1 = none) or None. Returns the attention output with the inverse rope: [B, 1, h, d]."""
     b, s, h, d = q.shape
     assert s == 1
     win = kv_win.shape[1]
@@ -381,7 +389,7 @@ def sattn2(q, kv_win, kv_c, idx, pos, attn_sink, cos, sin, rd, softmax_scale, bl
     pacc = torch.empty(b * h * nsplit, d, device=q.device, dtype=torch.float32)
     o = torch.empty_like(q)
     with torch.cuda.device(q.device):
-        _sattn2_split_kernel[(b, h // HB, nsplit)](q, kv_win, kv_c, idx, pos, pm, pl, pacc, n_c, t, softmax_scale,
+        _sattn2_split_kernel[(b, h // HB, nsplit)](q, kv_win, kv_c, idx, pos, seq, pmax, plim if plim is not None else pos, pm, pl, pacc, n_c, t, softmax_scale,
                                                    H=h, HB=HB, D=d, BLOCK_T=block_t, NSPLIT=nsplit, NWIN=nwin, WIN=win, HAS_C=t > 0, num_warps=4)
         _sattn2_combine_kernel[(b, h)](pm, pl, pacc, attn_sink, cos, sin, pos, o, H=h, D=d, RD=rd, NSPLIT=nsplit, num_warps=4)
     return o

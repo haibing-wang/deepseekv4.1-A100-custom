@@ -142,10 +142,10 @@ class EPRuntime(DecodeRuntime):
         later = [dd for dd in self.devs if self.idx[dd] > self.idx[d]]
         val, idx = self.kv_row[lid]
         for dd in later:
-            p2p_copy_row(self.m.shared.compress_kv[(lid, dd)], idx, val, d)
+            p2p_copy_row(self.m.shared.compress_kv[(lid, dd)], idx, val, d, self.seq[d])
         val, idx = self.ik_row[lid]
         for dd in later:
-            p2p_copy_row(self.m.shared.index_k[(lid, dd)], idx, val, d)
+            p2p_copy_row(self.m.shared.index_k[(lid, dd)], idx, val, d, self.seq[d])
 
     def _owner_layer(self, blk: Block, d, h, pre):
         L = blk.layer_id
@@ -326,19 +326,9 @@ class EPRuntime(DecodeRuntime):
                 self.token_end(d)
 
     @torch.inference_mode()
-    def step(self, token, pos: int) -> torch.Tensor:
-        if isinstance(token, int):
-            self.tok.fill_(token)
-        else:
-            self.tok.copy_(torch.as_tensor(token, dtype=torch.int64).view(-1, 1))
-        for d in self.devs:
-            self.pos[d].fill_(pos)
-        if self.m.engram_hash is not None:
-            hashes = self.m.engram_hash(self.tok, pos)
-            for blk in self.m.blocks:
-                if blk.engram is not None:
-                    emb = blk.engram.table.lookup(hashes[:, :, blk.engram.layer_hash_index, :], blk.device).flatten(-2)
-                    self.eng_in[blk.layer_id].copy_(emb)
+    def step(self, token, pos, seq=None, pmax=None) -> torch.Tensor:
+        tok, p, sq = self.set_rows(token, pos, seq, pmax)
+        self._engram_rows(tok, p, sq)
         if self.use_graphs and self.graphs:
             for d in self.devs:
                 self.graphs[d].replay()
