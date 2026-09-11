@@ -21,9 +21,37 @@ was used only as the architecture definition. All kernels are ours (Triton and C
 | `dsv41/model.py` | the 40-layer pipeline: sliding window + compressed sparse attention with two-level indexer, candidate blocks, hyper-connections, MoE with 384 experts; caches mirrored per (owner layer, GPU) |
 | `dsv41/decode.py` | static-shape decode (position as a device tensor, dummy cache rows instead of branches) with one CUDA graph per GPU |
 | `dsv41/load.py` | placement across GPUs by free memory (~7.1 GiB per layer), FP8 dense weights dequantized to bf16, experts kept packed |
-| `dsv41/run.py` | CLI |
+| `dsv41/engine.py` | generation engine shared by the REPL and the server (streaming, top-p, stop strings, chat template + completion parser from the checkpoint's `encoding/`) |
+| `dsv41/chat.py` | interactive terminal chat (multi-turn, `/clear`, `/system`, thinking mode) |
+| `dsv41/serve.py` | OpenAI-compatible HTTP server (`/v1/chat/completions` with streaming, `/v1/completions`, `/v1/models`), stdlib only |
+| `dsv41/run.py` | one-shot CLI with profiling flags |
 
 ## Run
+
+Interactive chat:
+
+```
+python -m dsv41.chat --devices 2,0,1,4,5,6,7,3            # add --thinking for reasoning mode
+>>> 日本で一番高い山と、その標高を教えてください。
+```
+
+OpenAI-compatible server (one request generates at a time; others queue):
+
+```
+python -m dsv41.serve --devices 2,0,1,4,5,6,7,3 --port 8000
+curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "deepseek-v4.1-flash",
+  "messages": [{"role": "user", "content": "東京タワーの高さは？"}],
+  "max_tokens": 256, "temperature": 0.6, "stream": true}'
+```
+
+Supported request fields: `messages` (system/user/assistant/tool, images not supported), `max_tokens`,
+`temperature`, `top_p`, `stop`, `seed`, `stream`, and `"thinking": true` (or `reasoning_effort`) to get
+the model's reasoning back in `message.reasoning_content`. Tool calls in the completion are parsed into
+OpenAI-format `tool_calls`. `/v1/completions` takes a raw `prompt`. Works with the `openai` client by
+setting `base_url="http://host:8000/v1"`.
+
+One-shot generation with profiling:
 
 ```
 python -m dsv41.run --devices 2,0,1,4,5,6,7,3 --decode graph --chat \

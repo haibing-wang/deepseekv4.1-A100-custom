@@ -1,0 +1,171 @@
+"""OpenAI-compatible HTTP server (no web framework needed: stdlib http.server, threaded).
+
+  python -m dsv41.serve --devices 2,0,1,4,5,6,7,3 --port 8000
+  curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+       -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hello"}],"stream":true}'
+
+Endpoints: GET /v1/models, POST /v1/chat/completions (stream or not), POST /v1/completions, GET /health.
+One request is generated at a time; others wait on the engine lock."""
+import argparse
+import json
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from .engine import Engine, GenParams, parse_budgets
+
+ENGINE: Engine | None = None
+
+
+def _params(body: dict) -> GenParams:
+    stop = body.get("stop") or []
+    if isinstance(stop, str):
+        stop = [stop]
+    return GenParams(
+        max_new_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024),
+        temperature=float(body.get("temperature", 0.6)),
+        top_p=float(body.get("top_p", 0.95)),
+        stop=list(stop),
+        seed=body.get("seed"),
+    )
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):  # quieter log
+        print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}", flush=True)
+
+    def _json(self, code: int, obj: dict):
+        data = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            self._json(200, {"object": "list", "data": [{"id": ENGINE.model_name, "object": "model", "owned_by": "local"}]})
+        elif self.path == "/health":
+            self._json(200, {"status": "ok"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError:
+            return self._json(400, {"error": "invalid JSON"})
+        if self.path == "/v1/chat/completions":
+            return self._chat(body)
+        if self.path == "/v1/completions":
+            return self._completion(body)
+        self._json(404, {"error": "not found"})
+
+    # ---------------------------------------------------------------- chat
+    def _chat(self, body: dict):
+        eng = ENGINE
+        messages = body.get("messages") or []
+        thinking = "thinking" if body.get("reasoning_effort") or body.get("thinking") else None
+        try:
+            ids = eng.tok.encode(eng.chat_prompt(messages, thinking))
+        except Exception as e:  # malformed messages / unsupported content
+            return self._json(400, {"error": f"cannot encode messages: {e}"})
+        params = _params(body)
+        rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        if body.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            def chunk(delta, finish=None):
+                obj = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": eng.model_name,
+                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+
+            chunk({"role": "assistant", "content": ""})
+            n = 0
+            try:
+                for _, piece in eng.generate(ids, params):
+                    chunk({"content": piece})
+                    n += 1
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            chunk({}, "length" if n >= params.max_new_tokens else "stop")
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+        text, n = eng.generate_text(ids, params)
+        msg = eng.parse_completion(text, thinking)
+        content = msg.get("content") if isinstance(msg, dict) else text
+        out = {"id": rid, "object": "chat.completion", "created": created, "model": eng.model_name,
+               "choices": [{"index": 0, "message": {"role": "assistant", "content": content if content is not None else text},
+                            "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],
+               "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}
+        if isinstance(msg, dict) and msg.get("reasoning_content"):
+            out["choices"][0]["message"]["reasoning_content"] = msg["reasoning_content"]
+        if isinstance(msg, dict) and msg.get("tool_calls"):
+            out["choices"][0]["message"]["tool_calls"] = msg["tool_calls"]
+        self._json(200, out)
+
+    # ---------------------------------------------------------------- raw completions
+    def _completion(self, body: dict):
+        eng = ENGINE
+        prompt = body.get("prompt") or ""
+        if isinstance(prompt, list):
+            prompt = prompt[0]
+        ids = eng.tok.encode(prompt)
+        params = _params(body)
+        rid = f"cmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        if body.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            n = 0
+            for _, piece in eng.generate(ids, params):
+                obj = {"id": rid, "object": "text_completion", "created": created, "model": eng.model_name,
+                       "choices": [{"index": 0, "text": piece, "finish_reason": None}]}
+                self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+                n += 1
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+        text, n = eng.generate_text(ids, params)
+        self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": eng.model_name,
+                         "choices": [{"index": 0, "text": text, "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],
+                         "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}})
+
+
+def main():
+    global ENGINE
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--devices", default="2,0,1,4,5,6,7,3")
+    ap.add_argument("--budgets", default="")
+    ap.add_argument("--max-seq-len", type=int, default=8192)
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--no-graphs", action="store_true")
+    a = ap.parse_args()
+    kw = dict(devices=[int(d) for d in a.devices.split(",")], max_seq_len=a.max_seq_len, budgets=parse_budgets(a.budgets),
+              use_graphs=not a.no_graphs)
+    ENGINE = Engine(a.ckpt, **kw) if a.ckpt else Engine(**kw)
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    print(f"serving OpenAI-compatible API on http://{a.host}:{a.port}/v1 (model '{ENGINE.model_name}')", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
