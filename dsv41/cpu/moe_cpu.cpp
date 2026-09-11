@@ -18,13 +18,22 @@ static int g_cpus[256];
 static cpu_set_t g_master_mask;  // the caller's affinity, restored after every entry point
 static int g_master_saved = 0;
 static void save_master() { if (!g_master_saved) { sched_getaffinity(0, sizeof(g_master_mask), &g_master_mask); g_master_saved = 1; } }
-static void restore_master() { if (g_master_saved) sched_setaffinity(0, sizeof(g_master_mask), &g_master_mask); }
+static void restore_master();
 // pin the calling OpenMP thread to its CPU. Threads torch's shared runtime re-creates inherit the
 // master's mask, so every parallel region re-pins (one cheap syscall per thread per region).
+static thread_local int* g_pin_memo = nullptr;
 static inline void pin_self() {
+    static thread_local int pinned_to = -1;  // each OS thread pins itself once (re-created threads pin on first use)
+    g_pin_memo = &pinned_to;
     int t = omp_get_thread_num();
+    if (pinned_to == g_cpus[t]) return;
     cpu_set_t s; CPU_ZERO(&s); CPU_SET(g_cpus[t], &s);
     sched_setaffinity(0, sizeof(s), &s);
+    pinned_to = g_cpus[t];
+}
+static void restore_master() {
+    if (g_master_saved) sched_setaffinity(0, sizeof(g_master_mask), &g_master_mask);
+    if (g_pin_memo) *g_pin_memo = -1;  // the master will pin itself again on the next region
 }
 
 extern "C" void cpumoe_init(int threads, int cores_per_node) {
@@ -280,7 +289,10 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
     const int N13 = 2 * inter;
     static uint8_t xu[8192]; static float sx[256];            // quantized x
     static uint8_t hu[16 * 4096]; static float sh[16 * 128];  // quantized h per expert
+    const int dbg = getenv("DSV41_CPU_DEBUG") != nullptr;
+    double t0 = dbg ? omp_get_wtime() : 0, t1 = 0, t2 = 0, t3 = 0;
     if (g_int8) quant_x_u8(x, K, xu, sx);
+    if (dbg) t1 = omp_get_wtime();
     // stage 1: gu[e][n] = x . w13[e][n]
 #pragma omp parallel
     {
@@ -301,6 +313,7 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
                     : dot_row(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), x, K);
         }
     }
+    if (dbg) t2 = omp_get_wtime();
     // stage 2: h[e] = fp8(bf16(wt * silu(gate) * up)) (+ int8 quantization for the w2 GEMV)
 #pragma omp parallel for
     for (int e = 0; e < E; ++e) {
@@ -308,11 +321,7 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
         swiglu_quant_row(gu + (size_t)e * N13, inter, wts[e], limit, h + (size_t)e * inter);
         if (g_int8) quant_x_u8(h + (size_t)e * inter, inter, hu + (size_t)e * inter, sh + (size_t)e * (inter / 32));
     }
-    if (getenv("DSV41_CPU_DEBUG")) {
-        double hs = 0; for (int i = 0; i < E * inter; ++i) hs += fabs(bf16_to_f(h[i]));
-        double gs = 0; for (int i = 0; i < E * N13; ++i) gs += fabs(gu[i]);
-        fprintf(stderr, "[cpumoe] threads=%d E=%d wts0=%g sum|gu|=%g sum|h|=%g limit=%g\n", g_threads, E, wts[0], gs, hs, limit);
-    }
+    if (dbg) t3 = omp_get_wtime();
     // stage 3: out[n] = sum_e h[e] . w2[e][n]
 #pragma omp parallel
     {
@@ -341,6 +350,7 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
             out[n] = acc;
         }
     }
+    if (dbg) fprintf(stderr, "[cpumoe] E=%d quant %.0fus stage1 %.0fus stage2 %.0fus stage3 %.0fus\n", E, (t1 - t0) * 1e6, (t2 - t1) * 1e6, (t3 - t2) * 1e6, (omp_get_wtime() - t3) * 1e6);
     restore_master();
     return 0;
 }
