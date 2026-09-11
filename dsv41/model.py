@@ -572,8 +572,9 @@ class MoE:
             p1 = GroupedPairs(eid, tok, pair_rows, ones, block_m)
             gu = grouped_fp4_gemm(xq, self.w13, self.s13, p1, n_pairs)  # fp32 [pairs, 2*inter]
             hq = swiglu_quant(gu, weights.flatten().float().contiguous(), self.inter, self.swiglu_limit)
-            p2 = GroupedPairs(eid, pair_rows, tok, ones, block_m)
-            y = grouped_fp4_gemm(hq, self.w2, self.s2, p2, n_tok)  # fp32 [tokens, dim], summed over the token's experts
+            # one output row per pair (no atomics across a token's experts), summed in a fixed order: deterministic prefill
+            p2 = GroupedPairs(eid, pair_rows, pair_rows, ones, block_m)
+            y = grouped_fp4_gemm(hq, self.w2, self.s2, p2, n_pairs).view(n_tok, self.topk, self.dim).sum(dim=1)
         y += self.shared_expert(x)
         return y.to(x.dtype).view(shape)
 
