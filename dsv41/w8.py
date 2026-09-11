@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from .quant import dequant_fp8_block
 
 ENABLED = os.environ.get("DSV41_W8", "1") == "1"
-MAX_TC_ROWS = 16
+MAX_TC_ROWS = 64  # rows handled by the tensor-core kernel (16 per launch, chunked); beyond that dequantize + cuBLAS
 
 
 class W8:
