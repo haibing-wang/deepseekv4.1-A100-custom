@@ -1,0 +1,20 @@
+# environments / build products
+.venv*/
+llama.cpp/
+nvml173/
+__pycache__/
+*.pyc
+dsv41/cuda/.*.cubin
+# data and large artifacts
+data/
+results/*.log
+results/*.json
+results/*.err
+results/*.md
+results/*.txt
+results/sweep*.log
+!results/README.md
+*.gguf
+*.safetensors
+# scratch
+/tmp/
