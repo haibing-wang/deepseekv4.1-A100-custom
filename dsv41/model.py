@@ -373,6 +373,7 @@ class MoE:
         self.s2 = w["experts.s2"]  # uint8 [E, dim, inter/32]
         self.inter = self.w2.shape[2] * 2
         self.offload = bool(w.get("experts.offload", False))  # experts in host RAM (streamed to the GPU, or computed on the CPU)
+        self.tiled = bool(w.get("experts.tiled", False))  # quant.tile_fp4 layout (all-GPU modes)
         self.ep = w.get("experts.ep")  # expert-parallel shards: [{device, start, n, w13, s13, w2, s2}] (see dsv41/ep.py)
         self.host = w.get("experts.host")  # HostExperts: compute the selected experts on the CPU
         self.hot = w.get("experts.hot")  # GPU-resident subset (slot map) computed on the GPU, overlapping the CPU
@@ -431,10 +432,10 @@ class MoE:
             ones = torch.ones(m, device=d)
             block_m = 64
             p1 = GroupedPairs(le, tk, local_rows, ones, block_m)
-            gu = grouped_fp4_gemm(xs, sh["w13"], sh["s13"], p1, m)
+            gu = grouped_fp4_gemm(xs, sh["w13"], sh["s13"], p1, m, tiled=self.tiled)
             hq = swiglu_quant(gu, wt.contiguous(), self.inter, self.swiglu_limit)
             p2 = GroupedPairs(le, local_rows, local_rows, ones, block_m)
-            ys = grouped_fp4_gemm(hq, sh["w2"], sh["s2"], p2, m)
+            ys = grouped_fp4_gemm(hq, sh["w2"], sh["s2"], p2, m, tiled=self.tiled)
             yp[sel] = ys.to(xq.device)
         return yp.view(n_tok, self.topk, self.dim).sum(dim=1)
 
@@ -581,11 +582,11 @@ class MoE:
         else:
             block_m = 64
             p1 = GroupedPairs(eid, tok, pair_rows, ones, block_m)
-            gu = grouped_fp4_gemm(xq, self.w13, self.s13, p1, n_pairs)  # fp32 [pairs, 2*inter]
+            gu = grouped_fp4_gemm(xq, self.w13, self.s13, p1, n_pairs, tiled=self.tiled)  # fp32 [pairs, 2*inter]
             hq = swiglu_quant(gu, weights.flatten().float().contiguous(), self.inter, self.swiglu_limit)
             # one output row per pair (no atomics across a token's experts), summed in a fixed order: deterministic prefill
             p2 = GroupedPairs(eid, pair_rows, pair_rows, ones, block_m)
-            y = grouped_fp4_gemm(hq, self.w2, self.s2, p2, n_pairs).view(n_tok, self.topk, self.dim).sum(dim=1)
+            y = grouped_fp4_gemm(hq, self.w2, self.s2, p2, n_pairs, tiled=self.tiled).view(n_tok, self.topk, self.dim).sum(dim=1)
         y += self.shared_expert(x)
         return y.to(x.dtype).view(shape)
 

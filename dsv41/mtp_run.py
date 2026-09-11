@@ -14,6 +14,7 @@ ap.add_argument("--budgets", default="", help="per-GPU GiB for the pipeline plac
 ap.add_argument("--seqs", type=int, default=8)
 ap.add_argument("--prompts", default="dsv41/batch_prompts16.txt")
 ap.add_argument("--max-new-tokens", type=int, default=64)
+ap.add_argument("--max-seq-len", type=int, default=8192, help="cache length per sequence (smaller = more sequences fit)")
 ap.add_argument("--no-mtp", action="store_true", help="plain batched decode with the same harness (baseline)")
 ap.add_argument("--drafts", type=int, default=5, help="draft tokens verified per sequence per step (1..5)")
 ap.add_argument("--n-layers", type=int, default=None, help="truncated model (plumbing test)")
@@ -28,7 +29,7 @@ from encoding import encode_messages
 S = a.seqs
 K = 1 if a.no_mtp else 1 + a.drafts
 devs = [int(d) for d in a.devices.split(",")]
-model = load_model(a.ckpt, devs, max_seq_len=8192, max_batch=S * K, max_seqs=S, engram=True, tokenizer=tok, ep=a.ep, n_layers=a.n_layers,
+model = load_model(a.ckpt, devs, max_seq_len=a.max_seq_len, max_batch=S * K, max_seqs=S, engram=True, tokenizer=tok, ep=a.ep, n_layers=a.n_layers,
                    ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None,
                    budgets_gb={int(k): float(v) for k, v in (kv.split(":") for kv in a.budgets.split(",") if kv)} or None)
 if a.ep:
@@ -52,8 +53,8 @@ if not a.no_mtp:
         ds.targets = rt.target_layers
     model.collect_main_hidden = ds.targets
     ds.capture(S)
-lines = [l.strip() for l in open(a.prompts) if l.strip()][:S]
-assert len(lines) == S
+lines = [l.strip() for l in open(a.prompts) if l.strip()]
+lines = (lines * (-(-S // len(lines))))[:S]  # cycle the prompt file when S exceeds it
 prompts = [tok.encode(encode_messages([{"role": "user", "content": l}], thinking_mode="chat")) for l in lines]
 # prefill one sequence at a time into slot 0, copy the state to its slot (last one stays in slot 0)
 p_last, bonus, mh_last = [0] * S, [0] * S, [None] * S

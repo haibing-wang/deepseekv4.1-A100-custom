@@ -9,6 +9,8 @@ import torch
 
 from .engram import Engram, EngramLayout, HostEngramTable, NgramHashState
 from .model import Args, Block, Transformer
+from . import cukern
+from .quant import tile_fp4, tile_fp4_scales
 from .w8 import ENABLED as W8_ENABLED, W8
 from .quant import dequant_fp8_block
 from .stio import Checkpoint
@@ -113,11 +115,15 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False, ep: list | None 
                 ss13[j, inter:].copy_(ckpt.get(q + "w3.scale"), non_blocking=True)
                 sw2[j].copy_(ckpt.get(q + "w2.weight").view(torch.uint8), non_blocking=True)
                 ss2[j].copy_(ckpt.get(q + "w2.scale"), non_blocking=True)
+            torch.cuda.synchronize(sd)
+            if cukern.FP4_TILED:
+                sw13, ss13, sw2, ss2 = tile_fp4(sw13), tile_fp4_scales(ss13), tile_fp4(sw2), tile_fp4_scales(ss2)
             shards.append({"device": sd, "start": start, "n": n, "w13": sw13, "s13": ss13, "w2": sw2, "s2": ss2})
         for sh in shards:
             torch.cuda.synchronize(sh["device"])
         own = [sh for sh in shards if sh["device"] == device][0]
-        w.update({"experts.w13": own["w13"], "experts.s13": own["s13"], "experts.w2": own["w2"], "experts.s2": own["s2"], "experts.offload": False, "experts.ep": shards})
+        w.update({"experts.w13": own["w13"], "experts.s13": own["s13"], "experts.w2": own["w2"], "experts.s2": own["s2"], "experts.offload": False, "experts.ep": shards,
+                  "experts.tiled": bool(cukern.FP4_TILED)})
         return w
     if offload:  # experts stay in page-locked host memory; the MoE streams the selected ones per token
         alloc = lambda *shape: torch.empty(*shape, dtype=torch.uint8, pin_memory=True)
@@ -135,8 +141,11 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False, ep: list | None 
         s13[e, inter:].copy_(ckpt.get(q + "w3.scale"), non_blocking=True)
         w2[e].copy_(ckpt.get(q + "w2.weight").view(torch.uint8), non_blocking=True)
         s2[e].copy_(ckpt.get(q + "w2.scale"), non_blocking=True)
-    w.update({"experts.w13": w13, "experts.s13": s13, "experts.w2": w2, "experts.s2": s2, "experts.offload": offload})
     torch.cuda.synchronize(device)
+    tiled = bool(cukern.FP4_TILED) and not offload
+    if tiled:
+        w13, s13, w2, s2 = tile_fp4(w13), tile_fp4_scales(s13), tile_fp4(w2), tile_fp4_scales(s2)
+    w.update({"experts.w13": w13, "experts.s13": s13, "experts.w2": w2, "experts.s2": s2, "experts.offload": offload, "experts.tiled": tiled})
     return w
 
 
@@ -167,6 +176,8 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
     max_seqs = max_seqs or max_batch
     ckpt = Checkpoint(ckpt_path)
     n_layers = n_layers or cfg["n_layers"]
+    if offload_experts:  # the hot cache copies host (row-major) expert bytes to the GPU: keep the kernels row-major
+        cukern.FP4_TILED = False
     if ep:
         nd = len(devices)
         placement = [torch.device(f"cuda:{devices[min(i * nd // n_layers, nd - 1)]}") for i in range(n_layers)]

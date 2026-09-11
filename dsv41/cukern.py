@@ -223,7 +223,11 @@ def permute_x(x: torch.Tensor) -> torch.Tensor:
 
 
 FP4_W_LAYOUT = os.environ.get("DSV41_FP4_W", "1") == "1"
+FP4_TILED = os.environ.get("DSV41_FP4_TILED", "1") == "1"  # experts stored tiled (quant.tile_fp4); the loader clears it in offload mode
 FP4_W_MAX = 64  # tokens per group the second layout handles (groups are split at this size)
+# groups up to this many tokens use fp4_tc.cu (x as the mma A operand, from registers), larger ones fp4_tcw.cu (x staged in
+# shared memory). With the tiled weight layout fp4_tcw.cu is faster at every size (1 token/expert: 1.19 -> 1.46 TB/s), so 0.
+FP4_SMALL_MAX = int(os.environ.get("DSV41_FP4_SMALL_MAX", "0"))
 
 
 def fp4_gemm_tc(xp: torch.Tensor, w: torch.Tensor, s: torch.Tensor, grp_expert: torch.Tensor, grp_start: torch.Tensor,
@@ -242,7 +246,7 @@ def fp4_gemm_tc(xp: torch.Tensor, w: torch.Tensor, s: torch.Tensor, grp_expert: 
     if out is None:
         out = torch.empty(n_pairs, N, device=xp.device, dtype=torch.float32)
     WARPS = 4
-    big = max_tokens > 8 and (FP4_W_LAYOUT or max_tokens > 16)
+    big = max_tokens > FP4_SMALL_MAX and (FP4_W_LAYOUT or max_tokens > 16 or FP4_SMALL_MAX == 0)
     assert max_tokens <= (FP4_W_MAX if big else 16)
     assert not big or N % 64 == 0
     common = [ctypes.c_void_p(xp.data_ptr()), ctypes.c_int(xp.stride(0)),
@@ -250,16 +254,18 @@ def fp4_gemm_tc(xp: torch.Tensor, w: torch.Tensor, s: torch.Tensor, grp_expert: 
               ctypes.c_void_p(grp_expert.data_ptr()), ctypes.c_void_p(grp_start.data_ptr()), ctypes.c_void_p(pair_tok.data_ptr()),
               ctypes.c_void_p(out.data_ptr()), ctypes.c_int(N), ctypes.c_int(N), ctypes.c_int(K),
               ctypes.c_int(shard_start), ctypes.c_int(min(shard_n, E)), ctypes.c_int(1 if zero_out else 0)]
-    small_max = 8 if (big or max_tokens <= 8) else 16
-    f = get_function("fp4_tc.cu", "fp4_gemm_tc8" if small_max <= 8 else "fp4_gemm_tc16", xp.device)
-    launch(f, ((N // 8 + WARPS - 1) // WARPS, G, 1), (WARPS * 32, 1, 1), common + [ctypes.c_int(0), ctypes.c_int(small_max)], xp.device)
+    tiled = [ctypes.c_int(1 if FP4_TILED else 0)]
+    small_max = FP4_SMALL_MAX if (big or max_tokens <= FP4_SMALL_MAX) else 16
+    if small_max > 0:
+        f = get_function("fp4_tc.cu", "fp4_gemm_tc8" if small_max <= 8 else "fp4_gemm_tc16", xp.device)
+        launch(f, ((N // 8 + WARPS - 1) // WARPS, G, 1), (WARPS * 32, 1, 1), common + [ctypes.c_int(0), ctypes.c_int(small_max)] + tiled, xp.device)
     if big:
         f = get_function("fp4_tcw.cu", "fp4_gemm_tcw", xp.device)
         shared = 3 * 64 * 256
         if (f.value, xp.device.index) not in _attr_done:
             _check(_cuda.cuFuncSetAttribute(f, 8, ctypes.c_int(shared)), "cuFuncSetAttribute")
             _attr_done.add((f.value, xp.device.index))
-        launch(f, (N // 64, G, 1), (WARPS * 32, 1, 1), common + [ctypes.c_int(9), ctypes.c_int(FP4_W_MAX)], xp.device, shared=shared)
+        launch(f, (N // 64, G, 1), (WARPS * 32, 1, 1), common + [ctypes.c_int(FP4_SMALL_MAX + 1), ctypes.c_int(FP4_W_MAX)] + tiled, xp.device, shared=shared)
     return out
 
 

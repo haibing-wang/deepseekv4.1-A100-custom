@@ -61,7 +61,7 @@ template <int MT, int STAGES>
 __device__ __forceinline__ void fp4_gemm_tcw_body(const __nv_bfloat16* __restrict__ X, int ldx,
         const uint8_t* __restrict__ W, long long stride_we, const uint8_t* __restrict__ S, long long stride_se,
         const int* __restrict__ grp_expert, const int* __restrict__ grp_start, const int* __restrict__ pair_tok,
-        float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out, int min_tok, int max_tok)
+        float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out, int min_tok, int max_tok, int tiled)
 {
     constexpr int ROWS = 8 * MT;
     constexpr int CH = 16;  // 16-byte chunks per row per 128 k
@@ -82,10 +82,22 @@ __device__ __forceinline__ void fp4_gemm_tcw_body(const __nv_bfloat16* __restric
         }
         return;
     }
-    const uint8_t* wrowA = W + (long long)e * stride_we + (long long)(n0 + g) * (K / 2);
-    const uint8_t* wrowB = W + (long long)e * stride_we + (long long)(n0 + g + 8) * (K / 2);
-    const uint8_t* srowA = S + (long long)e * stride_se + (long long)(n0 + g) * (K / 32);
-    const uint8_t* srowB = S + (long long)e * stride_se + (long long)(n0 + g + 8) * (K / 32);
+    // lane's first weight bytes / scale byte of rows n0+g and n0+g+8, and the step per 128 k (row-major or the
+    // tiled layout [N/16][K/128][16 rows][64 B], scales [N/16][K/128][16][4]; n0 is a multiple of 16)
+    const uint8_t* wrowA; const uint8_t* wrowB; const uint8_t* srowA; const uint8_t* srowB;
+    int wstep, sstep;
+    if (tiled) {
+        const uint8_t* wt0 = W + (long long)e * stride_we + (long long)(n0 >> 4) * (K / 128) * 1024 + 16 * t;
+        const uint8_t* st0 = S + (long long)e * stride_se + (long long)(n0 >> 4) * (K / 128) * 64 + t;
+        wrowA = wt0 + g * 64; wrowB = wt0 + (g + 8) * 64; srowA = st0 + g * 4; srowB = st0 + (g + 8) * 4;
+        wstep = 1024; sstep = 64;
+    } else {
+        wrowA = W + (long long)e * stride_we + (long long)(n0 + g) * (K / 2) + 16 * t;
+        wrowB = W + (long long)e * stride_we + (long long)(n0 + g + 8) * (K / 2) + 16 * t;
+        srowA = S + (long long)e * stride_se + (long long)(n0 + g) * (K / 32) + t;
+        srowB = S + (long long)e * stride_se + (long long)(n0 + g + 8) * (K / 32) + t;
+        wstep = 64; sstep = 4;
+    }
     float c[MT][4];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) { c[mt][0] = c[mt][1] = c[mt][2] = c[mt][3] = 0.f; }
@@ -93,11 +105,11 @@ __device__ __forceinline__ void fp4_gemm_tcw_body(const __nv_bfloat16* __restric
     uint4 wa0 = z4, wb0 = z4, wa1 = z4, wb1 = z4;
     int sa0 = 0, sb0 = 0, sa1 = 0, sb1 = 0;
     auto load_w = [&](int kk, uint4& wa, uint4& wb, int& sa, int& sb) {
-        const int kb = kk + 32 * t;  // 32 k of this lane
-        wa = __ldg(reinterpret_cast<const uint4*>(wrowA + (kb >> 1)));
-        wb = __ldg(reinterpret_cast<const uint4*>(wrowB + (kb >> 1)));
-        sa = __ldg(srowA + (kb >> 5));
-        sb = __ldg(srowB + (kb >> 5));
+        const int it_ = kk >> 7;  // 128-k iteration
+        wa = __ldg(reinterpret_cast<const uint4*>(wrowA + it_ * wstep));
+        wb = __ldg(reinterpret_cast<const uint4*>(wrowB + it_ * wstep));
+        sa = __ldg(srowA + it_ * sstep);
+        sb = __ldg(srowB + it_ * sstep);
     };
     // x tile staging: thread copies chunk (tid % 16) of rows tid/16 + 8j
     constexpr int XJ = ROWS * CH / (WARPS * 32);
@@ -181,14 +193,16 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
 fp4_gemm_tcw(const __nv_bfloat16* __restrict__ X, int ldx, const uint8_t* __restrict__ W, long long stride_we,
         const uint8_t* __restrict__ S, long long stride_se, const int* __restrict__ grp_expert, const int* __restrict__ grp_start,
         const int* __restrict__ pair_tok, float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out,
-        int min_tok, int max_tok)
+        int min_tok, int max_tok, int tiled)
 {
     // token-tile count chosen per group (the padded tiles cost mma work, not bytes); dynamic smem sized for MT = 8
     const int M = grp_start[blockIdx.y + 1] - grp_start[blockIdx.y];
-    if (M <= 16)
-        fp4_gemm_tcw_body<2, 3>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok);
+    if (M <= 8)
+        fp4_gemm_tcw_body<1, 3>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok, tiled);
+    else if (M <= 16)
+        fp4_gemm_tcw_body<2, 3>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok, tiled);
     else if (M <= 32)
-        fp4_gemm_tcw_body<4, 3>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok);
+        fp4_gemm_tcw_body<4, 3>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok, tiled);
     else
-        fp4_gemm_tcw_body<8, 3>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok);
+        fp4_gemm_tcw_body<8, 3>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok, tiled);
 }

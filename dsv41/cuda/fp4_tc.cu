@@ -53,7 +53,7 @@ template <bool M8>
 __device__ __forceinline__ void fp4_gemm_body(const __nv_bfloat16* __restrict__ X, int ldx,
         const uint8_t* __restrict__ W, long long stride_we, const uint8_t* __restrict__ S, long long stride_se,
         const int* __restrict__ grp_expert, const int* __restrict__ grp_start, const int* __restrict__ pair_tok,
-        float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out, int min_tok, int max_tok)
+        float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out, int min_tok, int max_tok, int tiled)
 {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
@@ -71,19 +71,36 @@ __device__ __forceinline__ void fp4_gemm_body(const __nv_bfloat16* __restrict__ 
         return;
     }
     const int n = n0 + g;
-    const uint8_t* wrow = W + (long long)e * stride_we + (long long)n * (K / 2);
-    const uint8_t* srow = S + (long long)e * stride_se + (long long)n * (K / 32);
+    // this lane's first 16 weight bytes / scale byte and the step per 128 k: row-major, or the tiled layout
+    // [N/16][K/128][16 rows][64 B] (scales [N/16][K/128][16][4]) where a warp's 8 rows x 64 B are contiguous
+    const uint8_t* wrow;
+    const uint8_t* srow;
+    int wstep, sstep;
+    if (tiled) {
+        const int nt_ = n0 >> 4, r_ = ((n0 >> 3) & 1) * 8 + g;
+        wrow = W + (long long)e * stride_we + (long long)nt_ * (K / 128) * 1024 + r_ * 64 + 16 * t;
+        srow = S + (long long)e * stride_se + (long long)nt_ * (K / 128) * 64 + r_ * 4 + t;
+        wstep = 1024; sstep = 64;
+    } else {
+        wrow = W + (long long)e * stride_we + (long long)n * (K / 2) + 16 * t;
+        srow = S + (long long)e * stride_se + (long long)n * (K / 32) + t;
+        wstep = 64; sstep = 4;
+    }
     // x rows for A fragment rows g and g+8
     const __nv_bfloat16* x0 = g < M ? X + (long long)pair_tok[p0 + g] * ldx : nullptr;
     const __nv_bfloat16* x1 = (!M8 && g + 8 < M) ? X + (long long)pair_tok[p0 + g + 8] * ldx : nullptr;
     float c[4] = {0.f, 0.f, 0.f, 0.f};
     const uint4 z4 = make_uint4(0, 0, 0, 0);
-    uint4 wv = z4, xa[4] = {z4, z4, z4, z4}, xb[4] = {z4, z4, z4, z4};
-    int sb = 0;
-    auto load = [&](int k0) {
-        const int kb = k0 + 32 * t;
-        wv = __ldg(reinterpret_cast<const uint4*>(wrow + (kb >> 1)));
-        sb = __ldg(srow + (kb >> 5));
+    // Weights are prefetched PF iterations (128 k each) ahead in explicit register sets: with one iteration of
+    // lookahead a lane had a single 16-byte load in flight, which caps the whole GPU near 1 TB/s by Little's law
+    // (~1.3 MB in flight at ~1.5 us latency). x (L2 resident) stays one iteration ahead.
+    uint4 wv[3] = {z4, z4, z4};
+    int sb[3] = {0, 0, 0};
+    uint4 xa[4] = {z4, z4, z4, z4}, xb[4] = {z4, z4, z4, z4};
+    const int kt = 32 * t;
+#define LOAD_W(k0, I) { wv[I] = __ldg(reinterpret_cast<const uint4*>(wrow + ((k0) >> 7) * wstep)); sb[I] = __ldg(srow + ((k0) >> 7) * sstep); }
+    auto load_x = [&](int k0) {
+        const int kb = k0 + kt;
         if (x0) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) xa[i] = *reinterpret_cast<const uint4*>(x0 + kb + 8 * i);
@@ -95,40 +112,48 @@ __device__ __forceinline__ void fp4_gemm_body(const __nv_bfloat16* __restrict__ 
             }
         }
     };
-    load(0);
-    for (int k0 = 0; k0 < K; k0 += 128) {
-        const uint4 wc = wv; const int sc = sb;
-        uint4 ya[4] = {xa[0], xa[1], xa[2], xa[3]}, yb[4] = {xb[0], xb[1], xb[2], xb[3]};
-        if (k0 + 128 < K) load(k0 + 128);
-        const uint32_t fb = (uint32_t)(sc + 126) << 7;  // 2^(s-1) as bf16
-        const uint32_t f2 = fb | (fb << 16);
-        uint32_t b[16];
-        e2m1x8_to_bf16(wc.x, f2, b);
-        e2m1x8_to_bf16(wc.y, f2, b + 4);
-        e2m1x8_to_bf16(wc.z, f2, b + 8);
-        e2m1x8_to_bf16(wc.w, f2, b + 12);
-        const uint32_t* xav = reinterpret_cast<const uint32_t*>(ya);  // 16 words: x pairs in the same order as b
-        const uint32_t* xbv = reinterpret_cast<const uint32_t*>(yb);
-#pragma unroll
-        for (int s = 0; s < 8; ++s) {
-            const uint32_t bf[2] = {b[2 * s], b[2 * s + 1]};
-            const uint32_t af[4] = {xav[2 * s], M8 ? 0u : xbv[2 * s], xav[2 * s + 1], M8 ? 0u : xbv[2 * s + 1]};
-            mma16816(c, af, bf);
-        }
+    // one 128-k iteration on register set I (compile-time index: the sets stay in registers)
+#define STEP(k0, I) { \
+        const uint4 wc = wv[I]; const int sc = sb[I]; \
+        uint4 ya[4] = {xa[0], xa[1], xa[2], xa[3]}, yb[4] = {xb[0], xb[1], xb[2], xb[3]}; \
+        if ((k0) + 128 < K) load_x((k0) + 128); \
+        if ((k0) + 384 < K) LOAD_W((k0) + 384, I); \
+        const uint32_t fb = (uint32_t)(sc + 126) << 7; \
+        const uint32_t f2 = fb | (fb << 16); \
+        uint32_t b[16]; \
+        e2m1x8_to_bf16(wc.x, f2, b); e2m1x8_to_bf16(wc.y, f2, b + 4); e2m1x8_to_bf16(wc.z, f2, b + 8); e2m1x8_to_bf16(wc.w, f2, b + 12); \
+        const uint32_t* xav = reinterpret_cast<const uint32_t*>(ya); \
+        const uint32_t* xbv = reinterpret_cast<const uint32_t*>(yb); \
+        _Pragma("unroll") \
+        for (int s = 0; s < 8; ++s) { \
+            const uint32_t bf[2] = {b[2 * s], b[2 * s + 1]}; \
+            const uint32_t af[4] = {xav[2 * s], M8 ? 0u : xbv[2 * s], xav[2 * s + 1], M8 ? 0u : xbv[2 * s + 1]}; \
+            mma16816(c, af, bf); \
+        } }
+    LOAD_W(0, 0);
+    if (128 < K) LOAD_W(128, 1);
+    if (256 < K) LOAD_W(256, 2);
+    load_x(0);
+    for (int k0 = 0; k0 < K; ) {
+        STEP(k0, 0); k0 += 128; if (k0 >= K) break;
+        STEP(k0, 1); k0 += 128; if (k0 >= K) break;
+        STEP(k0, 2); k0 += 128;
     }
+#undef STEP
+#undef LOAD_W
     // C: rows g / g+8 (pairs p0+g, p0+g+8), columns n0 + 2t, 2t+1
     if (g < M) { float* o = out + (long long)(p0 + g) * ldo + n0 + 2 * t; o[0] = c[0]; o[1] = c[1]; }
     if (!M8 && g + 8 < M) { float* o = out + (long long)(p0 + g + 8) * ldo + n0 + 2 * t; o[0] = c[2]; o[1] = c[3]; }
 }
 
-extern "C" __global__ void __launch_bounds__(WARPS * 32)
+extern "C" __global__ void __launch_bounds__(WARPS * 32, 4)
 fp4_gemm_tc8(const __nv_bfloat16* __restrict__ X, int ldx, const uint8_t* __restrict__ W, long long stride_we,
              const uint8_t* __restrict__ S, long long stride_se, const int* __restrict__ grp_expert, const int* __restrict__ grp_start,
-             const int* __restrict__ pair_tok, float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out, int min_tok, int max_tok)
-{ fp4_gemm_body<true>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok); }
+             const int* __restrict__ pair_tok, float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out, int min_tok, int max_tok, int tiled)
+{ fp4_gemm_body<true>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok, tiled); }
 
 extern "C" __global__ void __launch_bounds__(WARPS * 32)
 fp4_gemm_tc16(const __nv_bfloat16* __restrict__ X, int ldx, const uint8_t* __restrict__ W, long long stride_we,
               const uint8_t* __restrict__ S, long long stride_se, const int* __restrict__ grp_expert, const int* __restrict__ grp_start,
-              const int* __restrict__ pair_tok, float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out, int min_tok, int max_tok)
-{ fp4_gemm_body<false>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok); }
+              const int* __restrict__ pair_tok, float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out, int min_tok, int max_tok, int tiled)
+{ fp4_gemm_body<false>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out, min_tok, max_tok, tiled); }

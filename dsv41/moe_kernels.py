@@ -30,7 +30,7 @@ def _grouped_fp4_kernel(
     A, W, S, OUT, ROW_IN, ROW_OUT, WEIGHT, TILE_EXPERT, TILE_START, N_PAIRS,
     N, K,
     stride_am, stride_we, stride_wn, stride_se, stride_sn, stride_om,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr, ATOMIC: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr, ATOMIC: tl.constexpr, TILED: tl.constexpr,
 ):
     tile = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -52,8 +52,16 @@ def _grouped_fp4_kernel(
     s_base = S + expert * stride_se
     for k0 in range(pid_k * kps, (pid_k + 1) * kps, BLOCK_K):
         a = tl.load(A + rin[:, None] * stride_am + (k0 + tl.arange(0, BLOCK_K))[None, :], mask=p_mask[:, None], other=0.0)
-        packed = tl.load(w_base + rn[:, None] * stride_wn + (k0 // 2 + rkh)[None, :], mask=n_mask[:, None], other=0).to(tl.int32)
-        sb = tl.load(s_base + rn[:, None] * stride_sn + (k0 // 32 + rg)[None, :], mask=n_mask[:, None], other=0).to(tl.int32)
+        if TILED:  # quant.tile_fp4 layout: [N/16][K/128][16 rows][64 B], scales [N/16][K/128][16][4]
+            kb = k0 // 2 + rkh
+            ks = k0 // 32 + rg
+            packed = tl.load(w_base + ((rn // 16) * (K // 128) * 1024 + (rn % 16) * 64)[:, None] + ((kb // 64) * 1024 + kb % 64)[None, :],
+                             mask=n_mask[:, None], other=0).to(tl.int32)
+            sb = tl.load(s_base + ((rn // 16) * (K // 128) * 64 + (rn % 16) * 4)[:, None] + ((ks // 4) * 64 + ks % 4)[None, :],
+                         mask=n_mask[:, None], other=0).to(tl.int32)
+        else:
+            packed = tl.load(w_base + rn[:, None] * stride_wn + (k0 // 2 + rkh)[None, :], mask=n_mask[:, None], other=0).to(tl.int32)
+            sb = tl.load(s_base + rn[:, None] * stride_sn + (k0 // 32 + rg)[None, :], mask=n_mask[:, None], other=0).to(tl.int32)
         sb = tl.reshape(tl.broadcast_to(tl.reshape(sb, (BLOCK_N, BLOCK_K // 32, 1)), (BLOCK_N, BLOCK_K // 32, 16)), (BLOCK_N, BLOCK_K // 2))
         w_lo = _decode_e2m1_bf16(packed & 0x0F, sb)
         w_hi = _decode_e2m1_bf16(packed >> 4, sb)
@@ -117,7 +125,7 @@ class GroupedPairs:
 
 
 def grouped_fp4_gemm(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, pairs: GroupedPairs, n_out_rows: int,
-                     out: torch.Tensor | None = None, block_m: int | None = None) -> torch.Tensor:
+                     out: torch.Tensor | None = None, block_m: int | None = None, tiled: bool = False) -> torch.Tensor:
     """a: bf16 [rows_in, K]; w: uint8 [E, N, K/2]; s: uint8 [E, N, K/32]. Returns fp32 [n_out_rows, N]
     with out[row_out] += weight * a[row_in] @ W[expert]^T accumulated over pairs (atomic)."""
     K = a.shape[1]
@@ -138,7 +146,7 @@ def grouped_fp4_gemm(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, pairs: G
         _grouped_fp4_kernel_masked[(tiles, triton.cdiv(N, bn), split)](
             a, w, s, out, pairs.row_in, pairs.row_out, pairs.weight, pairs.tile_expert, pairs.tile_start, pairs.tile_count,
             N, K, a.stride(0), w.stride(0), w.stride(1), s.stride(0), s.stride(1), out.stride(0),
-            BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=split, num_warps=4, num_stages=3,
+            BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=split, TILED=tiled, num_warps=4, num_stages=3,
         )
     return out
 
@@ -148,7 +156,7 @@ def _grouped_fp4_kernel_masked(
     A, W, S, OUT, ROW_IN, ROW_OUT, WEIGHT, TILE_EXPERT, TILE_START, TILE_COUNT,
     N, K,
     stride_am, stride_we, stride_wn, stride_se, stride_sn, stride_om,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr, TILED: tl.constexpr,
 ):
     tile = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -170,8 +178,16 @@ def _grouped_fp4_kernel_masked(
     s_base = S + expert.to(tl.int64) * stride_se
     for k0 in range(pid_k * kps, (pid_k + 1) * kps, BLOCK_K):
         a = tl.load(A + rin[:, None] * stride_am + (k0 + tl.arange(0, BLOCK_K))[None, :], mask=p_mask[:, None], other=0.0)
-        packed = tl.load(w_base + rn[:, None] * stride_wn + (k0 // 2 + rkh)[None, :], mask=n_mask[:, None], other=0).to(tl.int32)
-        sb = tl.load(s_base + rn[:, None] * stride_sn + (k0 // 32 + rg)[None, :], mask=n_mask[:, None], other=0).to(tl.int32)
+        if TILED:  # quant.tile_fp4 layout: [N/16][K/128][16 rows][64 B], scales [N/16][K/128][16][4]
+            kb = k0 // 2 + rkh
+            ks = k0 // 32 + rg
+            packed = tl.load(w_base + ((rn // 16) * (K // 128) * 1024 + (rn % 16) * 64)[:, None] + ((kb // 64) * 1024 + kb % 64)[None, :],
+                             mask=n_mask[:, None], other=0).to(tl.int32)
+            sb = tl.load(s_base + ((rn // 16) * (K // 128) * 64 + (rn % 16) * 4)[:, None] + ((ks // 4) * 64 + ks % 4)[None, :],
+                         mask=n_mask[:, None], other=0).to(tl.int32)
+        else:
+            packed = tl.load(w_base + rn[:, None] * stride_wn + (k0 // 2 + rkh)[None, :], mask=n_mask[:, None], other=0).to(tl.int32)
+            sb = tl.load(s_base + rn[:, None] * stride_sn + (k0 // 32 + rg)[None, :], mask=n_mask[:, None], other=0).to(tl.int32)
         sb = tl.reshape(tl.broadcast_to(tl.reshape(sb, (BLOCK_N, BLOCK_K // 32, 1)), (BLOCK_N, BLOCK_K // 32, 16)), (BLOCK_N, BLOCK_K // 2))
         w_lo = _decode_e2m1_bf16(packed & 0x0F, sb)
         w_hi = _decode_e2m1_bf16(packed >> 4, sb)

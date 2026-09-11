@@ -4,7 +4,7 @@ import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from dsv41 import cukern
-from dsv41.quant import dequant_fp4, fake_quant_fp8
+from dsv41.quant import dequant_fp4, fake_quant_fp8, tile_fp4, tile_fp4_scales
 
 dev = torch.device("cuda:6")
 torch.manual_seed(0)
@@ -12,6 +12,8 @@ E, N, K = 48, 4608, 5120
 w = torch.randint(0, 256, (E, N, K // 2), device=dev, dtype=torch.uint8)
 s = torch.randint(112, 128, (E, N, K // 32), device=dev, dtype=torch.uint8)
 wb = torch.stack([dequant_fp4(w[e], s[e]) for e in range(E)]).float()
+if cukern.FP4_TILED:
+    w, s = tile_fp4(w), tile_fp4_scales(s)
 
 def gtime(fn, it=10):
     st = torch.cuda.Stream(device=dev)

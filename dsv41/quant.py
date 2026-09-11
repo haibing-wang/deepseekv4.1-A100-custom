@@ -108,3 +108,32 @@ def dequant_fp4(packed: torch.Tensor, scale: torch.Tensor, block: int = 32) -> t
     v = unpack_fp4(packed)
     s = e8m0_to_float(scale).repeat_interleave(block, 1)
     return (v * s).to(torch.bfloat16)
+
+
+# --------------------------------------------------------------------------- tiled FP4 expert layout
+# The decode kernels (cuda/fp4_tc.cu, cuda/fp4_tcw.cu) read, per warp instruction, 8 rows x 64 bytes of an expert
+# (128 k). Stored row-major those are 8 separate 64-byte pieces 2.5 KB apart; tiled as
+# [N/16][K/128][16 rows][64 B] (scales [N/16][K/128][16][4]) every warp load is one contiguous 512-byte range
+# (fp4_gemm_tc8 at one token per expert: 1.02 -> 1.20 TB/s). Same tensor shapes, permuted content.
+def tile_fp4(w: torch.Tensor) -> torch.Tensor:
+    """uint8 [E, N, K/2] row-major -> tiled (same shape)."""
+    E, N, Kh = w.shape
+    assert N % 16 == 0 and Kh % 64 == 0
+    return w.view(E, N // 16, 16, Kh // 64, 64).permute(0, 1, 3, 2, 4).reshape(E, N, Kh).contiguous()
+
+
+def untile_fp4(w: torch.Tensor) -> torch.Tensor:
+    E, N, Kh = w.shape
+    return w.view(E, N // 16, Kh // 64, 16, 64).permute(0, 1, 3, 2, 4).reshape(E, N, Kh).contiguous()
+
+
+def tile_fp4_scales(s: torch.Tensor) -> torch.Tensor:
+    """uint8 [E, N, K/32] -> tiled [N/16][K/128][16][4] (same shape)."""
+    E, N, Ks = s.shape
+    assert N % 16 == 0 and Ks % 4 == 0
+    return s.view(E, N // 16, 16, Ks // 4, 4).permute(0, 1, 3, 2, 4).reshape(E, N, Ks).contiguous()
+
+
+def untile_fp4_scales(s: torch.Tensor) -> torch.Tensor:
+    E, N, Ks = s.shape
+    return s.view(E, N // 16, Ks // 4, 16, 4).permute(0, 1, 3, 2, 4).reshape(E, N, Ks).contiguous()
