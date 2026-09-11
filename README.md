@@ -3,7 +3,8 @@
 `dsv41/` runs the official `deepseek-ai/DeepSeek-V4.1-Flash` checkpoint (552B MoE backbone + 196B Engram
 conditional memory, FP8/FP4 weights) on 8× A100 80GB, a GPU generation with no FP8/FP4 tensor cores and
 no support in DeepSeek's own inference stack, vLLM or SGLang. The Engram hash tables (2 × 92 GiB) live in
-host RAM. Single-stream decode reaches ~33 tok/s; the outputs are deterministic.
+host RAM. Single-stream decode reaches 52 tok/s on the 8-GPU layer pipeline, 62 tok/s with expert
+parallelism across 7 GPUs, and 32-35 tok/s on a single A100 with the experts computed on the CPUs.
 
 Nothing here depends on a third-party implementation of the model: the released `inference/model.py`
 was used only as the architecture definition. All kernels are ours (Triton and CUDA C).
@@ -63,8 +64,26 @@ Requirements: torch ≥ 2.10 with `float8_e8m0fnu` (we use 2.13+cu130), triton �
 (`--ckpt`), ~310 GiB of free GPU memory in total and ~190 GiB of host RAM for the Engram tables.
 
 Flags: `--profile` (per-component decode timing), `--kernel-profile` (top CUDA kernels per token),
-`--decode eager|static|graph`, `--n-layers N` (plumbing tests), `--no-engram`, `--budgets 3:26` (per-GPU GiB).
-`DSV41_DETERMINISTIC=1` disables split-K in the prefill MoE kernel.
+`--kernel-trace FILE` (chronological kernel list of one step), `--decode eager|static|graph`, `--n-layers N`
+(plumbing tests), `--no-engram`, `--budgets 3:26` (per-GPU GiB). `DSV41_DETERMINISTIC=1` disables split-K
+in the prefill MoE kernel.
+
+### Expert parallelism (`--ep`)
+
+```
+python -m dsv41.run --devices 2,3,0,1 --ep --chat --prompt "..."                 # 4 GPUs, equal shards
+python -m dsv41.run --devices 2,3,0,1,4,5,7 --ep --ep-shards 82,82,68,38,38,38,38 # uneven shards (free memory)
+```
+
+`dsv41/ep.py`: the dense layers are pipelined over the GPUs in order and every layer's 384 experts are
+sharded over all of them, so each GPU reads only its own experts. Per layer the owner GPU pushes the
+quantized activation and the routing to the peers with P2P stores and raises a flag; every GPU computes
+the selected experts it holds (a masked grouped tensor-core GEMM) and pushes its partial sum back; the
+owner waits for the flags, adds the shared expert and continues. The whole token is one CUDA graph per
+GPU with device-side flag synchronisation (no host round trips). Needs P2P between the GPUs: on this box
+the 4 GPUs of one socket exchange a message in ~10 us, across sockets it is much slower. 62 tok/s on
+7 GPUs vs 52 tok/s for the pipeline; the expert reads per step stay bounded when several tokens are
+verified at once, which is what speculative decoding needs.
 
 ## How it maps to Ampere
 
@@ -119,14 +138,17 @@ This is the `--offload-experts` mode. It has two variants:
   across the two NUMA nodes with node-local first touch, threads pinned to physical cores). Only the
   10 KB activation and the 20 KB MoE output cross PCIe per layer; the GPU runs attention, the dense
   projections and the shared expert (overlapped with the CPU) inside CUDA graphs. Measured on this box
-  (2× Xeon Silver 4410Y, DDR5-4000 ×16 channels): **12.2 tok/s** on one A100, CPU experts 57 ms/token.
+  (2× Xeon Silver 4410Y, DDR5-4000 ×32 DIMMs, 229 GB/s measured read ceiling): CPU experts ~0.13 ms per
+  expert plus ~0.05 ms per layer, i.e. ~24 ms/token when every expert is cold.
 - `--offload-experts cpu --hot-experts 64`: hybrid. The 64 most used experts of each layer (from a
   routing profile, `--route-stats` / `results/route_stats.pt`; on this text the top 20% of experts take
   82% of the hits) also live on the GPU and are computed there together with the shared expert while the
   CPU computes the cold ones; the two partial sums are added. Uses ~49 GB more GPU memory for 64/layer.
-  Measured: **21 tok/s** on an English prompt in the profile's domain (73% of expert hits on the GPU,
-  CPU 35-40 ms/token, GPU 21 ms/token); 11.7 tok/s on a Japanese prompt where only 20% hit. The profile is
-  static for now, so the next step is an adaptive (usage-based) replacement policy.
+  Measured with 80 hot experts per layer: **35 tok/s** on an English prompt in the profile's domain (78%
+  of expert hits on the GPU, GPU side 13 ms/token), 22 tok/s on a Japanese prompt where the static profile
+  hits 19%. `dsv41/hotcache.py` replaces resident experts by recent usage (a background thread copies the
+  weights over PCIe through pinned staging; `DSV41_ADAPTIVE_HOT=0` disables it, `DSV41_HOT_SWAPS` swaps per
+  token): the Japanese hit rate rises to 40-56% over a few hundred tokens.
 - `--offload-experts gpu`: the experts are DMA'd from pinned RAM into a GPU staging buffer and computed on
   the GPU. 4.5 GB per token over PCIe 4.0 x16 (25 GB/s measured) → **2.3 tok/s**. Kept for reference.
 
@@ -138,7 +160,13 @@ python -m dsv41.serve --devices 2 --offload-experts --port 8000
 The dense weights go to the GPU (~20 GiB used in total). Prefill (more than 16 tokens) currently streams
 all experts of a layer through the GPU in chunks of 64 (each (token, expert) pair is computed in its
 expert's chunk); from pageable NUMA memory this takes ~40 s per prompt and is the next thing to fix.
-Decode uses three CUDA graphs per layer (dense part → CPU experts → post-processing).
+Decode uses three CUDA graphs per layer (dense part → CPU experts → post-processing) and one host sync
+per layer. The CPU path wants huge pages (the expert buffers are `MADV_HUGEPAGE`; with a fragmented
+page cache the kernel silently falls back to 4 KiB pages and streaming gets ~10% slower), the workers
+pinned to all hardware threads except one core per NUMA node (kept for the main thread, the CUDA driver
+and the cache copy thread), `OMP_WAIT_POLICY=active` (set before torch is imported), the expert rows
+first-touched under a per-thread `MPOL_BIND` (otherwise the kernel spills a node's rows to the other node
+when its free memory is fragmented, and that node's threads run at half speed), `kernel.numa_balancing=0`.
 
 ## Numbers (8× A100 80GB PCIe, shared with other jobs)
 
@@ -150,9 +178,19 @@ Decode uses three CUDA graphs per layer (dense part → CPU experts → post-pro
 | static-shape decode + CUDA graphs | 21.7 |
 | CUDA C expert GEMV | 31.6 |
 | split-slot decode attention | 33.6 |
+| fused decode layer (~26 kernels instead of ~100; the 12 ms "rest" was ~4,000 tiny kernels inside the graphs) | 37.9 |
+| dense weights kept FP8, decoded in registers to bf16 tensor-core operands (`cuda/fp8_tc.cu`) | 42.6 |
+| FP4 experts decoded in registers to bf16 tensor-core operands, grouped by expert (`cuda/fp4_tc.cu`) | 47.4 |
+| split-K epilogue in the kernel, hyper-connection split on a side stream | 51.9 |
+| expert parallelism over 7 GPUs (`--ep`) | 62.0 |
 
-Prefill of a 1,413-token prompt: 4.8 s (296 tok/s); decode after it: 33.4 tok/s. Load: ~70 s with the
-checkpoint in page cache, ~4 min cold.
+GPU time per token on the pipeline: FP8 dense 6.3 ms, FP4 experts 5.0 ms, the rest ~8 ms (attention,
+indexer top-k, small fused kernels). Prefill of a 1,413-token prompt: 4.8 s (296 tok/s). Load: ~70 s with
+the checkpoint in page cache, ~4 min cold.
 
-Not implemented yet: DSpark (MTP) speculative decoding, the vision encoder, batch > 1, a fast FP8
-dense GEMV (`cuda/fp8_gemv.cu` is an unused attempt that does not beat cuBLAS bf16).
+Why A100 can do this without FP8/FP4 units: an E4M3 byte placed as `s<<15 | e<<7 | m<<4` is a bf16 whose
+value is the FP8 value times 2^-120 (the subnormals line up too), so one bf16x2 multiply by 2^(scale-7)
+turns two packed weights into exactly dequantized bf16 operands for `mma.sync`; E2M1 nibbles work the same
+way with 2^126. The weights stay 8-bit / 4-bit in HBM and the tensor cores do the accumulation in fp32.
+
+Not implemented yet: DSpark (MTP) speculative decoding, the vision encoder, batch > 1.
