@@ -70,7 +70,7 @@ template <int MT, int STAGES, int MW>
 __device__ __forceinline__ void fp8_gemm_tcw_body(const __nv_bfloat16* __restrict__ X, int ldx, int M,
             const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, int N, int K, int Kc,
             float* __restrict__ out, int ldo, int k_per_split, int group_cols,
-            __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits)
+            __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits, int tiled)
 {
     constexpr int ROWS = 8 * MT * MW;          // x rows staged per iteration (MW warps along M, MT tiles each)
     constexpr int CH = 16;                     // 16-byte chunks per row (128 k)
@@ -84,8 +84,12 @@ __device__ __forceinline__ void fp8_gemm_tcw_body(const __nv_bfloat16* __restric
     const int mrow0 = mw * 8 * MT;             // first x row of this warp's tiles
     const int ks = blockIdx.y * k_per_split;
     const int ke = min(K, ks + k_per_split);
-    const uint8_t* wrowA = W + (long long)(n0 + g) * K;
-    const uint8_t* wrowB = W + (long long)(n0 + g + 8) * K;
+    // lane's first bytes of rows n0+g / n0+g+8 and the step per 64 k (row-major or the tiled layout
+    // [N/16][K/64][16 rows][64 B]; n0 is a multiple of 16)
+    const uint8_t* wt0 = tiled ? W + (long long)(n0 >> 4) * (K / 64) * 1024 + 16 * t : nullptr;
+    const uint8_t* wrowA = tiled ? wt0 + g * 64 : W + (long long)(n0 + g) * K + 16 * t;
+    const uint8_t* wrowB = tiled ? wt0 + (g + 8) * 64 : W + (long long)(n0 + g + 8) * K + 16 * t;
+    const int wstep = tiled ? 1024 : 64;
     const uint8_t* srow = S + (long long)(n0 >> 5) * Kc;
     const int xgroups = group_cols > 0 ? N / group_cols : 1;
     const int xg = group_cols > 0 ? n_blk / group_cols : 0;
@@ -101,8 +105,8 @@ __device__ __forceinline__ void fp8_gemm_tcw_body(const __nv_bfloat16* __restric
         for (int h = 0; h < 2; ++h) {
             const int kb = kk + 64 * h + 16 * t;
             const bool ok = kb < ke;
-            wa[h] = ok ? __ldg(reinterpret_cast<const uint4*>(wrowA + kb)) : z4;
-            wb[h] = ok ? __ldg(reinterpret_cast<const uint4*>(wrowB + kb)) : z4;
+            wa[h] = ok ? __ldg(reinterpret_cast<const uint4*>(wrowA + (kb >> 6) * wstep)) : z4;
+            wb[h] = ok ? __ldg(reinterpret_cast<const uint4*>(wrowB + (kb >> 6) * wstep)) : z4;
             sb[h] = ok ? __ldg(srow + (kb >> 5)) : 0;
         }
     };
@@ -203,8 +207,8 @@ __device__ __forceinline__ void fp8_gemm_tcw_body(const __nv_bfloat16* __restric
 extern "C" __global__ void __launch_bounds__(WARPS * MW * 32) \
 NAME(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, \
              int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols, \
-             __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits) \
-{ fp8_gemm_tcw_body<MT, ST, MW>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits); }
+             __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits, int tiled) \
+{ fp8_gemm_tcw_body<MT, ST, MW>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits, tiled); }
 
 KERNEL(2, 3, 1, fp8_gemm_tcw2s3)
 KERNEL(4, 3, 1, fp8_gemm_tcw4s3)

@@ -113,8 +113,9 @@ FP8_W_MW = int(os.environ.get("DSV41_FP8_W_MW", "1"))  # warps along M per block
 _attr_done: set = set()  # experiment: force the split-K factor
 
 
-def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols: int = 0, out_dtype=torch.bfloat16) -> torch.Tensor:
-    """x: bf16 [M, K] (contiguous); w8: uint8 (e4m3 bits) [N, K] in the w8.PERM_K byte order; s8: uint8 (E8M0) [ceil(N/32), K/32].
+def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols: int = 0, out_dtype=torch.bfloat16, tiled: bool = False) -> torch.Tensor:
+    """x: bf16 [M, K] (contiguous); w8: uint8 (e4m3 bits) [N, K] in the w8.PERM_K byte order (tiled=True: also w8.tile);
+    s8: uint8 (E8M0) [ceil(N/32), K/32].
     Returns x @ dequant(w8, s8)^T as [M, N] (fp32 accumulation, rounded to out_dtype).
     group_cols > 0: block-diagonal use (x: [B * N/group_cols, K]; output row b, column n uses x row
     b * (N/group_cols) + n // group_cols) -> [B, N]."""
@@ -123,14 +124,14 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and w8.is_contiguous() and s8.is_contiguous()
     assert K % 64 == 0 and N % 8 == 0 and (group_cols == 0 or group_cols % 8 == 0 and N % group_cols == 0)
     Mo = M // (N // group_cols) if group_cols else M
-    tiled = FP8_G_LAYOUT and Mo > 64 and N % 128 == 0 and K % 128 == 0 and (group_cols == 0 or group_cols % 128 == 0)
-    if tiled:  # many rows: CUTLASS-style tiles (fp8_tcg.cu), any M
-        return _fp8_gemm_tcg(x, w8, s8, Mo, N, K, group_cols, out_dtype)
+    use_tcg = FP8_G_LAYOUT and Mo > 64 and N % 128 == 0 and K % 128 == 0 and (group_cols == 0 or group_cols % 128 == 0)
+    if use_tcg:  # many rows: CUTLASS-style tiles (fp8_tcg.cu), any M
+        return _fp8_gemm_tcg(x, w8, s8, Mo, N, K, group_cols, out_dtype, tiled)
     wlayout = FP8_W_LAYOUT and Mo > 16 and N % 64 == 0 and (group_cols == 0 or group_cols % 64 == 0)
     rows_per = 64 if wlayout else 16
     if Mo > rows_per:  # chunk
         per = (N // group_cols) if group_cols else 1
-        return torch.cat([fp8_gemm_tc(x[i * per : (i + rows_per) * per], w8, s8, group_cols, out_dtype) for i in range(0, Mo, rows_per)], dim=0)
+        return torch.cat([fp8_gemm_tc(x[i * per : (i + rows_per) * per], w8, s8, group_cols, out_dtype, tiled) for i in range(0, Mo, rows_per)], dim=0)
     WARPS = 4
     if wlayout:  # weights as the mma A operand (16 columns per warp), up to 64 rows per pass, weights read once
         MT = 2 if Mo <= 16 else 4 if Mo <= 32 else 8
@@ -162,7 +163,8 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
     args = [ctypes.c_void_p(x.data_ptr()), ctypes.c_int(x.stride(0)), ctypes.c_int(Mo),
             ctypes.c_void_p(w8.data_ptr()), ctypes.c_void_p(s8.data_ptr()), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(s8.shape[1]),
             ctypes.c_void_p(part.data_ptr()), ctypes.c_int(N), ctypes.c_int(kps), ctypes.c_int(group_cols),
-            ctypes.c_void_p(y.data_ptr() if y is not None else 0), ctypes.c_void_p(counters.data_ptr() if counters is not None else 0), ctypes.c_int(splits)]
+            ctypes.c_void_p(y.data_ptr() if y is not None else 0), ctypes.c_void_p(counters.data_ptr() if counters is not None else 0), ctypes.c_int(splits),
+            ctypes.c_int(1 if tiled else 0)]
     launch(f, grid, (WARPS * 32 * (MW if wlayout else 1), 1, 1), args, x.device, shared=shared if wlayout else 0)
     if fused_epilogue:
         return y
@@ -170,7 +172,7 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
     return y.to(out_dtype)
 
 
-def _fp8_gemm_tcg(x, w8, s8, Mo, N, K, group_cols, out_dtype):
+def _fp8_gemm_tcg(x, w8, s8, Mo, N, K, group_cols, out_dtype, tiled=False):
     """fp8_tcg.cu: 256-thread blocks, tile 64 rows x 128 columns x 128 k, split-K with the fused epilogue."""
     mblocks = (Mo + 63) // 64
     splits = 1  # ~256 blocks, fp32 partials at most the weight bytes
@@ -193,7 +195,8 @@ def _fp8_gemm_tcg(x, w8, s8, Mo, N, K, group_cols, out_dtype):
     args = [ctypes.c_void_p(x.data_ptr()), ctypes.c_int(x.stride(0)), ctypes.c_int(Mo),
             ctypes.c_void_p(w8.data_ptr()), ctypes.c_void_p(s8.data_ptr()), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(s8.shape[1]),
             ctypes.c_void_p(part.data_ptr()), ctypes.c_int(N), ctypes.c_int(kps), ctypes.c_int(group_cols),
-            ctypes.c_void_p(y.data_ptr() if y is not None else 0), ctypes.c_void_p(counters.data_ptr() if counters is not None else 0), ctypes.c_int(splits)]
+            ctypes.c_void_p(y.data_ptr() if y is not None else 0), ctypes.c_void_p(counters.data_ptr() if counters is not None else 0), ctypes.c_int(splits),
+            ctypes.c_int(1 if tiled else 0)]
     launch(f, (N // 128, mblocks, splits), (256, 1, 1), args, x.device, shared=shared)
     if fused_epilogue:
         return y

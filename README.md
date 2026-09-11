@@ -228,6 +228,13 @@ speed = aggregate / S):
 | 40 | 71.7, 554 | 182.2, 2.59, **568** | – |
 | 48 | 76.0, **624** | 201.9, 2.58, 614 | – |
 | 64 | 86.1, **737** | 244.4, 2.57, 674 | – |
+| 96 | 96.2, 996 | – | – |
+| 128 | 109.8, 1164 | – | – |
+| 192 | 143.3, 1340 | – | – |
+| 256 | 174.5, 1467 | – | – |
+
+(measured before the tiled expert layout below; after it: S=1 K=5 91, S=8 K=5 361, S=32 K=3 633, S=32 plain
+571, S=64 plain 873, S=256 plain **1,769 tok/s** at 144.7 ms/step.)
 
 The best setting depends on the number of contexts: 5 drafts up to 8 contexts, 3 drafts from 12 to 40,
 no MTP from about 44 contexts on (the verification rows then touch nearly every expert of every layer, so
@@ -247,6 +254,14 @@ interference), so the 8-GPU box gives ~1,050 tok/s on mixed prompts and ~1,250 o
 GPU time per token on the pipeline: FP8 dense 6.3 ms, FP4 experts 5.0 ms, the rest ~8 ms (attention,
 indexer top-k, small fused kernels). Prefill of a 1,413-token prompt: 4.8 s (296 tok/s). Load: ~70 s with
 the checkpoint in page cache, ~4 min cold.
+
+Expert kernel bandwidth: Nsight showed the FP4 expert GEMM at 46% of DRAM peak with `long_scoreboard` as the
+top stall, but stripping the decode entirely only gained 11% (memory-only variant: 1.50 TB/s), so the culprit
+was the access pattern: a warp read 8 rows x 64 B per 128-k step as 8 scattered pieces. The experts are now
+stored tiled at load time (`quant.tile_fp4`: `[N/16][K/128][16 rows][64 B]`, scales alongside; the prefill
+Triton kernel reads the same layout) and every group goes through the shared-memory kernel: 1 token per expert
+1.02 -> 1.46 TB/s, 8 tokens 0.86 -> 1.35, 16 tokens 0.52 -> 1.21 TB/s; the expert phase of a 128-row step
+fell from 1.74 to 1.16 ms per layer. The same tiling on the FP8 dense weights (`w8.tile`) is worth ~5%.
 
 Why A100 can do this without FP8/FP4 units: an E4M3 byte placed as `s<<15 | e<<7 | m<<4` is a bf16 whose
 value is the FP8 value times 2^-120 (the subnormals line up too), so one bf16x2 multiply by 2^(scale-7)

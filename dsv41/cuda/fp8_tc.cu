@@ -54,7 +54,7 @@ template <bool M8>
 __device__ __forceinline__ void fp8_gemm_tc_body(const __nv_bfloat16* __restrict__ X, int ldx, int M,
             const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, int N, int K, int Kc,
             float* __restrict__ out, int ldo, int k_per_split, int group_cols,
-            __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits)
+            __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits, int tiled)
 {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
@@ -63,7 +63,10 @@ __device__ __forceinline__ void fp8_gemm_tc_body(const __nv_bfloat16* __restrict
     const int n = n0 + g;
     const int ks = blockIdx.y * k_per_split;
     const int ke = min(K, ks + k_per_split);
-    const uint8_t* wrow = W + (long long)n * K;
+    // lane's first 16 weight bytes and the step per 64 k: row-major, or the tiled layout [N/16][K/64][16 rows][64 B]
+    // (w8.tile: a warp's 8 rows x 64 B per 64-k step are one contiguous 512-byte range)
+    const uint8_t* wrow = tiled ? W + (long long)(n >> 4) * (K / 64) * 1024 + (n & 15) * 64 + 16 * t : W + (long long)n * K + 16 * t;
+    const int wstep = tiled ? 1024 : 64;
     const uint8_t* srow = S + (long long)(n >> 5) * Kc;
     int xr0, xr1;
     if (group_cols > 0) {  // block-diagonal: row b of the output uses x row b * xgroups + (column group)
@@ -86,7 +89,7 @@ __device__ __forceinline__ void fp8_gemm_tc_body(const __nv_bfloat16* __restrict
         for (int h = 0; h < 2; ++h) {
             const int kb = kk + 64 * h + 16 * t;
             const bool ok = kb < ke;
-            wv[h] = ok ? __ldg(reinterpret_cast<const uint4*>(wrow + kb)) : z4;
+            wv[h] = ok ? __ldg(reinterpret_cast<const uint4*>(wrow + (kb >> 6) * wstep)) : z4;
             sb[h] = ok ? __ldg(srow + (kb >> 5)) : 0;
             if (x0 && ok) { xa[h][0] = *reinterpret_cast<const uint4*>(x0 + kb); xa[h][1] = *reinterpret_cast<const uint4*>(x0 + kb + 8); }
             if (!M8) { if (x1 && ok) { xb[h][0] = *reinterpret_cast<const uint4*>(x1 + kb); xb[h][1] = *reinterpret_cast<const uint4*>(x1 + kb + 8); } }
@@ -147,11 +150,11 @@ __device__ __forceinline__ void fp8_gemm_tc_body(const __nv_bfloat16* __restrict
 extern "C" __global__ void __launch_bounds__(WARPS * 32)
 fp8_gemm_tc8(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
              int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols,
-             __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits)
-{ fp8_gemm_tc_body<true>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits); }
+             __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits, int tiled)
+{ fp8_gemm_tc_body<true>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits, tiled); }
 
 extern "C" __global__ void __launch_bounds__(WARPS * 32)
 fp8_gemm_tc16(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
               int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols,
-              __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits)
-{ fp8_gemm_tc_body<false>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits); }
+              __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits, int tiled)
+{ fp8_gemm_tc_body<false>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits, tiled); }

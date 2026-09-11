@@ -10,9 +10,11 @@ dev = torch.device("cuda:6")
 torch.manual_seed(0)
 PERM = [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15]
 
+from dsv41.w8 import tile, TILED as W8_TILED
 def permute_k(w8):
     N, K = w8.shape
-    return w8.view(N, K // 16, 16)[:, :, PERM].reshape(N, K).contiguous()
+    p = w8.view(N, K // 16, 16)[:, :, PERM].reshape(N, K).contiguous()
+    return tile(p) if W8_TILED else p
 
 def rand_fp8(N, K):
     w = torch.randint(0, 256, (N, K), device=dev, dtype=torch.uint8)
@@ -47,7 +49,7 @@ def tcg(x, wp, s, N, K, gc, splits):
     counters = cukern._tile_counters(dev, (N // 128) * ((M + 63) // 64))
     args = [ctypes.c_void_p(x.data_ptr()), ctypes.c_int(K), ctypes.c_int(M), ctypes.c_void_p(wp.data_ptr()), ctypes.c_void_p(s.data_ptr()),
             ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(K // 32), ctypes.c_void_p(part.data_ptr()), ctypes.c_int(N), ctypes.c_int(kps), ctypes.c_int(gc),
-            ctypes.c_void_p(y.data_ptr()), ctypes.c_void_p(counters.data_ptr()), ctypes.c_int(splits)]
+            ctypes.c_void_p(y.data_ptr()), ctypes.c_void_p(counters.data_ptr()), ctypes.c_int(splits), ctypes.c_int(1 if W8_TILED else 0)]
     launch(f, (N // 128, (M + 63) // 64, splits), (256, 1, 1), args, dev, shared=SHARED)
     return y
 
@@ -64,8 +66,8 @@ for (M, N, K, gc) in [(32, 5120, 8192, 0), (64, 5120, 8192, 0), (96, 5120, 8192,
     err = ((y.float() - ref.float()).abs().max() / ref.abs().max()).item()
     ts = [gtime(lambda sp=sp: tcg(x, wp, s, N, K, gc, sp)) for sp in [1, 2, 4, 8]]
     cukern.FP8_G_LAYOUT = False
-    told = gtime(lambda: cukern.fp8_gemm_tc(x, wp, s, group_cols=gc))
+    told = gtime(lambda: cukern.fp8_gemm_tc(x, wp, s, group_cols=gc, tiled=W8_TILED))
     cukern.FP8_G_LAYOUT = True
-    tnew = gtime(lambda: cukern.fp8_gemm_tc(x, wp, s, group_cols=gc))
-    assert cukern.fp8_gemm_tc(x, wp, s, group_cols=gc).float().sub(ref.float()).abs().max() <= 2 * (y.float() - ref.float()).abs().max() + 1
+    tnew = gtime(lambda: cukern.fp8_gemm_tc(x, wp, s, group_cols=gc, tiled=W8_TILED))
+    assert cukern.fp8_gemm_tc(x, wp, s, group_cols=gc, tiled=W8_TILED).float().sub(ref.float()).abs().max() <= 2 * (y.float() - ref.float()).abs().max() + 1
     print(f"M={M:3d} N={N:5d} K={K:4d} gc={gc:4d}   {err:9.2e} " + " ".join(f"{t*1e6:6.1f}({N*K/t/1e9:4.0f})" for t in ts) + f"   {told*1e6:6.1f}")

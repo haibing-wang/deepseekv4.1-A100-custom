@@ -68,7 +68,7 @@ __device__ __forceinline__ int x_off(int r, int c) { return r * 256 + ((c ^ (r &
 extern "C" __global__ void __launch_bounds__(NTHR, 2)
 fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
              int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols,
-             __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits)
+             __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits, int tiled)
 {
     extern __shared__ __align__(128) uint8_t smem[];
     uint8_t* ws = smem;                              // STAGES * BN * 64
@@ -82,6 +82,7 @@ fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t*
     const int ke = min(K, ks + k_per_split);
     const int xgroups = group_cols > 0 ? N / group_cols : 1;
     const int xg = group_cols > 0 ? n_blk / group_cols : 0;
+    const int wstep = tiled ? 1024 : 64;  // weight bytes per 64 k from a lane's base pointer
     // global -> smem copy assignments (loop invariant): W: 512 chunks (row = i/4, chunk = i%4); X: 512 chunks (row = i/8, chunk = i%8)
     constexpr int WJ = BN * BK / 16 / NTHR, XJ = BM * BK * 2 / 16 / NTHR;
     const uint8_t* wsrc[WJ]; int wdst[WJ];
@@ -90,7 +91,9 @@ fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t*
     for (int j = 0; j < WJ; ++j) {
         const int i = tid + j * NTHR;
         const int wr = i / (BK / 16), wc = i % (BK / 16);
-        wsrc[j] = W + (long long)(n_blk + wr) * K + wc * 16;
+        // row-major, or tiled [N/16][K/64][16 rows][64 B]: chunk wc (16 B of the 128-k stage) sits in tile step wc/4
+        wsrc[j] = tiled ? W + (long long)((n_blk + wr) >> 4) * (K / 64) * 1024 + (wc >> 2) * 1024 + ((n_blk + wr) & 15) * 64 + (wc & 3) * 16
+                        : W + (long long)(n_blk + wr) * K + wc * 16;
         wdst[j] = w_off(wr, wc);
     }
 #pragma unroll
@@ -106,7 +109,7 @@ fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t*
             uint8_t* wd = ws + st * (BN * BK);
             uint8_t* xd = xs + st * (BM * BK * 2);
 #pragma unroll
-            for (int j = 0; j < WJ; ++j) cp_async16(wd + wdst[j], wsrc[j] + kk, 16);   // K % BK == 0: always in range
+            for (int j = 0; j < WJ; ++j) cp_async16(wd + wdst[j], wsrc[j] + (kk >> 6) * wstep, 16);   // K % BK == 0: always in range
 #pragma unroll
             for (int j = 0; j < XJ; ++j) cp_async16(xd + xdst[j], xsrc[j] + kk, xok[j] ? 16 : 0);
         }
