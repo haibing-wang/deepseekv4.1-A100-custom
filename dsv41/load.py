@@ -9,6 +9,7 @@ import torch
 
 from .engram import Engram, EngramLayout, HostEngramTable, NgramHashState
 from .model import Args, Block, Transformer
+from .w8 import ENABLED as W8_ENABLED, W8
 from .quant import dequant_fp8_block
 from .stio import Checkpoint
 
@@ -44,12 +45,15 @@ def plan_placement(n_layers: int, devices: list[int], budgets_gb: dict[int, floa
     return placement
 
 
-def _dense(ckpt: Checkpoint, name: str, device) -> torch.Tensor:
-    """A Linear weight as bf16 on device (FP8 block-scaled -> dequantized; bf16 stays)."""
+def _dense(ckpt: Checkpoint, name: str, device):
+    """A Linear weight on device: FP8 block-scaled stays packed (W8, tensor-core GEMV) unless DSV41_W8=0
+    (then dequantized to bf16); bf16 stays."""
     dtype, _ = ckpt.meta(name)
     w = ckpt.get(name, device)
     if dtype == "F8_E4M3":
         s = ckpt.get(name.replace(".weight", ".scale"), device)
+        if W8_ENABLED:
+            return W8(w.view(torch.uint8), s)
         return dequant_fp8_block(w, s)
     return w
 

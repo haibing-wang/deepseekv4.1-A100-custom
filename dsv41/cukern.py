@@ -93,3 +93,38 @@ def fp8_gemv(x: torch.Tensor, w_fp8: torch.Tensor, s_u8: torch.Tensor) -> torch.
             ctypes.c_void_p(out.data_ptr()), ctypes.c_int(out.stride(0)), ctypes.c_int(N), ctypes.c_int(K)]
     launch(f, grid, (256, 1, 1), args, x.device, shared=smem)
     return out
+
+
+# --------------------------------------------------------------------------- FP8-weight tensor-core GEMM (M <= 16)
+def _splits_for(N: int, K: int) -> int:
+    """Split-K factor so that at least ~1024 warps stream the weights (each warp owns 8 columns)."""
+    warps = N // 8
+    s = 1
+    while warps * s < 4096 and (K // (s * 2)) >= 256:
+        s *= 2
+    return s
+
+
+def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols: int = 0, out_dtype=torch.bfloat16) -> torch.Tensor:
+    """x: bf16 [M, K] (M <= 16, contiguous); w8: uint8 (e4m3 bits) [N, K]; s8: uint8 (E8M0) [ceil(N/32), K/32].
+    Returns x @ dequant(w8, s8)^T as [M, N] (fp32 accumulation, rounded to out_dtype).
+    group_cols > 0: block-diagonal use (x: [N/group_cols, K]; column n uses x row n // group_cols) -> [1, N]."""
+    M, K = x.shape
+    N = w8.shape[0]
+    assert x.dtype == torch.bfloat16 and x.is_contiguous() and w8.is_contiguous() and s8.is_contiguous()
+    assert K % 64 == 0 and N % 8 == 0 and (group_cols == 0 and M <= 16 or group_cols > 0 and group_cols % 8 == 0)
+    Mo = 1 if group_cols else M
+    splits = _splits_for(N, K)
+    kps = -(-K // splits)
+    kps = -(-kps // 128) * 128
+    splits = -(-K // kps)
+    part = torch.empty(splits, Mo, N, device=x.device, dtype=torch.float32)
+    f = get_function("fp8_tc.cu", "fp8_gemm_tc8" if Mo <= 8 else "fp8_gemm_tc16", x.device)
+    WARPS = 4
+    grid = ((N // 8 + WARPS - 1) // WARPS, splits, 1)
+    args = [ctypes.c_void_p(x.data_ptr()), ctypes.c_int(x.stride(0)), ctypes.c_int(Mo),
+            ctypes.c_void_p(w8.data_ptr()), ctypes.c_void_p(s8.data_ptr()), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(s8.shape[1]),
+            ctypes.c_void_p(part.data_ptr()), ctypes.c_int(N), ctypes.c_int(kps), ctypes.c_int(group_cols)]
+    launch(f, grid, (WARPS * 32, 1, 1), args, x.device)
+    y = part[0] if splits == 1 else part.sum(dim=0)
+    return y.to(out_dtype)

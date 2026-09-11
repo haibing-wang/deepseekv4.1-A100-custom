@@ -17,6 +17,7 @@ from .cukern import fp4_gemv_pairs as cukern_fp4
 from .fused import fake_quant_fp4, fake_quant_fp8, rmsnorm, rope_dev_, sparse_attn_decode_split as sparse_attn_decode2, swiglu_quant
 from .fused2 import gate_topk, hc_mix, hc_post2_, hc_pre_norm_quant, kv_write, norm_quant, sattn2
 from .model import Attention, Block, Transformer, _hc_post, _hc_pre, linear_fp8, select_candidate_blocks
+from .w8 import linear_w, oproj_a
 
 FUSED2 = os.environ.get("DSV41_FUSED2", "1") == "1"  # the ~25-launch layer (fused2.py) instead of the ~100-launch one
 
@@ -72,10 +73,10 @@ class DecodeRuntime:
         """x: rmsnorm output bf16 [1, dim] (unquantized, for the compressor/indexer); xq: its fp8 fake-quantized copy."""
         pos = self.pos[d]
         rd, eps = self.rd, A.eps
-        qr = norm_quant(F.linear(xq, A.wq_a), A.q_norm_w, eps)  # q_norm output, already fp8-rounded for wq_b / indexer
-        q = F.linear(qr, A.wq_b).view(1, 1, A.n_heads, A.head_dim)
+        qr = norm_quant(linear_w(xq, A.wq_a), A.q_norm_w, eps)  # q_norm output, already fp8-rounded for wq_b / indexer
+        q = linear_w(qr, A.wq_b).view(1, 1, A.n_heads, A.head_dim)
         rope_dev_(q, rd, A.cos, A.sin, pos)
-        kv_write(F.linear(xq, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps)
+        kv_write(linear_w(xq, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps)
         if A.ratio:
             ratio = A.ratio
             compress_len = torch.div(pos + 1, ratio, rounding_mode="floor")
@@ -103,9 +104,8 @@ class DecodeRuntime:
             o = sattn2(q, A.window_kv_cache, ckv, idxs, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale)
         else:
             o = sattn2(q, A.window_kv_cache, None, None, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale)
-        o = o.view(1, 1, A.n_groups, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, A.wo_a)
-        return linear_fp8(o.flatten(2), A.wo_b)
+        o = oproj_a(o.view(1, 1, A.n_groups, -1), A.wo_a, A.n_groups, A.o_lora_rank)
+        return linear_fp8(o, A.wo_b)
 
     def attention(self, A: Attention, x: torch.Tensor, d: torch.device) -> torch.Tensor:
         pos = self.pos[d]
@@ -148,9 +148,8 @@ class DecodeRuntime:
         else:
             o = sparse_attn_decode2(q, A.window_kv_cache, None, A.attn_sink, widx, A.softmax_scale)
         rope_dev_(o, rd, A.cos, A.sin, pos, inverse=True)
-        o = o.view(1, 1, A.n_groups, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, A.wo_a)
-        return linear_fp8(o.flatten(2), A.wo_b)
+        o = oproj_a(o.view(1, 1, A.n_groups, -1), A.wo_a, A.n_groups, A.o_lora_rank)
+        return linear_fp8(o, A.wo_b)
 
     def compressor(self, A: Attention, x: torch.Tensor, pos: torch.Tensor):
         C = A.compressor
@@ -222,9 +221,9 @@ class DecodeRuntime:
         gu = cukern_fp4(xq, moe.w13, moe.s13, tok, eid, ones, moe.topk)
         hq = swiglu_quant(gu, wt, moe.inter, moe.swiglu_limit)
         y2 = cukern_fp4(hq, moe.w2, moe.s2, pair_rows, eid, ones, moe.topk)
-        gu_s = F.linear(xq, moe.sh_w13)
+        gu_s = linear_w(xq, moe.sh_w13)
         hs = swiglu_quant(gu_s, None, moe.inter, moe.swiglu_limit)
-        ys = F.linear(hs, moe.sh_w2)
+        ys = linear_w(hs, moe.sh_w2)
         return y2, ys
 
     def block(self, blk: Block, x: torch.Tensor, pre_mix: torch.Tensor):
@@ -420,9 +419,9 @@ class OffloadDecodeRuntime(DecodeRuntime):
             self.wts_host.copy_(self.gate_w, non_blocking=True)
 
     def _shared(self, moe):
-        gu_s = F.linear(self.xq_buf, moe.sh_w13)
+        gu_s = linear_w(self.xq_buf, moe.sh_w13)
         hs = swiglu_quant(gu_s, None, moe.inter, moe.swiglu_limit)
-        return F.linear(hs, moe.sh_w2)
+        return linear_w(hs, moe.sh_w2)
 
     def part2_cpu_shared(self, blk: Block):
         """GPU work that overlaps the CPU expert computation: the shared expert and the hot experts."""

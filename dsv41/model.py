@@ -16,6 +16,7 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+from .w8 import W8, linear_w, oproj_a
 from .fused import fake_quant_fp4, fake_quant_fp8, hc_post as _fused_hc_post, hc_pre as _fused_hc_pre, hc_split_sinkhorn, rmsnorm, rope_, sparse_attn_decode, swiglu_quant
 from .kernels import sparse_attn as sparse_attn_prefill
 from .moe_kernels import GroupedPairs, grouped_fp4_gemm
@@ -50,10 +51,10 @@ def _tick(key: str, t0: float) -> float:
 
 
 # --------------------------------------------------------------------------- small pieces
-def linear_fp8(x: torch.Tensor, w_bf16: torch.Tensor) -> torch.Tensor:
+def linear_fp8(x: torch.Tensor, w) -> torch.Tensor:
     """A Linear whose checkpoint weight is FP8: the reference quantizes the activation to FP8 (per-32,
-    power-of-two scale) before the GEMM; we do the same rounding, then a bf16 GEMM."""
-    return F.linear(fake_quant_fp8(x, 32), w_bf16)
+    power-of-two scale) before the GEMM; we do the same rounding, then the GEMM (w: bf16 tensor or W8)."""
+    return linear_w(fake_quant_fp8(x, 32), w)
 
 
 @lru_cache(8)
@@ -257,7 +258,7 @@ class Attention:
         self.attn_sink = w["attn.attn_sink"].float()
         self.wq_a, self.q_norm_w, self.wq_b = w["attn.wq_a.weight"], w["attn.q_norm.weight"], w["attn.wq_b.weight"]
         self.wkv, self.kv_norm_w = w["attn.wkv.weight"], w["attn.kv_norm.weight"]
-        self.wo_a = w["attn.wo_a.weight"].view(self.n_groups, self.o_lora_rank, -1)  # bf16, block-diagonal over groups
+        self.wo_a = w["attn.wo_a.weight"]  # block-diagonal over groups: rows g*rank..(g+1)*rank see only group g (see w8.oproj_a)
         self.wo_b = w["attn.wo_b.weight"]
         self.is_kv_source = layer_id in args.kv_source_layers
         self.is_index_source = layer_id in args.index_source_layers
@@ -338,8 +339,8 @@ class Attention:
             o = sparse_attn_prefill(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         rope_(o, rd, self.cos, self.sin, start_pos, inverse=True)
         o = o.view(bsz, seqlen, self.n_groups, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, self.wo_a)
-        return linear_fp8(o.flatten(2), self.wo_b)
+        o = oproj_a(o, self.wo_a, self.n_groups, self.o_lora_rank)
+        return linear_fp8(o, self.wo_b)
 
 
 # --------------------------------------------------------------------------- MoE
@@ -369,7 +370,8 @@ class MoE:
             self.y_host = torch.empty(self.dim, dtype=torch.float32, pin_memory=True)
             self.y_host.zero_()
         # shared expert: one GEMM for gate and up (rows [w1; w3])
-        self.sh_w13 = torch.cat([w["ffn.shared_experts.w1.weight"], w["ffn.shared_experts.w3.weight"]], dim=0).contiguous()
+        w1, w3 = w["ffn.shared_experts.w1.weight"], w["ffn.shared_experts.w3.weight"]
+        self.sh_w13 = W8.cat([w1, w3]) if isinstance(w1, W8) else torch.cat([w1, w3], dim=0).contiguous()
         self.sh_w2 = w["ffn.shared_experts.w2.weight"]
         self.device = device
         self._cache: dict = {}
@@ -395,7 +397,7 @@ class MoE:
     def shared_expert(self, x: torch.Tensor) -> torch.Tensor:
         gu = linear_fp8(x, self.sh_w13).float()
         h = swiglu_quant(gu, None, self.inter, self.swiglu_limit)  # bf16, already FP8-rounded for w2
-        return F.linear(h, self.sh_w2).float()
+        return linear_w(h, self.sh_w2).float()
 
     def _pair_tables(self, n_tok: int, device):
         """Constant index tensors for a dispatch of n_tok tokens (cached: no per-step allocations)."""

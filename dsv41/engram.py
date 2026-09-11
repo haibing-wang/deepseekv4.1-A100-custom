@@ -156,7 +156,8 @@ class Engram(torch.nn.Module):
 
     def apply(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         """The GPU half: emb [B, L, cols*head_dim] bf16 (already gathered + dequantized)."""
-        kv = torch.nn.functional.linear(emb, self.wkv)
+        from .w8 import linear_w
+        kv = linear_w(emb, self.wkv)
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
         h = x.float()
