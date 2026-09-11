@@ -106,13 +106,15 @@ def _splits_for(N: int, K: int) -> int:
 
 
 FP8_W_LAYOUT = os.environ.get("DSV41_FP8_W", "1") == "1"
+FP8_G_LAYOUT = os.environ.get("DSV41_FP8_G", "1") == "1"  # tiled kernel for > 64 rows
 FP8_W_SPLITS = int(os.environ.get("DSV41_FP8_W_SPLITS", "0"))
 FP8_W_STAGES = int(os.environ.get("DSV41_FP8_W_STAGES", "3"))  # x stages in shared memory
+FP8_W_MW = int(os.environ.get("DSV41_FP8_W_MW", "1"))  # warps along M per block (1, 2 or 4 for 64 rows; 1 or 2 for 32)
 _attr_done: set = set()  # experiment: force the split-K factor
 
 
 def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols: int = 0, out_dtype=torch.bfloat16) -> torch.Tensor:
-    """x: bf16 [M, K] (M <= 16, contiguous); w8: uint8 (e4m3 bits) [N, K]; s8: uint8 (E8M0) [ceil(N/32), K/32].
+    """x: bf16 [M, K] (contiguous); w8: uint8 (e4m3 bits) [N, K] in the w8.PERM_K byte order; s8: uint8 (E8M0) [ceil(N/32), K/32].
     Returns x @ dequant(w8, s8)^T as [M, N] (fp32 accumulation, rounded to out_dtype).
     group_cols > 0: block-diagonal use (x: [B * N/group_cols, K]; output row b, column n uses x row
     b * (N/group_cols) + n // group_cols) -> [B, N]."""
@@ -121,6 +123,9 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and w8.is_contiguous() and s8.is_contiguous()
     assert K % 64 == 0 and N % 8 == 0 and (group_cols == 0 or group_cols % 8 == 0 and N % group_cols == 0)
     Mo = M // (N // group_cols) if group_cols else M
+    tiled = FP8_G_LAYOUT and Mo > 64 and N % 128 == 0 and K % 128 == 0 and (group_cols == 0 or group_cols % 128 == 0)
+    if tiled:  # many rows: CUTLASS-style tiles (fp8_tcg.cu), any M
+        return _fp8_gemm_tcg(x, w8, s8, Mo, N, K, group_cols, out_dtype)
     wlayout = FP8_W_LAYOUT and Mo > 16 and N % 64 == 0 and (group_cols == 0 or group_cols % 64 == 0)
     rows_per = 64 if wlayout else 16
     if Mo > rows_per:  # chunk
@@ -141,7 +146,8 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
     splits = -(-K // kps)
     part = torch.empty(splits, Mo, N, device=x.device, dtype=torch.float32)
     if wlayout:
-        f = get_function("fp8_tcw.cu", f"fp8_gemm_tcw{MT}s{FP8_W_STAGES}", x.device)
+        MW = FP8_W_MW if MT >= 4 else 1  # warps along M (each MT/MW tiles)
+        f = get_function("fp8_tcw.cu", f"fp8_gemm_tcw{MT}s{FP8_W_STAGES}" if MW == 1 else f"fp8_gemm_tcw{MT}m{MW}s{FP8_W_STAGES}", x.device)
         grid = (N // 64, splits, 1)
         shared = FP8_W_STAGES * 8 * MT * 256
         if (f.value, x.device.index) not in _attr_done:  # dynamic shared memory above 48 KB needs the attribute
@@ -157,7 +163,38 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
             ctypes.c_void_p(w8.data_ptr()), ctypes.c_void_p(s8.data_ptr()), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(s8.shape[1]),
             ctypes.c_void_p(part.data_ptr()), ctypes.c_int(N), ctypes.c_int(kps), ctypes.c_int(group_cols),
             ctypes.c_void_p(y.data_ptr() if y is not None else 0), ctypes.c_void_p(counters.data_ptr() if counters is not None else 0), ctypes.c_int(splits)]
-    launch(f, grid, (WARPS * 32, 1, 1), args, x.device, shared=shared if wlayout else 0)
+    launch(f, grid, (WARPS * 32 * (MW if wlayout else 1), 1, 1), args, x.device, shared=shared if wlayout else 0)
+    if fused_epilogue:
+        return y
+    y = part[0] if splits == 1 else part.sum(dim=0)
+    return y.to(out_dtype)
+
+
+def _fp8_gemm_tcg(x, w8, s8, Mo, N, K, group_cols, out_dtype):
+    """fp8_tcg.cu: 256-thread blocks, tile 64 rows x 128 columns x 128 k, split-K with the fused epilogue."""
+    mblocks = (Mo + 63) // 64
+    splits = 1  # ~256 blocks, fp32 partials at most the weight bytes
+    while (N // 128) * mblocks * splits < 256 and splits * 2 * Mo * 4 <= K and K // (splits * 2) >= 256:
+        splits *= 2
+    if FP8_W_SPLITS:
+        splits = FP8_W_SPLITS
+    kps = -(-K // splits)
+    kps = -(-kps // 128) * 128
+    splits = -(-K // kps)
+    part = torch.empty(splits, Mo, N, device=x.device, dtype=torch.float32)
+    f = get_function("fp8_tcg.cu", "fp8_gemm_tcg", x.device)
+    shared = 2 * (128 * 128 + 64 * 256)
+    if (f.value, x.device.index) not in _attr_done:
+        _check(_cuda.cuFuncSetAttribute(f, 8, ctypes.c_int(shared)), "cuFuncSetAttribute")
+        _attr_done.add((f.value, x.device.index))
+    fused_epilogue = out_dtype == torch.bfloat16
+    y = torch.empty(Mo, N, device=x.device, dtype=torch.bfloat16) if fused_epilogue else None
+    counters = _tile_counters(x.device, (N // 128) * mblocks) if fused_epilogue else None
+    args = [ctypes.c_void_p(x.data_ptr()), ctypes.c_int(x.stride(0)), ctypes.c_int(Mo),
+            ctypes.c_void_p(w8.data_ptr()), ctypes.c_void_p(s8.data_ptr()), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(s8.shape[1]),
+            ctypes.c_void_p(part.data_ptr()), ctypes.c_int(N), ctypes.c_int(kps), ctypes.c_int(group_cols),
+            ctypes.c_void_p(y.data_ptr() if y is not None else 0), ctypes.c_void_p(counters.data_ptr() if counters is not None else 0), ctypes.c_int(splits)]
+    launch(f, (N // 128, mblocks, splits), (256, 1, 1), args, x.device, shared=shared)
     if fused_epilogue:
         return y
     y = part[0] if splits == 1 else part.sum(dim=0)

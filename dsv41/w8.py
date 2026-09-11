@@ -15,15 +15,34 @@ import torch.nn.functional as F
 from .quant import dequant_fp8_block
 
 ENABLED = os.environ.get("DSV41_W8", "1") == "1"
-MAX_TC_ROWS = 64  # rows handled by the tensor-core kernel (16 per launch, chunked); beyond that dequantize + cuBLAS
+MAX_TC_ROWS = 512  # rows handled by the tensor-core kernels (fp8_tc <= 16, fp8_tcw <= 64, fp8_tcg beyond); then dequantize + cuBLAS
+
+
+# Byte order of every 16-k group in memory (cuda/fp8_tcg.cu): position 4t + j holds k = 2t + j (j < 2) or 2t + 8 + j - 2,
+# so the 32-bit word ldmatrix gives lane t is exactly its mma A fragment; fp8_tc.cu / fp8_tcw.cu read x accordingly.
+PERM_K = [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15]
+_INV_PERM_K = [PERM_K.index(i) for i in range(16)]
+
+
+def permute_k(w8: torch.Tensor) -> torch.Tensor:
+    """uint8 [N, K] natural k order -> the in-memory order of the fp8 kernels."""
+    N, K = w8.shape
+    assert K % 16 == 0
+    return w8.view(N, K // 16, 16)[:, :, PERM_K].reshape(N, K).contiguous()
+
+
+def unpermute_k(w8: torch.Tensor) -> torch.Tensor:
+    N, K = w8.shape
+    return w8.view(N, K // 16, 16)[:, :, _INV_PERM_K].reshape(N, K).contiguous()
 
 
 class W8:
     __slots__ = ("w8", "s8", "shape", "device")
 
-    def __init__(self, w8: torch.Tensor, s8: torch.Tensor):
+    def __init__(self, w8: torch.Tensor, s8: torch.Tensor, permuted: bool = False):
+        """w8: uint8 e4m3 bits [N, K] (natural k order unless permuted=True); s8: E8M0 [ceil(N/32), K/32]."""
         assert w8.dtype == torch.uint8 and s8.dtype == torch.uint8 and w8.dim() == 2
-        self.w8 = w8.contiguous()
+        self.w8 = w8.contiguous() if permuted else permute_k(w8)
         self.s8 = s8.contiguous()
         self.shape = tuple(w8.shape)
         self.device = w8.device
@@ -33,13 +52,13 @@ class W8:
         return torch.bfloat16
 
     def bf16(self) -> torch.Tensor:
-        return dequant_fp8_block(self.w8.view(torch.float8_e4m3fn), self.s8)
+        return dequant_fp8_block(unpermute_k(self.w8).view(torch.float8_e4m3fn), self.s8)
 
     @staticmethod
     def cat(ws: list) -> "W8":
         """Concatenate along N (row counts must be multiples of 32)."""
         assert all(w.shape[0] % 32 == 0 for w in ws)
-        return W8(torch.cat([w.w8 for w in ws], dim=0), torch.cat([w.s8 for w in ws], dim=0))
+        return W8(torch.cat([w.w8 for w in ws], dim=0), torch.cat([w.s8 for w in ws], dim=0), permuted=True)
 
 
 def linear_w(x: torch.Tensor, w) -> torch.Tensor:

@@ -75,6 +75,9 @@ def hc_mix(x: torch.Tensor, fn: torch.Tensor, eps: float) -> torch.Tensor:
     n_mix, N = fn.shape
     B = x.numel() // N
     assert x.numel() == B * N and x.is_contiguous()
+    if B > 32:  # the per-(row, mix) kernel re-reads every row per mix: cuBLAS fp32 is 2x faster from 64 rows on
+        xf = x.view(B, N).float()
+        return torch.mm(xf, fn.t()) * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     out = torch.empty(B, n_mix, device=x.device, dtype=torch.float32)
     with torch.cuda.device(x.device):
         _hc_mix_kernel[(n_mix, B)](x, fn, out, eps, N=N, NMIX=n_mix, BLOCK=4096, num_warps=8)

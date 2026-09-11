@@ -66,20 +66,22 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, int src
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
 template <int N_> __device__ __forceinline__ void cp_async_wait_group() { asm volatile("cp.async.wait_group %0;" :: "n"(N_) : "memory"); }
 
-template <int MT, int STAGES>
+template <int MT, int STAGES, int MW>
 __device__ __forceinline__ void fp8_gemm_tcw_body(const __nv_bfloat16* __restrict__ X, int ldx, int M,
             const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, int N, int K, int Kc,
             float* __restrict__ out, int ldo, int k_per_split, int group_cols,
             __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits)
 {
-    constexpr int ROWS = 8 * MT;               // x rows staged per iteration
+    constexpr int ROWS = 8 * MT * MW;          // x rows staged per iteration (MW warps along M, MT tiles each)
     constexpr int CH = 16;                     // 16-byte chunks per row (128 k)
+    constexpr int NTHR = WARPS * MW * 32;
     extern __shared__ __align__(16) uint4 xs[];  // [STAGES][ROWS * CH]
-    __shared__ unsigned int last[WARPS];
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __shared__ unsigned int last[WARPS * MW];
+    const int lane = threadIdx.x & 31, warp = (threadIdx.x >> 5) % WARPS, mw = (threadIdx.x >> 5) / WARPS;
     const int g = lane >> 2, t = lane & 3;
     const int n_blk = blockIdx.x * (WARPS * 16);
     const int n0 = n_blk + warp * 16;
+    const int mrow0 = mw * 8 * MT;             // first x row of this warp's tiles
     const int ks = blockIdx.y * k_per_split;
     const int ke = min(K, ks + k_per_split);
     const uint8_t* wrowA = W + (long long)(n0 + g) * K;
@@ -106,11 +108,11 @@ __device__ __forceinline__ void fp8_gemm_tcw_body(const __nv_bfloat16* __restric
     };
     // x tile [ROWS, 128 k] -> smem stage (rows >= M and k >= ke zero-filled); always commits a group.
     // Thread i copies chunk (i % 16) of rows i/16, i/16 + 8, ...: all loop invariant except the k offset.
-    constexpr int XJ = ROWS * CH / (WARPS * 32);  // chunks per thread per stage (MT)
+    constexpr int XJ = ROWS * CH / NTHR;  // chunks per thread per stage (MT)
     const int xr0 = threadIdx.x / CH, xc0 = threadIdx.x % CH;
     const __nv_bfloat16* xsrc0 = X + ((long long)xr0 * xgroups + xg) * ldx + 8 * xc0;
     const long long xstride8 = 8LL * xgroups * ldx;       // 8 rows further
-    const int xoff0 = xr0 * CH + (xc0 ^ (xr0 & 7));        // (xr0 + 8j) & 7 == xr0 & 7
+    const int xoff0 = xr0 * CH + (xc0 ^ (xr0 & 7));        // (xr0 + 8j) & 7 == xr0 & 7  (NTHR / CH is a multiple of 8)
     auto load_x = [&](int kk, int st) {
         if (kk < ke) {
             uint4* dst = xs + st * (ROWS * CH) + xoff0;
@@ -131,7 +133,7 @@ __device__ __forceinline__ void fp8_gemm_tcw_body(const __nv_bfloat16* __restric
         __syncthreads();  // stage `st` landed for everyone; everyone is done reading stage (it-1) % STAGES
         load_x(k0 + 128 * (STAGES - 1), (it + STAGES - 1) % STAGES);
         if (k0 + 256 < ke) load_w(k0 + 256, wa, wb, sb);
-        const uint4* xt = xs + st * (ROWS * CH) + g * CH;  // this lane's row within every token tile
+        const uint4* xt = xs + st * (ROWS * CH) + (mrow0 + g) * CH;  // this lane's row within every token tile
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const uint32_t fb = (sc[h] + 120 > 0) ? ((uint32_t)(sc[h] + 120) << 7) : 0u;
@@ -154,7 +156,7 @@ __device__ __forceinline__ void fp8_gemm_tcw_body(const __nv_bfloat16* __restric
                 const uint32_t af[4] = {da[2 * s], db[2 * s], da[2 * s + 1], db[2 * s + 1]};
 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
-                    const uint32_t bf[2] = {xw[mt][2 * s], xw[mt][2 * s + 1]};
+                    const uint32_t bf[2] = {xw[mt][s], xw[mt][s + 4]};  // permuted weight layout (w8.PERM_K), as in fp8_tc.cu
                     mma16816(c[mt], af, bf);
                 }
             }
@@ -176,12 +178,15 @@ __device__ __forceinline__ void fp8_gemm_tcw_body(const __nv_bfloat16* __restric
     float* o = out + (long long)blockIdx.y * M * ldo;
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
-        const int t0 = 8 * mt + 2 * t;
+        const int t0 = mrow0 + 8 * mt + 2 * t;
         if (t0 < M) { o[(long long)t0 * ldo + n0 + g] = c[mt][0]; o[(long long)t0 * ldo + n0 + g + 8] = c[mt][2]; }
         if (t0 + 1 < M) { o[(long long)(t0 + 1) * ldo + n0 + g] = c[mt][1]; o[(long long)(t0 + 1) * ldo + n0 + g + 8] = c[mt][3]; }
     }
     if (y == nullptr) return;
+    // epilogue by the column warps of the M-slice 0 only, after every warp of the block stored its partial
     __threadfence();
+    __syncthreads();
+    if (mw != 0) return;
     if (lane == 0) last[warp] = (splits == 1) ? 1u : (atomicInc(&counters[n0 >> 4], (unsigned)splits - 1) == (unsigned)(splits - 1));
     __syncwarp();
     if (!last[warp]) return;
@@ -194,16 +199,19 @@ __device__ __forceinline__ void fp8_gemm_tcw_body(const __nv_bfloat16* __restric
     }
 }
 
-#define KERNEL(MT, ST) \
-extern "C" __global__ void __launch_bounds__(WARPS * 32) \
-fp8_gemm_tcw##MT##s##ST(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, \
+#define KERNEL(MT, ST, MW, NAME) \
+extern "C" __global__ void __launch_bounds__(WARPS * MW * 32) \
+NAME(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, \
              int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols, \
              __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits) \
-{ fp8_gemm_tcw_body<MT, ST>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits); }
+{ fp8_gemm_tcw_body<MT, ST, MW>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits); }
 
-KERNEL(2, 3)
-KERNEL(4, 3)
-KERNEL(8, 3)
-KERNEL(2, 4)
-KERNEL(4, 4)
-KERNEL(8, 4)
+KERNEL(2, 3, 1, fp8_gemm_tcw2s3)
+KERNEL(4, 3, 1, fp8_gemm_tcw4s3)
+KERNEL(8, 3, 1, fp8_gemm_tcw8s3)
+KERNEL(2, 4, 1, fp8_gemm_tcw2s4)
+KERNEL(4, 4, 1, fp8_gemm_tcw4s4)
+KERNEL(8, 4, 1, fp8_gemm_tcw8s4)
+KERNEL(2, 3, 2, fp8_gemm_tcw4m2s3)   // 32 rows as 2 warps x 2 tiles
+KERNEL(4, 3, 2, fp8_gemm_tcw8m2s3)   // 64 rows as 2 warps x 4 tiles
+KERNEL(2, 3, 4, fp8_gemm_tcw8m4s3)   // 64 rows as 4 warps x 2 tiles

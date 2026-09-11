@@ -15,7 +15,9 @@ ap.add_argument("--seqs", type=int, default=8)
 ap.add_argument("--prompts", default="dsv41/batch_prompts16.txt")
 ap.add_argument("--max-new-tokens", type=int, default=64)
 ap.add_argument("--no-mtp", action="store_true", help="plain batched decode with the same harness (baseline)")
+ap.add_argument("--drafts", type=int, default=5, help="draft tokens verified per sequence per step (1..5)")
 ap.add_argument("--n-layers", type=int, default=None, help="truncated model (plumbing test)")
+ap.add_argument("--trace", action="store_true", help="print the EP per-layer timeline of the last step (needs DSV41_EP_TRACE=1)")
 ap.add_argument("--profile", type=int, default=0, help="profile this many steps (after 4 warm-up steps) and print kernel time per device")
 a = ap.parse_args()
 from transformers import AutoTokenizer
@@ -23,7 +25,7 @@ tok = AutoTokenizer.from_pretrained(a.ckpt)
 sys.path.insert(0, os.path.join(a.ckpt, "encoding"))
 from encoding import encode_messages
 S = a.seqs
-K = 1 if a.no_mtp else 6
+K = 1 if a.no_mtp else 1 + a.drafts
 devs = [int(d) for d in a.devices.split(",")]
 model = load_model(a.ckpt, devs, max_seq_len=8192, max_batch=S * K, max_seqs=S, engram=True, tokenizer=tok, ep=a.ep, n_layers=a.n_layers,
                    ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None,
@@ -73,7 +75,7 @@ written_max = [p_last[s] for s in range(S)]
 drafts = None
 if ds is not None:
     dr = ds.draft_rows(torch.tensor(bonus, device=last), torch.tensor(p_last, device=last), torch.stack(mh_last), torch.tensor(written_max, device=last))
-    drafts = dr.tolist()
+    drafts = dr[:, :K - 1].tolist()
 torch.cuda.synchronize()
 t0 = time.time()
 steps = 0
@@ -123,7 +125,7 @@ while steps < a.max_new_tokens and not all(done):
     if ds is not None:
         td = time.time()
         dr = ds.draft_rows(torch.tensor(bonus, device=last), torch.tensor(p_last, device=last), mh_all[mh_rows], torch.tensor(written_max, device=last))
-        drafts = dr.tolist()
+        drafts = dr[:, :K - 1].tolist()
         t_draft += time.time() - td
     steps += 1
 torch.cuda.synchronize()
@@ -144,6 +146,9 @@ if prof is not None:
         for name, (us, n) in sorted(per[dev].items(), key=lambda kv: -kv[1][0])[:22]:
             print(f"  {us / 1000:7.2f} ms  {n // a.profile:5d}/step  {name}")
 total = sum(len(g) for g in generated)
+if a.trace and a.ep:
+    from dsv41.ep import trace_report
+    print("[EP timeline per layer, averaged over the layers, last step]\n" + trace_report(rt))
 print(tok.decode(generated[0][:60]))
 print(f"\n[{S} sequences, {steps} steps, {dt:.2f}s] {total} tokens generated: {total / dt:.1f} tok/s aggregate, "
       f"{dt / steps * 1000:.1f} ms/step, {total / steps / S:.2f} tokens per sequence per step" + (f", accepted drafts per step per seq {n_acc / steps / S:.2f}" if ds else "")

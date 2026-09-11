@@ -11,7 +11,9 @@
 // Layout trick: lane (g = lane/4, t = lane%4) of a warp owns row n = n0 + g and 16 consecutive k
 // (K0 + 16t .. +15) per 64-wide k step, loaded as one 16-byte transaction. The k index inside the mma
 // tile is a permutation of the physical k; x is loaded with the same permutation, and a dot product
-// does not care about the order of its terms.
+// does not care about the order of its terms. The weight bytes are stored k-permuted within every
+// 16-k group (w8.PERM_K, shared with fp8_tcg.cu's ldmatrix path): byte 4s+j of the group holds k 2s+j
+// (j < 2) or 2s+8+j-2, so mma step s pairs decoded words 2s, 2s+1 with x words s and s+4.
 //
 // grid: (N / 8 / WARPS, splits). Each warp: 8 output columns, k range [ks, ks + k_per_split).
 // out: fp32 partials [splits, M, N] (row stride ldo = N); M rows < 16 are zero-padded on the fly.
@@ -114,7 +116,9 @@ __device__ __forceinline__ void fp8_gemm_tc_body(const __nv_bfloat16* __restrict
 #pragma unroll
             for (int s = 0; s < 4; ++s) {
                 const uint32_t bf[2] = {b[2 * s], b[2 * s + 1]};
-                const uint32_t af[4] = {xav[2 * s], M8 ? 0u : xbv[2 * s], xav[2 * s + 1], M8 ? 0u : xbv[2 * s + 1]};
+                // permuted weight layout (w8.PERM_K): decoded words 2s, 2s+1 hold k (2s, 2s+1) and (2s+8, 2s+9) of the
+                // lane's 16-k group = x words s and s + 4
+                const uint32_t af[4] = {xav[s], M8 ? 0u : xbv[s], xav[s + 4], M8 ? 0u : xbv[s + 4]};
                 mma16816(c, af, bf);
             }
         }
