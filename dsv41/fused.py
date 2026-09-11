@@ -282,7 +282,7 @@ def sparse_attn_decode(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tenso
 
 # --------------------------------------------------------------------------- SwiGLU (+ routing weight) + FP8 fake quant
 @triton.jit(do_not_specialize=["n_rows"])
-def _swiglu_quant_kernel(GU, W, Y, n_rows, limit, INTER: tl.constexpr, GROUP: tl.constexpr, HAS_W: tl.constexpr):
+def _swiglu_quant_kernel(GU, W, Y, n_rows, limit, INTER: tl.constexpr, GROUP: tl.constexpr, HAS_W: tl.constexpr, PERMUTE: tl.constexpr):
     """One program per (row, group of GROUP inter columns): h = w * silu(clamp(gate)) * clamp(up), then the
     per-32 FP8 fake quantization the reference applies before w2. GU: fp32 [rows, 2*INTER]; Y: bf16 [rows, INTER]."""
     row = tl.program_id(0)
@@ -300,16 +300,19 @@ def _swiglu_quant_kernel(GU, W, Y, n_rows, limit, INTER: tl.constexpr, GROUP: tl
     amax = tl.maximum(tl.max(tl.abs(h), axis=0), 1e-4)
     s = _pow2(_ceil_log2(libdevice.div_rn(amax, 448.0)))
     q = _round_e4m3(tl.minimum(tl.maximum(libdevice.div_rn(h, s), -448.0), 448.0))
+    if PERMUTE:  # the 8-k permuted layout of cuda/fp4_tc.cu (bit reversal of the low 3 bits of the column)
+        j = cols & 7
+        cols = (cols & ~7) | ((j & 1) << 2) | (j & 2) | (j >> 2)
     tl.store(Y + row * INTER + cols, (q * s).to(tl.bfloat16))
 
 
-def swiglu_quant(gu: torch.Tensor, weights: torch.Tensor | None, inter: int, limit: float) -> torch.Tensor:
+def swiglu_quant(gu: torch.Tensor, weights: torch.Tensor | None, inter: int, limit: float, permute: bool = False) -> torch.Tensor:
     """gu: fp32 or bf16 [rows, 2*inter] (gate | up); weights: fp32 [rows] or None -> bf16 [rows, inter], FP8-rounded per 32."""
     rows = gu.shape[0]
     y = torch.empty(rows, inter, device=gu.device, dtype=torch.bfloat16)
     with torch.cuda.device(gu.device):
         _swiglu_quant_kernel[(rows, inter // 32)](gu.contiguous(), weights if weights is not None else gu, y, rows, float(limit),
-                                                 INTER=inter, GROUP=32, HAS_W=weights is not None, num_warps=1)
+                                                 INTER=inter, GROUP=32, HAS_W=weights is not None, PERMUTE=permute, num_warps=1)
     return y
 
 

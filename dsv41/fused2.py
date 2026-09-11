@@ -48,6 +48,22 @@ def _hc_mix_kernel(X, FN, OUT, eps, N: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(OUT + k, dot * (1.0 / tl.sqrt(var + eps)))
 
 
+@triton.jit
+def _sinkhorn_only_kernel(MIX, SCALE, BASE, PRE, POST, COMB, eps, iters: tl.constexpr, HC: tl.constexpr):
+    _sinkhorn_part(MIX, SCALE, BASE, PRE, POST, COMB, eps, iters, HC)
+
+
+def hc_sinkhorn(mixes: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, hc: int, iters: int, hc_eps: float):
+    """(pre, post, comb) of one token from its mixing logits [(2+hc)*hc] (the split part of hc_pre_norm_quant alone)."""
+    dev = mixes.device
+    pre = torch.empty(hc, device=dev, dtype=torch.float32)
+    post = torch.empty(hc, device=dev, dtype=torch.float32)
+    comb = torch.empty(hc, hc, device=dev, dtype=torch.float32)
+    with torch.cuda.device(dev):
+        _sinkhorn_only_kernel[(1,)](mixes, scale, base, pre, post, comb, hc_eps, iters=iters, HC=hc, num_warps=1)
+    return pre, post, comb
+
+
 def hc_mix(x: torch.Tensor, fn: torch.Tensor, eps: float) -> torch.Tensor:
     """x: [1, 1, hc, d] bf16 (contiguous), fn: [n_mix, hc*d] fp32 -> [n_mix] fp32 (= _hc_mix_proj for one token)."""
     n_mix, N = fn.shape
@@ -83,9 +99,18 @@ def _sinkhorn_part(MIX, SCALE, BASE, PRE, POST, COMB, eps, iters: tl.constexpr, 
 
 
 @triton.jit
-def _hc_prenq_kernel(X, PREIN, MIX, SCALE, BASE, W, PRE, POST, COMB, Y, YQ, YF, eps, hc_eps,
-                     iters: tl.constexpr, HC: tl.constexpr, D: tl.constexpr, R: tl.constexpr, WRITE_YF: tl.constexpr):
-    _sinkhorn_part(MIX, SCALE, BASE, PRE, POST, COMB, hc_eps, iters, HC)
+def _perm8(offs):
+    """Index map of the 8-k permuted activation layout used by cuda/fp4_tc.cu (bit reversal of the low 3 bits)."""
+    j = offs & 7
+    return (offs & ~7) | ((j & 1) << 2) | (j & 2) | (j >> 2)
+
+
+@triton.jit
+def _hc_prenq_kernel(X, PREIN, MIX, SCALE, BASE, W, PRE, POST, COMB, Y, YQ, YF, YQP, eps, hc_eps,
+                     iters: tl.constexpr, HC: tl.constexpr, D: tl.constexpr, R: tl.constexpr, WRITE_YF: tl.constexpr, SINKHORN: tl.constexpr,
+                     WRITE_YQP: tl.constexpr):
+    if SINKHORN:
+        _sinkhorn_part(MIX, SCALE, BASE, PRE, POST, COMB, hc_eps, iters, HC)
     r = tl.arange(0, R)[:, None]
     c = tl.arange(0, 32)[None, :]
     offs = r * 32 + c
@@ -101,10 +126,13 @@ def _hc_prenq_kernel(X, PREIN, MIX, SCALE, BASE, W, PRE, POST, COMB, Y, YQ, YF, 
     tl.store(Y + offs, y.to(tl.bfloat16), mask=mask)
     if WRITE_YF:
         tl.store(YF + offs, y, mask=mask)
-    tl.store(YQ + offs, _fq8(y).to(tl.bfloat16), mask=mask)
+    yq = _fq8(y).to(tl.bfloat16)
+    tl.store(YQ + offs, yq, mask=mask)
+    if WRITE_YQP:
+        tl.store(YQP + _perm8(offs), yq, mask=mask)
 
 
-def hc_pre_norm_quant(x, pre_in, mixes, scale, base, w, eps, hc_eps, iters, want_f32=False, out=None):
+def hc_pre_norm_quant(x, pre_in, mixes, scale, base, w, eps, hc_eps, iters, want_f32=False, out=None, sinkhorn=True, want_perm=False):
     """x: [1, 1, hc, d] bf16; pre_in: [hc] fp32 (previous sub-block's pre mix); mixes: [(2+hc)*hc] fp32.
     Returns (pre, post, comb, y, yq, yf): the sinkhorn split of `mixes`, the hc_pre+rmsnorm output y (bf16 [1, d]),
     its fp8 fake-quantized copy yq, and (optionally) y as fp32. `out`: optional dict of persistent output buffers
@@ -112,17 +140,83 @@ def hc_pre_norm_quant(x, pre_in, mixes, scale, base, w, eps, hc_eps, iters, want
     hc, d = x.shape[-2], x.shape[-1]
     dev = x.device
     out = out or {}
+    if not sinkhorn:  # the split runs elsewhere: the kernel only reads PREIN
+        mixes = scale = base = x
     pre = out.get("pre") if out.get("pre") is not None else torch.empty(hc, device=dev, dtype=torch.float32)
     post = out.get("post") if out.get("post") is not None else torch.empty(hc, device=dev, dtype=torch.float32)
     comb = out.get("comb") if out.get("comb") is not None else torch.empty(hc, hc, device=dev, dtype=torch.float32)
     y = out.get("y") if out.get("y") is not None else torch.empty(1, d, device=dev, dtype=torch.bfloat16)
     yq = out.get("yq") if out.get("yq") is not None else torch.empty(1, d, device=dev, dtype=torch.bfloat16)
     yf = (out.get("yf") if out.get("yf") is not None else torch.empty(1, d, device=dev, dtype=torch.float32)) if want_f32 else y
+    yqp = (out.get("yqp") if out.get("yqp") is not None else torch.empty(1, d, device=dev, dtype=torch.bfloat16)) if want_perm else y
     R = triton.next_power_of_2(d // 32)
     with torch.cuda.device(dev):
-        _hc_prenq_kernel[(1,)](x, pre_in, mixes, scale, base, w, pre, post, comb, y, yq, yf, eps, hc_eps,
-                               iters=iters, HC=hc, D=d, R=R, WRITE_YF=want_f32, num_warps=8)
+        _hc_prenq_kernel[(1,)](x, pre_in, mixes, scale, base, w, pre, post, comb, y, yq, yf, yqp, eps, hc_eps,
+                               iters=iters, HC=hc, D=d, R=R, WRITE_YF=want_f32, SINKHORN=sinkhorn, WRITE_YQP=want_perm, num_warps=8)
+    if want_perm:
+        return pre, post, comb, y, yq, (yf if want_f32 else None), yqp
     return pre, post, comb, y, yq, (yf if want_f32 else None)
+
+
+# --------------------------------------------------------------------------- hc_pre + rmsnorm + quant in two multi-CTA passes
+@triton.jit
+def _hc_pre2_kernel(X, PREIN, Y, SS, D: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr):
+    """pass 1: y = bf16(sum_h pre[h] * x[h]) for one column block, plus its sum of squares."""
+    cb = tl.program_id(0)
+    cols = cb * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < D
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for h in tl.static_range(HC):
+        acc += tl.load(PREIN + h) * tl.load(X + h * D + cols, mask=mask, other=0.0).to(tl.float32)
+    acc = acc.to(tl.bfloat16).to(tl.float32)
+    tl.store(Y + cols, acc.to(tl.bfloat16), mask=mask)
+    tl.store(SS + cb, tl.sum(acc * acc, axis=0))
+
+
+@triton.jit
+def _norm_quant2_kernel(Y, SS, W, YN, YQ, YF, YQP, eps, D: tl.constexpr, NB: tl.constexpr, BLOCK: tl.constexpr,
+                        WRITE_YF: tl.constexpr, WRITE_YQP: tl.constexpr):
+    """pass 2: rmsnorm of y (variance from the pass-1 partials) and the per-32 fp8 fake quant, one column block."""
+    cb = tl.program_id(0)
+    var = tl.sum(tl.load(SS + tl.arange(0, NB)), axis=0) / D
+    r = tl.arange(0, BLOCK // 32)[:, None]
+    c = tl.arange(0, 32)[None, :]
+    offs = cb * BLOCK + r * 32 + c
+    mask = offs < D
+    y = tl.load(Y + offs, mask=mask, other=0.0).to(tl.float32)
+    y = y * (1.0 / tl.sqrt(var + eps)) * tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
+    y = y.to(tl.bfloat16).to(tl.float32)
+    tl.store(YN + offs, y.to(tl.bfloat16), mask=mask)
+    if WRITE_YF:
+        tl.store(YF + offs, y, mask=mask)
+    yq = _fq8(y).to(tl.bfloat16)
+    tl.store(YQ + offs, yq, mask=mask)
+    if WRITE_YQP:
+        tl.store(YQP + _perm8(offs), yq, mask=mask)
+
+
+def hc_pre_norm_quant2(x, pre_in, w, eps, want_f32=False, out=None, want_perm=False):
+    """Same outputs as hc_pre_norm_quant without the split (y, yq, yf, yqp), as two multi-CTA kernels (~3 us each
+    instead of one ~13 us single-CTA kernel)."""
+    hc, d = x.shape[-2], x.shape[-1]
+    dev = x.device
+    out = out or {}
+    BLOCK = 1024
+    nb = triton.cdiv(d, BLOCK)
+    ytmp = torch.empty(1, d, device=dev, dtype=torch.bfloat16)
+    ss = torch.empty(triton.next_power_of_2(nb), device=dev, dtype=torch.float32)
+    y = out.get("y") if out.get("y") is not None else torch.empty(1, d, device=dev, dtype=torch.bfloat16)
+    yq = out.get("yq") if out.get("yq") is not None else torch.empty(1, d, device=dev, dtype=torch.bfloat16)
+    yf = (out.get("yf") if out.get("yf") is not None else torch.empty(1, d, device=dev, dtype=torch.float32)) if want_f32 else y
+    yqp = (out.get("yqp") if out.get("yqp") is not None else torch.empty(1, d, device=dev, dtype=torch.bfloat16)) if want_perm else y
+    with torch.cuda.device(dev):
+        if ss.numel() > nb:
+            ss.zero_()
+        _hc_pre2_kernel[(nb,)](x, pre_in, ytmp, ss, D=d, HC=hc, BLOCK=BLOCK, num_warps=4)
+        _norm_quant2_kernel[(nb,)](ytmp, ss, w, y, yq, yf, yqp, eps, D=d, NB=ss.numel(), BLOCK=BLOCK, WRITE_YF=want_f32, WRITE_YQP=want_perm, num_warps=4)
+    if want_perm:
+        return y, yq, (yf if want_f32 else None), yqp
+    return y, yq, (yf if want_f32 else None)
 
 
 # --------------------------------------------------------------------------- rmsnorm + fp8 quant

@@ -51,7 +51,8 @@ __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint
 template <bool M8>
 __device__ __forceinline__ void fp8_gemm_tc_body(const __nv_bfloat16* __restrict__ X, int ldx, int M,
             const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, int N, int K, int Kc,
-            float* __restrict__ out, int ldo, int k_per_split, int group_cols)
+            float* __restrict__ out, int ldo, int k_per_split, int group_cols,
+            __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits)
 {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
@@ -122,14 +123,32 @@ __device__ __forceinline__ void fp8_gemm_tc_body(const __nv_bfloat16* __restrict
         if (g < M) { o[(long long)g * ldo + n0 + 2 * t] = c[0]; o[(long long)g * ldo + n0 + 2 * t + 1] = c[1]; }
         if (!M8 && g + 8 < M) { o[(long long)(g + 8) * ldo + n0 + 2 * t] = c[2]; o[(long long)(g + 8) * ldo + n0 + 2 * t + 1] = c[3]; }
     }
+    if (y == nullptr) return;
+    // epilogue: the last warp to finish this 8-column tile (over all splits) sums the partials in split
+    // order and writes bf16. Counter per tile, reset for the next launch.
+    __threadfence();
+    __shared__ unsigned int last[WARPS];
+    if (lane == 0) last[warp] = (splits == 1) ? 1u : (atomicInc(&counters[n0 >> 3], (unsigned)splits - 1) == (unsigned)(splits - 1));
+    __syncwarp();
+    if (!last[warp]) return;
+    __threadfence();
+    const int rows = group_cols > 0 ? 1 : M;
+    for (int i = lane; i < rows * 8; i += 32) {
+        const int r = i >> 3, col = n0 + (i & 7);
+        float acc = 0.f;
+        for (int sp = 0; sp < splits; ++sp) acc += out[((long long)sp * M + r) * ldo + col];
+        y[(long long)r * N + col] = __float2bfloat16(acc);
+    }
 }
 
 extern "C" __global__ void __launch_bounds__(WARPS * 32)
 fp8_gemm_tc8(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
-             int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols)
-{ fp8_gemm_tc_body<true>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols); }
+             int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols,
+             __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits)
+{ fp8_gemm_tc_body<true>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits); }
 
 extern "C" __global__ void __launch_bounds__(WARPS * 32)
 fp8_gemm_tc16(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
-              int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols)
-{ fp8_gemm_tc_body<false>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols); }
+              int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols,
+              __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits)
+{ fp8_gemm_tc_body<false>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits); }

@@ -379,7 +379,7 @@ static void swiglu_quant_cols(const float* gu, int inter, float wt, float limit,
 // One MoE layer for one token. Pointers per selected expert (E of them).
 static int g_int8 = 2;
 alignas(64) static int g_ctr1[16 * 8], g_ctr3[16 * 8];  // per-node dynamic work counters (one cache line each)
-static int g_ch1 = 64, g_ch3 = 64;  // rows per dynamic work item (stage 1 / stage 3)
+static int g_ch1 = 96, g_ch3 = 64;  // max rows per dynamic work item (stage 1 / stage 3)
 extern "C" void cpumoe_set_chunks(int ch1, int ch3) { g_ch1 = ch1 > 0 ? ch1 : 64; g_ch3 = ch3 > 0 && ch3 <= 256 ? ch3 : 64; }
 extern "C" void cpumoe_set_int8(int on) { g_int8 = on; }
 
@@ -411,8 +411,11 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
         // (expert, 32-row chunk) work items are handed out dynamically through an atomic counter, so a thread
         // that gets descheduled or shares a core with another process just takes fewer chunks.
         {
-            const int CH = g_ch1;
             const int n0 = (int)((long)N13 * node / g_nodes), n1 = (int)((long)N13 * (node + 1) / g_nodes);
+            // work item size: ~8 items per thread (balance) but not below 8 rows (streaming); g_ch1 caps it
+            int CH = (int)(((long)(n1 - n0) * E) / ((long)g_cores_per_node * 8)) & ~1;
+            if (CH < 8) CH = 8;
+            if (CH > g_ch1) CH = g_ch1;
             const int nch = (n1 - n0 + CH - 1) / CH, total = E * nch;
             for (;;) {
                 int c = __atomic_fetch_add(&g_ctr1[node * 16], 1, __ATOMIC_RELAXED);
@@ -451,8 +454,10 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
         if (dbg) tdbg[t][2] = omp_get_wtime();
         // stage 3: out[n] = sum_e h[e] . w2[e][n]  (dynamic 32-row output chunks per node; expert-outer inside a chunk)
         {
-            const int CH = g_ch3;
             const int n0 = (int)((long)dim * node / g_nodes), n1 = (int)((long)dim * (node + 1) / g_nodes);
+            int CH = (int)((n1 - n0) / (g_cores_per_node * 6)) & ~1;
+            if (CH < 8) CH = 8;
+            if (CH > g_ch3) CH = g_ch3;
             const int nch = (n1 - n0 + CH - 1) / CH;
             for (;;) {
                 int c = __atomic_fetch_add(&g_ctr3[node * 16], 1, __ATOMIC_RELAXED);

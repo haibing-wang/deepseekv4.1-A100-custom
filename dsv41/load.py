@@ -15,7 +15,7 @@ from .stio import Checkpoint
 
 HOT_EXPERTS: dict[int, list[int]] = {}  # layer -> expert ids to keep on the GPU (cpu offload mode)
 LAYER_GB = 7.1  # experts (6.72 GiB fp4 + scales) + dense bf16 (0.34 GiB) per layer
-LAYER_GB_OFFLOAD = 0.4  # dense bf16 only; experts live in host RAM
+LAYER_GB_OFFLOAD = 0.25  # dense bf16 only; experts live in host RAM
 RESERVE_GB = 2.0  # activations / temporaries per device
 RESERVE_GB_OFFLOAD = 6.0  # + expert staging buffers (decode 1.8 GiB, prefill chunk 1.2 GiB) and prefill temporaries
 

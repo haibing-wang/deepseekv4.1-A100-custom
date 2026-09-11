@@ -150,6 +150,8 @@ def main():
         print(f"[offload decode stages, per token; cold experts per token: {rt.n_cold / max(len(out) + 8, 1):.1f} of {40 * 6}]")
         for k, v in sorted(rt.prof.items(), key=lambda kv: -kv[1]):
             print(f"  {k:26s} {v / 8 * 1000:7.1f} ms  ({v / tot * 100:4.1f}%)")
+        if getattr(rt, "hotcache", None) is not None:
+            print("  " + rt.hotcache.stats())
         ct = sorted(rt.call_times)
         if ct:
             q = lambda f: ct[min(int(len(ct) * f), len(ct) - 1)] * 1e3

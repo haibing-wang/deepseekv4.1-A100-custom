@@ -8,18 +8,22 @@ H2D/D2D copies between GPU segments, and one graph launch per GPU."""
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import torch
 import torch.nn.functional as F
 
-from .cukern import fp4_gemv_pairs as cukern_fp4
+from .cukern import fp4_gemm_tc, fp4_gemv_pairs as cukern_fp4
 from .fused import fake_quant_fp4, fake_quant_fp8, rmsnorm, rope_dev_, sparse_attn_decode_split as sparse_attn_decode2, swiglu_quant
-from .fused2 import gate_topk, hc_mix, hc_post2_, hc_pre_norm_quant, kv_write, norm_quant, sattn2
+from .fused2 import gate_topk, hc_mix, hc_post2_, hc_pre_norm_quant, hc_pre_norm_quant2, hc_sinkhorn, kv_write, norm_quant, sattn2
 from .model import Attention, Block, Transformer, _hc_post, _hc_pre, linear_fp8, select_candidate_blocks
 from .w8 import linear_w, oproj_a
 
-FUSED2 = os.environ.get("DSV41_FUSED2", "1") == "1"  # the ~25-launch layer (fused2.py) instead of the ~100-launch one
+FUSED2 = os.environ.get("DSV41_FUSED2", "1") == "1"
+_CPU_DEBUG = os.environ.get("DSV41_CPU_DEBUG") is not None
+FP4_TC = os.environ.get("DSV41_FP4_TC", "1") == "1"  # expert GEMM on tensor cores (cuda/fp4_tc.cu) instead of the GEMV
+HC_FORK = os.environ.get("DSV41_HC_FORK", "0") == "1"  # hyper-connection mixes + sinkhorn on a side stream (a parallel graph branch)  # the ~25-launch layer (fused2.py) instead of the ~100-launch one
 
 
 class DecodeRuntime:
@@ -198,29 +202,87 @@ class DecodeRuntime:
         return torch.where(idxs < compress_len, idxs + self.win, -1).to(torch.int32)
 
     # ------------------------------------------------------------------ block / segment
+    def _hc_sub(self, blk: Block, h: torch.Tensor, params, pre_in, norm_w, want_f32=False, out=None, want_perm=False):
+        """Hyper-connection split + hc_pre + rmsnorm + fp8 quant for one sub-block.
+        Returns ((pre, post, comb), side, x, xq, xf[, xqp]): with HC_FORK the split (hc_mix + sinkhorn) runs on a side
+        stream (a parallel graph branch; it is only needed at hc_post) and `side` must be joined by _hc_join first.
+        want_perm: also the 8-k permuted copy of xq for the tensor-core expert GEMM."""
+        fn, scale, base = params
+        if not HC_FORK:
+            mixes = hc_mix(h, fn, blk.eps)
+            r = hc_pre_norm_quant(h, pre_in, mixes, scale, base, norm_w, blk.eps, blk.hc_eps, blk.sinkhorn_iters, want_f32=want_f32, out=out, want_perm=want_perm)
+            return (r[0], r[1], r[2]), None, *r[3:]
+        split, side = self._hc_split(blk, h, params)
+        r = hc_pre_norm_quant2(h, pre_in, norm_w, blk.eps, want_f32=want_f32, out=out, want_perm=want_perm)
+        return split, side, *r
+
+    def _hc_split(self, blk: Block, h: torch.Tensor, params):
+        fn, scale, base = params
+        d = blk.device
+        main = torch.cuda.current_stream(d)
+        side = self._side_stream(d)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            mixes = hc_mix(h, fn, blk.eps)
+            out = hc_sinkhorn(mixes, scale, base, blk.hc, blk.sinkhorn_iters, blk.hc_eps)
+        return out, side
+
+    def _side_stream(self, d):
+        ss = getattr(self, "_side", None)
+        if ss is None:
+            ss = self._side = {}
+        if d not in ss:
+            ss[d] = torch.cuda.Stream(d)
+        return ss[d]
+
+    @staticmethod
+    def _hc_join(side, d):
+        if side is not None:
+            torch.cuda.current_stream(d).wait_stream(side)
+
     def block2(self, blk: Block, h: torch.Tensor, pre_mix: torch.Tensor):
         """One layer on the residual buffer h [1, 1, hc, dim] (updated in place); pre_mix: [hc] fp32."""
-        fn, scale, base = blk.hc_attn
-        mixes = hc_mix(h, fn, blk.eps)
-        pre_n, post, comb, x, xq, _ = hc_pre_norm_quant(h, pre_mix, mixes, scale, base, blk.attn_norm_w, blk.eps, blk.hc_eps, blk.sinkhorn_iters)
-        a = self.attention2(blk.attn, x, xq, blk.device)
+        d = blk.device
+        (pre_n, post, comb), side, x, xq, _ = self._hc_sub(blk, h, blk.hc_attn, pre_mix, blk.attn_norm_w)
+        a = self.attention2(blk.attn, x, xq, d)
+        self._hc_join(side, d)
         hc_post2_(a.view(1, -1), h, post, comb)
-        fn, scale, base = blk.hc_ffn
-        mixes = hc_mix(h, fn, blk.eps)
-        pre_out, post, comb, x, xq, xf = hc_pre_norm_quant(h, pre_n, mixes, scale, base, blk.ffn_norm_w, blk.eps, blk.hc_eps, blk.sinkhorn_iters, want_f32=True)
-        y2, ys = self.moe2(blk.ffn, xq, xf)
+        (pre_out, post, comb), side, x, xq, xf, xqp = self._hc_sub(blk, h, blk.hc_ffn, pre_n, blk.ffn_norm_w, want_f32=True, want_perm=True)
+        y2, ys = self.moe2(blk.ffn, xq, xf, xqp)
+        self._hc_join(side, d)
         hc_post2_(None, h, post, comb, y2=y2, ys=ys)
         return h, pre_out
 
-    def moe2(self, moe, xq: torch.Tensor, xf: torch.Tensor):
+    def _tc_tables(self, n: int, d):
+        """Constant group tables for n single-token pairs: group p = pair p (grp_start = 0..n, pair_tok = 0)."""
+        key = (n, d)
+        t = self._tc_cache.get(key) if hasattr(self, "_tc_cache") else None
+        if t is None:
+            if not hasattr(self, "_tc_cache"):
+                self._tc_cache = {}
+            t = self._tc_cache[key] = (torch.arange(n + 1, device=d, dtype=torch.int32), torch.zeros(n, device=d, dtype=torch.int32),
+                                       torch.arange(n, device=d, dtype=torch.int32))
+        return t
+
+    def experts_tc(self, xqp, hq_permute, w13, s13, w2, s2, eid, wt, inter, limit, n, d):
+        """n single-token (expert, weight) pairs on the tensor-core FP4 GEMM: fp32 [n, dim]. xqp: 8-k permuted x."""
+        starts, tok0, rows = self._tc_tables(n, d)
+        gu = fp4_gemm_tc(xqp, w13, s13, eid, starts, tok0, n, 1)
+        hqp = swiglu_quant(gu, wt, inter, limit, permute=True)
+        return fp4_gemm_tc(hqp, w2, s2, eid, starts, rows, n, 1)
+
+    def moe2(self, moe, xq: torch.Tensor, xf: torch.Tensor, xqp=None):
         """Routed experts (fp32 [topk, dim], one row per selected expert, routing weight applied) and the shared expert (bf16 [1, dim])."""
         d = xq.device
         scores = F.linear(xf, moe.gate_w)
         eid, wt = gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1)
-        tok, pair_rows, ones = moe._pair_tables(1, d)
-        gu = cukern_fp4(xq, moe.w13, moe.s13, tok, eid, ones, moe.topk)
-        hq = swiglu_quant(gu, wt, moe.inter, moe.swiglu_limit)
-        y2 = cukern_fp4(hq, moe.w2, moe.s2, pair_rows, eid, ones, moe.topk)
+        if FP4_TC and xqp is not None:
+            y2 = self.experts_tc(xqp, True, moe.w13, moe.s13, moe.w2, moe.s2, eid, wt, moe.inter, moe.swiglu_limit, moe.topk, d)
+        else:
+            tok, pair_rows, ones = moe._pair_tables(1, d)
+            gu = cukern_fp4(xq, moe.w13, moe.s13, tok, eid, ones, moe.topk)
+            hq = swiglu_quant(gu, wt, moe.inter, moe.swiglu_limit)
+            y2 = cukern_fp4(hq, moe.w2, moe.s2, pair_rows, eid, ones, moe.topk)
         gu_s = linear_w(xq, moe.sh_w13)
         hs = swiglu_quant(gu_s, None, moe.inter, moe.swiglu_limit)
         ys = linear_w(hs, moe.sh_w2)
@@ -356,6 +418,7 @@ class OffloadDecodeRuntime(DecodeRuntime):
         self.pre_buf = torch.zeros(hc, dtype=torch.float32, device=d)
         self.pre_mid = torch.zeros(hc, dtype=torch.float32, device=d)
         self.xq_buf = torch.zeros(1, dim, dtype=torch.bfloat16, device=d)
+        self.xqp_buf = torch.zeros(1, dim, dtype=torch.bfloat16, device=d)  # 8-k permuted copy (tensor-core expert GEMM)
         self.ffn_pre = torch.zeros(hc, dtype=torch.float32, device=d)
         self.ffn_post = torch.zeros(hc, dtype=torch.float32, device=d)
         self.ffn_comb = torch.zeros(hc, hc, dtype=torch.float32, device=d)
@@ -389,26 +452,36 @@ class OffloadDecodeRuntime(DecodeRuntime):
         self.cold_ids_np, self.cold_w_np = self.cold_ids_host.numpy(), self.cold_w_host.numpy()
         self.limit = float(model.blocks[0].ffn.swiglu_limit)
         self.call_times: list[float] = []
+        self.capturing = False
+        self.hotcache = None
         if self.cpu_experts:
             from . import cpumoe
             cpumoe.lib()
             cpumoe.pin_main_thread(_gpu_numa_node(d))
+            if any(blk.ffn.hot for blk in model.blocks) and os.environ.get("DSV41_ADAPTIVE_HOT", "1") == "1":
+                from .hotcache import HotCache
+                self.hotcache = HotCache(model.blocks, d, swaps_per_token=int(os.environ.get("DSV41_HOT_SWAPS", "2")),
+                                         margin=float(os.environ.get("DSV41_HOT_MARGIN", "2.0")), cpus=cpumoe.RESERVED_CPUS or None)
 
     # ---- the halves of a layer, on static buffers
     def part1(self, blk: Block):
         h = self.h_buf
         if blk.engram is not None:
             h.copy_(blk.engram.apply(h, self.eng_in[blk.layer_id]))
-        fn, scale, base = blk.hc_attn
-        mixes = hc_mix(h, fn, blk.eps)
-        _, post, comb, x, xq, _ = hc_pre_norm_quant(h, self.pre_buf, mixes, scale, base, blk.attn_norm_w, blk.eps, blk.hc_eps, blk.sinkhorn_iters,
-                                                    out={"pre": self.pre_mid})
-        a = self.attention2(blk.attn, x, xq, blk.device)
+        d = blk.device
+        (pre_n, post, comb), side, x, xq, _ = self._hc_sub(blk, h, blk.hc_attn, self.pre_buf, blk.attn_norm_w, out={"pre": self.pre_mid})
+        a = self.attention2(blk.attn, x, xq, d)
+        self._hc_join(side, d)
         hc_post2_(a.view(1, -1), h, post, comb)
-        fn, scale, base = blk.hc_ffn
-        mixes = hc_mix(h, fn, blk.eps)
-        _, _, _, _, _, xf = hc_pre_norm_quant(h, self.pre_mid, mixes, scale, base, blk.ffn_norm_w, blk.eps, blk.hc_eps, blk.sinkhorn_iters, want_f32=True,
-                                             out={"pre": self.ffn_pre, "post": self.ffn_post, "comb": self.ffn_comb, "yq": self.xq_buf})
+        if HC_FORK:
+            self.pre_mid.copy_(pre_n)
+        (pre_f, post_f, comb_f), side, _, _, xf, _ = self._hc_sub(blk, h, blk.hc_ffn, self.pre_mid, blk.ffn_norm_w, want_f32=True, want_perm=True,
+                                                                out={"pre": self.ffn_pre, "post": self.ffn_post, "comb": self.ffn_comb, "yq": self.xq_buf, "yqp": self.xqp_buf})
+        self._hc_join(side, d)
+        if HC_FORK:
+            self.ffn_pre.copy_(pre_f)
+            self.ffn_post.copy_(post_f)
+            self.ffn_comb.copy_(comb_f)
         moe = blk.ffn
         scores = F.linear(xf, moe.gate_w)
         gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1,
@@ -430,7 +503,12 @@ class OffloadDecodeRuntime(DecodeRuntime):
         if moe.hot:
             self.slot_ids.copy_(self.slot_ids_host, non_blocking=True)  # H2D memcpy nodes at the head of graph 2
             self.slot_w.copy_(self.slot_w_host, non_blocking=True)
-            y = y + moe.hot_experts_gpu(self.xq_buf, self.slot_ids, self.slot_w)
+            if FP4_TC:
+                hot = moe.hot
+                y2 = self.experts_tc(self.xqp_buf, True, hot["w13"], hot["s13"], hot["w2"], hot["s2"], self.slot_ids, self.slot_w, moe.inter, moe.swiglu_limit, moe.topk, self.d)
+                y = y + y2.sum(dim=0, keepdim=True)
+            else:
+                y = y + moe.hot_experts_gpu(self.xq_buf, self.slot_ids, self.slot_w)
         self.y_shared.copy_(y)
 
     def part2_cpu_post(self, blk: Block):
@@ -445,6 +523,8 @@ class OffloadDecodeRuntime(DecodeRuntime):
         torch.cuda.current_stream(self.d).synchronize()
         ids = self.ids_host.tolist()
         wts = self.wts_host.tolist()
+        if self.hotcache is not None and not self.capturing:
+            self.hotcache.update(blk.layer_id, ids)
         gs, gw, cid, cw = moe.split_hot(ids, wts)
         if gs is not None:
             self.slot_ids_np[:] = gs
@@ -466,6 +546,8 @@ class OffloadDecodeRuntime(DecodeRuntime):
             dt = time.perf_counter() - t0
             self.prof["  (of which cpumoe_forward call)"] += dt
             self.call_times.append(dt)
+            if _CPU_DEBUG:
+                print(f"[pycall] E={n_cold} {dt * 1e6:.0f}us", file=sys.stderr, flush=True)
 
     def part2(self, blk: Block):
         moe = blk.ffn
@@ -473,9 +555,12 @@ class OffloadDecodeRuntime(DecodeRuntime):
         tok, pair_rows, ones = moe._pair_tables(1, self.d)
         b = moe._staging(n_pairs, "decode")
         local = torch.arange(n_pairs, device=self.d, dtype=torch.int32)
-        gu = cukern_fp4(self.xq_buf, b["w13"], b["s13"], tok, local, ones, n_pairs)
-        hq = swiglu_quant(gu, self.gate_w, moe.inter, moe.swiglu_limit)
-        y2 = cukern_fp4(hq, b["w2"], b["s2"], pair_rows, local, ones, n_pairs)
+        if FP4_TC:
+            y2 = self.experts_tc(self.xqp_buf, True, b["w13"], b["s13"], b["w2"], b["s2"], local, self.gate_w, moe.inter, moe.swiglu_limit, n_pairs, self.d)
+        else:
+            gu = cukern_fp4(self.xq_buf, b["w13"], b["s13"], tok, local, ones, n_pairs)
+            hq = swiglu_quant(gu, self.gate_w, moe.inter, moe.swiglu_limit)
+            y2 = cukern_fp4(hq, b["w2"], b["s2"], pair_rows, local, ones, n_pairs)
         hc_post2_(None, self.h_buf, self.ffn_post, self.ffn_comb, y2=y2, ys=self._shared(moe))
         self.pre_buf.copy_(self.ffn_pre)
 
@@ -488,6 +573,7 @@ class OffloadDecodeRuntime(DecodeRuntime):
     def capture(self):
         if not self.use_graphs:
             return
+        self.capturing = True
         with torch.cuda.device(self.d):
             s = torch.cuda.Stream(self.d)
             s.wait_stream(torch.cuda.current_stream(self.d))
@@ -505,23 +591,24 @@ class OffloadDecodeRuntime(DecodeRuntime):
                             self.part2(blk)
                 torch.cuda.synchronize(self.d)
                 g1 = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g1, stream=s):
+                with torch.cuda.graph(g1, stream=s, capture_error_mode="thread_local"):
                     self.part1(blk)
                 if self.cpu_experts:
                     g2 = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g2, stream=s):
+                    with torch.cuda.graph(g2, stream=s, capture_error_mode="thread_local"):
                         self.part2_cpu_shared(blk)
                     g3 = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g3, stream=s):
+                    with torch.cuda.graph(g3, stream=s, capture_error_mode="thread_local"):
                         self.part2_cpu_post(blk)
                     self.g3[blk.layer_id] = g3
                 else:
                     g2 = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g2, stream=s):
+                    with torch.cuda.graph(g2, stream=s, capture_error_mode="thread_local"):
                         self.part2(blk)
                 self.g1[blk.layer_id], self.g2[blk.layer_id] = g1, g2
             torch.cuda.current_stream(self.d).wait_stream(s)
             torch.cuda.synchronize(self.d)
+        self.capturing = False
 
     @torch.inference_mode()
     def step(self, token: int, pos: int) -> torch.Tensor:
@@ -539,6 +626,8 @@ class OffloadDecodeRuntime(DecodeRuntime):
         self.h_buf.copy_(F.embedding(self.tok, self.m.embed).unsqueeze(2).repeat(1, 1, self.cfg["hc_mult"], 1))
         self.pre_buf.zero_()
         self.pre_buf[0] = 1.0
+        if self.hotcache is not None:
+            self.hotcache.new_token()
         prof = self.prof
         for blk in self.m.blocks:
             lid = blk.layer_id

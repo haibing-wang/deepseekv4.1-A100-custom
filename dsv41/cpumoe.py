@@ -34,7 +34,7 @@ def lib():
         _lib.cpumoe_forward_ids.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 4 + [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                                             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_void_p, ctypes.c_void_p]
         _lib.cpumoe_set_int8(int(os.environ.get("DSV41_CPU_INT8", "2")))
-        _lib.cpumoe_set_chunks(int(os.environ.get("DSV41_CH1", "64")), int(os.environ.get("DSV41_CH3", "64")))
+        _lib.cpumoe_set_chunks(int(os.environ.get("DSV41_CH1", "96")), int(os.environ.get("DSV41_CH3", "64")))
         cpus = os.environ.get("DSV41_CPU_LIST") or default_cpu_list()  # e.g. "0-11,24-35,12-23,36-47" (node 0 first, then node 1)
         if cpus:
             lst = []
@@ -62,10 +62,18 @@ def _expand(cpulist: str) -> list[int]:
     return out
 
 
-def default_cpu_list(reserve_per_node: int | None = None) -> str:
-    """Worker cpus grouped by NUMA node (node 0 first) from sysfs, leaving `reserve_per_node` hardware threads
-    per node (default DSV41_RESERVE_CPUS=2) for the Python main thread and the CUDA driver: with active OpenMP
-    waiting the workers spin between layers and would otherwise starve the thread that launches the GPU work."""
+def _siblings(cpu: int) -> list[int]:
+    try:
+        return _expand(open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read().strip())
+    except OSError:
+        return [cpu]
+
+
+def default_cpu_list(reserve_cores: int | None = None) -> str:
+    """Worker cpus grouped by NUMA node (node 0 first) from sysfs, leaving `reserve_cores` whole physical cores
+    (all their hardware threads) per node (default DSV41_RESERVE_CORES=1) for the Python main thread, the CUDA
+    driver and the hot-cache copy thread: with active OpenMP waiting the workers spin between layers and would
+    otherwise starve those threads, and a busy hyperthread sibling slows the worker sharing its core."""
     import glob
     nodes = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))
     per_node = []
@@ -76,15 +84,27 @@ def default_cpu_list(reserve_per_node: int | None = None) -> str:
             return ""
     if not per_node:
         return ""
-    r = int(os.environ.get("DSV41_RESERVE_CPUS", "2")) if reserve_per_node is None else reserve_per_node
-    m = min(len(c) for c in per_node) - r
+    r = int(os.environ.get("DSV41_RESERVE_CORES", "1")) if reserve_cores is None else reserve_cores
     workers, reserved = [], []
+    m = None
     for c in per_node:
-        workers.append(",".join(str(x) for x in c[:m]))
-        reserved.extend(c[m:])
+        cores = []  # distinct physical cores of this node, in cpu order
+        seen = set()
+        for x in c:
+            if x in seen:
+                continue
+            sib = [y for y in _siblings(x) if y in c]
+            seen.update(sib)
+            cores.append(sib)
+        keep = cores[: len(cores) - r] if r < len(cores) else cores
+        drop = cores[len(cores) - r:] if r < len(cores) else []
+        w = sorted(x for core in keep for x in core)
+        workers.append(w)
+        reserved.extend(x for core in drop for x in core)
+        m = len(w) if m is None else min(m, len(w))
     RESERVED_CPUS[:] = reserved
     os.environ.setdefault("DSV41_CORES_PER_NODE", str(m))
-    return ",".join(workers)
+    return ",".join(",".join(str(x) for x in w[:m]) for w in workers)
 
 
 def pin_main_thread(node: int | None = None):
