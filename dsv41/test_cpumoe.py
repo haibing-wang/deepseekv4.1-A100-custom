@@ -13,6 +13,7 @@ for e in range(E):
     w2 = torch.randint(0, 256, (dim, inter // 2), dtype=torch.uint8); s2 = torch.randint(118, 128, (dim, inter // 32), dtype=torch.uint8)
     he.load_expert(e, w1, w3, s1, s3, w2, s2)
     if e in (0, 2, 3, 5, 6, 7): ws[e] = (w1, w3, s1, s3, w2, s2)
+print(f"NUMA-local fraction of expert rows: {he.local_fraction():.3f}")
 x = fake_quant_fp8(torch.randn(1, dim, dtype=torch.bfloat16) * 2, 32)
 ids = [0, 2, 3, 5, 6, 7]; wts = [0.3, 0.2, 0.15, 0.15, 0.1, 0.1]
 ref = torch.zeros(dim)
@@ -24,7 +25,7 @@ for e, wt in zip(ids, wts):
     ref += (h.float() @ dequant_fp4(w2, s2).float().T)[0]
 L = cpumoe.lib()
 mb = 6 * (2 * inter * dim // 2 + 2 * inter * dim // 32 + dim * inter // 2 + dim * inter // 32)
-for mode in (0, 1):
+for mode in (0, 1, 2):
     L.cpumoe_set_int8(mode)
     out = he.forward(x[0], ids, wts, 10.0).clone()
     err = ((out - ref).abs().max() / ref.abs().max()).item()
@@ -32,4 +33,4 @@ for mode in (0, 1):
     t = time.perf_counter(); it = 40
     for i in range(it): he.forward(x[0], [(e + 6 * i) % E for e in ids], wts, 10.0)
     dt = (time.perf_counter() - t) / it
-    print(f"{'int8 VNNI' if mode else 'bf16     '}: rel err {err:.2e}  layer {dt*1e3:.2f} ms -> {mb/dt/1e9:.0f} GB/s ; per token (40 layers) {dt*40*1e3:.0f} ms")
+    print(f"{['bf16     ', 'int8 VNNI', 'int8 v2  '][mode]}: rel err {err:.2e}  layer {dt*1e3:.2f} ms -> {mb/dt/1e9:.0f} GB/s ; per token (40 layers) {dt*40*1e3:.0f} ms")

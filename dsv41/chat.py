@@ -5,6 +5,8 @@ import argparse
 import sys
 import time
 
+import os as _os
+_os.environ.setdefault("OMP_WAIT_POLICY", "active")  # CPU expert threads keep spinning between layers (libgomp reads this once)
 from .engine import Engine, GenParams, parse_budgets
 
 

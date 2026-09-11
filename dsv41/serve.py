@@ -12,6 +12,8 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import os as _os
+_os.environ.setdefault("OMP_WAIT_POLICY", "active")  # CPU expert threads keep spinning between layers (libgomp reads this once)
 from .engine import Engine, GenParams, parse_budgets
 
 ENGINE: Engine | None = None

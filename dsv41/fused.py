@@ -288,8 +288,8 @@ def _swiglu_quant_kernel(GU, W, Y, n_rows, limit, INTER: tl.constexpr, GROUP: tl
     row = tl.program_id(0)
     gb = tl.program_id(1)
     cols = gb * GROUP + tl.arange(0, GROUP)
-    gate = tl.load(GU + row * (2 * INTER) + cols)
-    up = tl.load(GU + row * (2 * INTER) + INTER + cols)
+    gate = tl.load(GU + row * (2 * INTER) + cols).to(tl.float32)
+    up = tl.load(GU + row * (2 * INTER) + INTER + cols).to(tl.float32)
     if limit > 0:
         up = tl.minimum(tl.maximum(up, -limit), limit)
         gate = tl.minimum(gate, limit)
@@ -304,7 +304,7 @@ def _swiglu_quant_kernel(GU, W, Y, n_rows, limit, INTER: tl.constexpr, GROUP: tl
 
 
 def swiglu_quant(gu: torch.Tensor, weights: torch.Tensor | None, inter: int, limit: float) -> torch.Tensor:
-    """gu: fp32 [rows, 2*inter] (gate | up); weights: fp32 [rows] or None -> bf16 [rows, inter], FP8-rounded per 32."""
+    """gu: fp32 or bf16 [rows, 2*inter] (gate | up); weights: fp32 [rows] or None -> bf16 [rows, inter], FP8-rounded per 32."""
     rows = gu.shape[0]
     y = torch.empty(rows, inter, device=gu.device, dtype=torch.bfloat16)
     with torch.cuda.device(gu.device):

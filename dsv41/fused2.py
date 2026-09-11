@@ -1,0 +1,362 @@
+"""Second round of fusion for the static decode path: one layer in ~25 launches instead of ~100.
+
+The decode step is one CUDA graph per GPU, so nothing here is about CPU launch cost: it is the
+device time of thousands of 2-5 us kernels executed back to back. Every kernel below replaces a
+chain of 5-15 torch ops on a single token and keeps the reference rounding points (bf16 stores
+between stages, per-32 FP8 fake quantization) so the results match the unfused path.
+
+  hc_mix              : 24 mixing logits of the hyper-connection block (rmsnorm-scaled dot products)
+  hc_pre_norm_quant   : sinkhorn split of the mixes + hc_pre + rmsnorm + fp8 fake quant (+ fp32 copy)
+  norm_quant          : rmsnorm + fp8 fake quant (q_norm)
+  kv_write            : kv_norm + rope + fp8 fake quant + write into the sliding-window ring
+  sattn2              : split-K sparse attention over the window ring (validity from pos) and the
+                        compressed cache (top-k indices), combine fused with the inverse rope
+  gate_topk           : sqrt(softplus) / bias / top-k / weight normalisation of the MoE gate
+  hc_post2            : (sum of routed experts + shared expert ->) bf16 -> hc_post, in place
+"""
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+
+from .fused import _ceil_log2, _pow2, _round_e4m3
+
+
+@triton.jit
+def _fq8(x):
+    """Per-row FP8 fake quantization of a 2D tile [rows, 32] (fp32 in, fp32 out)."""
+    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
+    s = _pow2(_ceil_log2(libdevice.div_rn(amax, 448.0)))
+    q = _round_e4m3(tl.minimum(tl.maximum(libdevice.div_rn(x, s[:, None]), -448.0), 448.0))
+    return q * s[:, None]
+
+
+# --------------------------------------------------------------------------- hyper-connection mixes
+@triton.jit
+def _hc_mix_kernel(X, FN, OUT, eps, N: tl.constexpr, BLOCK: tl.constexpr):
+    k = tl.program_id(0)
+    acc = tl.zeros((BLOCK,), tl.float32)
+    ss = tl.zeros((BLOCK,), tl.float32)
+    for i in range(0, N, BLOCK):
+        offs = i + tl.arange(0, BLOCK)
+        x = tl.load(X + offs).to(tl.float32)
+        f = tl.load(FN + k * N + offs).to(tl.float32)
+        acc += x * f
+        ss += x * x
+    dot = tl.sum(acc, axis=0)
+    var = tl.sum(ss, axis=0) / N
+    tl.store(OUT + k, dot * (1.0 / tl.sqrt(var + eps)))
+
+
+def hc_mix(x: torch.Tensor, fn: torch.Tensor, eps: float) -> torch.Tensor:
+    """x: [1, 1, hc, d] bf16 (contiguous), fn: [n_mix, hc*d] fp32 -> [n_mix] fp32 (= _hc_mix_proj for one token)."""
+    n_mix, N = fn.shape
+    assert x.numel() == N and x.is_contiguous()
+    out = torch.empty(n_mix, device=x.device, dtype=torch.float32)
+    with torch.cuda.device(x.device):
+        _hc_mix_kernel[(n_mix,)](x, fn, out, eps, N=N, BLOCK=4096, num_warps=8)
+    return out
+
+
+@triton.jit
+def _sinkhorn_part(MIX, SCALE, BASE, PRE, POST, COMB, eps, iters: tl.constexpr, HC: tl.constexpr):
+    j = tl.arange(0, HC)
+    jj = tl.arange(0, HC)[:, None]
+    kk = tl.arange(0, HC)[None, :]
+    s0 = tl.load(SCALE)
+    s1 = tl.load(SCALE + 1)
+    s2 = tl.load(SCALE + 2)
+    pre = tl.sigmoid(tl.load(MIX + j) * s0 + tl.load(BASE + j)) + eps
+    post = 2.0 * tl.sigmoid(tl.load(MIX + HC + j) * s1 + tl.load(BASE + HC + j))
+    idx = 2 * HC + jj * HC + kk
+    comb = tl.load(MIX + idx) * s2 + tl.load(BASE + idx)
+    rmax = tl.max(comb, axis=1)
+    comb = tl.exp(comb - rmax[:, None])
+    comb = comb / tl.sum(comb, axis=1)[:, None] + eps
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + eps)
+    for _ in range(iters - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + eps)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + eps)
+    tl.store(PRE + j, pre)
+    tl.store(POST + j, post)
+    tl.store(COMB + jj * HC + kk, comb)
+
+
+@triton.jit
+def _hc_prenq_kernel(X, PREIN, MIX, SCALE, BASE, W, PRE, POST, COMB, Y, YQ, YF, eps, hc_eps,
+                     iters: tl.constexpr, HC: tl.constexpr, D: tl.constexpr, R: tl.constexpr, WRITE_YF: tl.constexpr):
+    _sinkhorn_part(MIX, SCALE, BASE, PRE, POST, COMB, hc_eps, iters, HC)
+    r = tl.arange(0, R)[:, None]
+    c = tl.arange(0, 32)[None, :]
+    offs = r * 32 + c
+    mask = offs < D
+    acc = tl.zeros((R, 32), tl.float32)
+    for h in tl.static_range(HC):
+        p = tl.load(PREIN + h)
+        acc += p * tl.load(X + h * D + offs, mask=mask, other=0.0).to(tl.float32)
+    acc = acc.to(tl.bfloat16).to(tl.float32)  # hc_pre output is stored in bf16
+    var = tl.sum(tl.sum(acc * acc, axis=1), axis=0) / D
+    y = acc * (1.0 / tl.sqrt(var + eps)) * tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
+    y = y.to(tl.bfloat16).to(tl.float32)  # rmsnorm output is stored in bf16
+    tl.store(Y + offs, y.to(tl.bfloat16), mask=mask)
+    if WRITE_YF:
+        tl.store(YF + offs, y, mask=mask)
+    tl.store(YQ + offs, _fq8(y).to(tl.bfloat16), mask=mask)
+
+
+def hc_pre_norm_quant(x, pre_in, mixes, scale, base, w, eps, hc_eps, iters, want_f32=False, out=None):
+    """x: [1, 1, hc, d] bf16; pre_in: [hc] fp32 (previous sub-block's pre mix); mixes: [(2+hc)*hc] fp32.
+    Returns (pre, post, comb, y, yq, yf): the sinkhorn split of `mixes`, the hc_pre+rmsnorm output y (bf16 [1, d]),
+    its fp8 fake-quantized copy yq, and (optionally) y as fp32. `out`: optional dict of persistent output buffers
+    (keys pre, post, comb, y, yq, yf) for static-buffer runtimes."""
+    hc, d = x.shape[-2], x.shape[-1]
+    dev = x.device
+    out = out or {}
+    pre = out.get("pre") if out.get("pre") is not None else torch.empty(hc, device=dev, dtype=torch.float32)
+    post = out.get("post") if out.get("post") is not None else torch.empty(hc, device=dev, dtype=torch.float32)
+    comb = out.get("comb") if out.get("comb") is not None else torch.empty(hc, hc, device=dev, dtype=torch.float32)
+    y = out.get("y") if out.get("y") is not None else torch.empty(1, d, device=dev, dtype=torch.bfloat16)
+    yq = out.get("yq") if out.get("yq") is not None else torch.empty(1, d, device=dev, dtype=torch.bfloat16)
+    yf = (out.get("yf") if out.get("yf") is not None else torch.empty(1, d, device=dev, dtype=torch.float32)) if want_f32 else y
+    R = triton.next_power_of_2(d // 32)
+    with torch.cuda.device(dev):
+        _hc_prenq_kernel[(1,)](x, pre_in, mixes, scale, base, w, pre, post, comb, y, yq, yf, eps, hc_eps,
+                               iters=iters, HC=hc, D=d, R=R, WRITE_YF=want_f32, num_warps=8)
+    return pre, post, comb, y, yq, (yf if want_f32 else None)
+
+
+# --------------------------------------------------------------------------- rmsnorm + fp8 quant
+@triton.jit
+def _norm_quant_kernel(X, W, YQ, eps, D: tl.constexpr, R: tl.constexpr):
+    r = tl.arange(0, R)[:, None]
+    c = tl.arange(0, 32)[None, :]
+    offs = r * 32 + c
+    mask = offs < D
+    x = tl.load(X + offs, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(tl.sum(x * x, axis=1), axis=0) / D
+    y = x * (1.0 / tl.sqrt(var + eps)) * tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
+    y = y.to(tl.bfloat16).to(tl.float32)
+    tl.store(YQ + offs, _fq8(y).to(tl.bfloat16), mask=mask)
+
+
+def norm_quant(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    """rmsnorm of one row (bf16 [1, d]) followed by the per-32 FP8 fake quantization -> bf16 [1, d]."""
+    d = x.shape[-1]
+    xc = x.contiguous()
+    yq = torch.empty_like(xc)
+    with torch.cuda.device(x.device):
+        _norm_quant_kernel[(1,)](xc, w, yq, eps, D=d, R=triton.next_power_of_2(d // 32), num_warps=4)
+    return yq
+
+
+# --------------------------------------------------------------------------- kv: norm + rope + quant + ring write
+@triton.jit
+def _kv_write_kernel(X, W, COS, SIN, POS, CACHE, eps, WIN: tl.constexpr, D: tl.constexpr, RD: tl.constexpr):
+    offs = tl.arange(0, D)
+    x = tl.load(X + offs).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / D
+    y = x * (1.0 / tl.sqrt(var + eps)) * tl.load(W + offs).to(tl.float32)
+    y = y.to(tl.bfloat16).to(tl.float32)
+    # rope on the last RD elements, interleaved (real, imag) pairs
+    pos = tl.load(POS)
+    re, im = tl.split(tl.reshape(y, (D // 2, 2)))
+    j = tl.arange(0, D // 2)
+    rj = j - (D - RD) // 2
+    rm = rj >= 0
+    c = tl.load(COS + pos * (RD // 2) + rj, mask=rm, other=1.0)
+    s = tl.load(SIN + pos * (RD // 2) + rj, mask=rm, other=0.0)
+    yr = (re * c - im * s).to(tl.bfloat16).to(tl.float32)
+    yi = (re * s + im * c).to(tl.bfloat16).to(tl.float32)
+    y2 = tl.reshape(tl.join(yr, yi), (D // 32, 32))
+    q = _fq8(y2).to(tl.bfloat16)
+    slot = pos % WIN
+    r = tl.arange(0, D // 32)[:, None]
+    cc = tl.arange(0, 32)[None, :]
+    tl.store(CACHE + slot * D + r * 32 + cc, q)
+
+
+def kv_write(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, pos: torch.Tensor, cache: torch.Tensor, rd: int, eps: float):
+    """x: bf16 [1, d] (wkv output). Writes kv_norm -> rope(pos) -> fp8 fake quant into cache[0, pos % win]."""
+    d = x.shape[-1]
+    win = cache.shape[1]
+    with torch.cuda.device(x.device):
+        _kv_write_kernel[(1,)](x.contiguous(), w, cos, sin, pos, cache, eps, WIN=win, D=d, RD=rd, num_warps=4)
+
+
+# --------------------------------------------------------------------------- sparse attention v2
+@triton.jit(do_not_specialize=["n_kvc", "topk"])
+def _sattn2_split_kernel(Q, KVW, KVC, IDX, POS, PM, PL, PACC, n_kvc, topk, scale,
+                         H: tl.constexpr, HB: tl.constexpr, D: tl.constexpr, BLOCK_T: tl.constexpr,
+                         NSPLIT: tl.constexpr, NWIN: tl.constexpr, WIN: tl.constexpr, HAS_C: tl.constexpr):
+    b = tl.program_id(0)
+    hb = tl.program_id(1)
+    sp = tl.program_id(2)
+    hs = hb * HB + tl.arange(0, HB)
+    dd = tl.arange(0, D)
+    q = tl.load(Q + (b * H + hs)[:, None] * D + dd[None, :])
+    if sp < NWIN:
+        pos = tl.load(POS)
+        tt = ((sp * BLOCK_T + tl.arange(0, BLOCK_T) + pos % WIN + 1) % WIN).to(tl.int32)  # ring slots, oldest first
+        valid = (tt <= pos) | (pos >= WIN)
+        kv = tl.load(KVW + (b * WIN + tt)[:, None] * D + dd[None, :], mask=valid[:, None], other=0.0)
+    else:
+        tt = (sp - NWIN) * BLOCK_T + tl.arange(0, BLOCK_T)
+        if HAS_C:
+            idx = tl.load(IDX + b * topk + tt, mask=tt < topk, other=-1)
+        else:
+            idx = tl.full((BLOCK_T,), -1, tl.int32)
+        valid = idx >= 0
+        kv = tl.load(KVC + (b * n_kvc + tl.maximum(idx, 0))[:, None] * D + dd[None, :], mask=valid[:, None], other=0.0)
+    s = tl.dot(q, tl.trans(kv)).to(tl.float32) * scale
+    s = tl.where(valid[None, :], s, -1e30)
+    m = tl.max(s, axis=1)
+    p = tl.exp(s - m[:, None])
+    p = tl.where(valid[None, :], p, 0.0)
+    l = tl.sum(p, axis=1)
+    acc = tl.dot(p.to(tl.bfloat16), kv).to(tl.float32)
+    base = (b * H + hs) * NSPLIT + sp
+    tl.store(PM + base, m)
+    tl.store(PL + base, l)
+    tl.store(PACC + base[:, None] * D + dd[None, :], acc)
+
+
+@triton.jit
+def _sattn2_combine_kernel(PM, PL, PACC, SINK, COS, SIN, POS, O, H: tl.constexpr, D: tl.constexpr, RD: tl.constexpr, NSPLIT: tl.constexpr):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    sp = tl.arange(0, NSPLIT)
+    dd = tl.arange(0, D)
+    base = (b * H + h) * NSPLIT + sp
+    m = tl.load(PM + base)
+    l = tl.load(PL + base)
+    mx = tl.max(m, axis=0)
+    w = tl.exp(m - mx)
+    acc = tl.load(PACC + base[:, None] * D + dd[None, :])
+    num = tl.sum(acc * w[:, None], axis=0)
+    den = tl.sum(l * w, axis=0) + tl.exp(tl.load(SINK + h) - mx)
+    o = (num / den).to(tl.bfloat16).to(tl.float32)
+    # inverse rope on the last RD elements
+    pos = tl.load(POS)
+    re, im = tl.split(tl.reshape(o, (D // 2, 2)))
+    j = tl.arange(0, D // 2)
+    rj = j - (D - RD) // 2
+    rm = rj >= 0
+    c = tl.load(COS + pos * (RD // 2) + rj, mask=rm, other=1.0)
+    s = -tl.load(SIN + pos * (RD // 2) + rj, mask=rm, other=0.0)
+    yr = (re * c - im * s).to(tl.bfloat16)
+    yi = (re * s + im * c).to(tl.bfloat16)
+    tl.store(O + (b * H + h) * D + dd, tl.reshape(tl.join(yr, yi), (D,)))
+
+
+def sattn2(q, kv_win, kv_c, idx, pos, attn_sink, cos, sin, rd, softmax_scale, block_t: int = 64):
+    """q: [1, 1, h, d] bf16; kv_win: [1, win, d] ring (entries with slot > pos are empty while pos < win);
+    kv_c: [1, n, d] compressed cache or None; idx: [1, 1, t] int32 rows of kv_c (-1 = none) or None.
+    Returns the attention output with the inverse rope applied: [1, 1, h, d] bf16."""
+    b, s, h, d = q.shape
+    assert s == 1 and b == 1
+    win = kv_win.shape[1]
+    nwin = win // block_t
+    if kv_c is None:
+        kv_c, n_c, t = kv_win, 0, 0
+        idx = pos  # unused
+        nsplit = triton.next_power_of_2(nwin)
+    else:
+        n_c = kv_c.shape[1]
+        t = idx.shape[-1]
+        nsplit = triton.next_power_of_2(nwin + triton.cdiv(t, block_t))
+    HB = 16
+    pm = torch.empty(b * h * nsplit, device=q.device, dtype=torch.float32)
+    pl = torch.empty_like(pm)
+    pacc = torch.empty(b * h * nsplit, d, device=q.device, dtype=torch.float32)
+    o = torch.empty_like(q)
+    with torch.cuda.device(q.device):
+        _sattn2_split_kernel[(b, h // HB, nsplit)](q, kv_win, kv_c, idx, pos, pm, pl, pacc, n_c, t, softmax_scale,
+                                                   H=h, HB=HB, D=d, BLOCK_T=block_t, NSPLIT=nsplit, NWIN=nwin, WIN=win, HAS_C=t > 0, num_warps=4)
+        _sattn2_combine_kernel[(b, h)](pm, pl, pacc, attn_sink, cos, sin, pos, o, H=h, D=d, RD=rd, NSPLIT=nsplit, num_warps=4)
+    return o
+
+
+# --------------------------------------------------------------------------- MoE gate
+@triton.jit
+def _gate_topk_kernel(S, BIAS, EID, WT, temp, route_scale, E: tl.constexpr, EP: tl.constexpr, TOPK: tl.constexpr,
+                      MODE: tl.constexpr, NORM: tl.constexpr):
+    e = tl.arange(0, EP)
+    mask = e < E
+    s = tl.load(S + e, mask=mask, other=0.0) / temp
+    if MODE == 0:  # sqrt(softplus)
+        s = tl.sqrt(tl.where(s > 20.0, s, libdevice.log1p(tl.exp(s))))
+    elif MODE == 1:  # sigmoid
+        s = tl.sigmoid(s)
+    else:  # softmax
+        mx = tl.max(tl.where(mask, s, -1e30), axis=0)
+        ex = tl.where(mask, tl.exp(s - mx), 0.0)
+        s = ex / tl.sum(ex, axis=0)
+    b = tl.where(mask, s + tl.load(BIAS + e, mask=mask, other=0.0), -1e30)
+    wsum = 0.0
+    for k in tl.static_range(TOPK):
+        m = tl.max(b, axis=0)
+        i = tl.min(tl.where(b == m, e, EP), axis=0)
+        w = tl.sum(tl.where(e == i, s, 0.0), axis=0)
+        tl.store(EID + k, i.to(tl.int32))
+        tl.store(WT + k, w)
+        wsum += w
+        b = tl.where(e == i, -1e30, b)
+    if NORM:
+        for k in tl.static_range(TOPK):
+            tl.store(WT + k, tl.load(WT + k) / (wsum + 1e-20) * route_scale)
+    else:
+        for k in tl.static_range(TOPK):
+            tl.store(WT + k, tl.load(WT + k) * route_scale)
+
+
+def gate_topk(scores: torch.Tensor, bias: torch.Tensor, temp: float, topk: int, route_scale: float, score_func: str, norm: bool, eid=None, wt=None):
+    """scores: fp32 [1, E] (gate GEMV output) -> (eid int32 [topk], wt fp32 [topk]) like MoE.gate."""
+    E = scores.shape[-1]
+    if eid is None:
+        eid = torch.empty(topk, device=scores.device, dtype=torch.int32)
+    if wt is None:
+        wt = torch.empty(topk, device=scores.device, dtype=torch.float32)
+    mode = {"sqrtsoftplus": 0, "sigmoid": 1, "softmax": 2}[score_func]
+    with torch.cuda.device(scores.device):
+        _gate_topk_kernel[(1,)](scores, bias, eid, wt, float(temp), float(route_scale), E=E, EP=triton.next_power_of_2(E),
+                                TOPK=topk, MODE=mode, NORM=norm, num_warps=4)
+    return eid, wt
+
+
+# --------------------------------------------------------------------------- hc_post (in place), optionally summing the MoE outputs
+@triton.jit
+def _hc_post2_kernel(X, Y2, YS, R, POST, COMB, D: tl.constexpr, HC: tl.constexpr, BLOCK_D: tl.constexpr, NSUM: tl.constexpr):
+    cb = tl.program_id(0)
+    cols = cb * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = cols < D
+    if NSUM > 0:
+        x = tl.zeros((BLOCK_D,), tl.float32)
+        for k in tl.static_range(NSUM):
+            x += tl.load(Y2 + k * D + cols, mask=mask, other=0.0)
+        x += tl.load(YS + cols, mask=mask, other=0.0).to(tl.float32)
+        x = x.to(tl.bfloat16).to(tl.float32)
+    else:
+        x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+    r0 = tl.load(R + 0 * D + cols, mask=mask, other=0.0).to(tl.float32)
+    r1 = tl.load(R + 1 * D + cols, mask=mask, other=0.0).to(tl.float32)
+    r2 = tl.load(R + 2 * D + cols, mask=mask, other=0.0).to(tl.float32)
+    r3 = tl.load(R + 3 * D + cols, mask=mask, other=0.0).to(tl.float32)
+    for i in tl.static_range(HC):
+        acc = tl.load(POST + i) * x
+        acc += tl.load(COMB + 0 * HC + i) * r0
+        acc += tl.load(COMB + 1 * HC + i) * r1
+        acc += tl.load(COMB + 2 * HC + i) * r2
+        acc += tl.load(COMB + 3 * HC + i) * r3
+        tl.store(R + i * D + cols, acc.to(tl.bfloat16), mask=mask)
+
+
+def hc_post2_(x, residual, post, comb, y2=None, ys=None):
+    """In-place hyper-connection post mix: residual [1, 1, hc, d] bf16 <- post * x + comb^T residual.
+    Either x (bf16 [1, d]) or the MoE pieces y2 (fp32 [topk, d], routed expert outputs) + ys (bf16 [1, d], shared expert)."""
+    hc, d = residual.shape[-2], residual.shape[-1]
+    assert hc == 4 and residual.is_contiguous()
+    nsum = 0 if y2 is None else y2.shape[0]
+    with torch.cuda.device(residual.device):
+        _hc_post2_kernel[(triton.cdiv(d, 1024),)](x if x is not None else residual, y2 if y2 is not None else residual, ys if ys is not None else residual,
+                                                  residual, post, comb, D=d, HC=hc, BLOCK_D=1024, NSUM=nsum, num_warps=4)
+    return residual

@@ -5,6 +5,8 @@ import os
 import sys
 import time
 
+import os as _os
+_os.environ.setdefault("OMP_WAIT_POLICY", "active")  # CPU expert threads keep spinning between layers (libgomp reads this once)
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,6 +38,7 @@ def main():
     ap.add_argument("--profile", action="store_true", help="per-component timing of the decode steps")
     ap.add_argument("--decode", default="graph", choices=["eager", "static", "graph"], help="decode path")
     ap.add_argument("--kernel-profile", action="store_true", help="after generation, profile 8 decode steps and list the top CUDA kernels")
+    ap.add_argument("--kernel-trace", default="", help="after generation, trace one decode step (use --decode static) and write the chronological kernel list with the op behind each launch")
     ap.add_argument("--route-stats", default="", help="write per-layer expert hit counts (decode only) to this .pt file")
     ap.add_argument("--hot-experts", type=int, default=0, help="cpu offload mode: experts per layer kept on the GPU (by usage stats)")
     ap.add_argument("--hot-stats", default="", help="route stats .pt used to pick the hot experts (default: results/route_stats.pt)")
@@ -116,6 +119,28 @@ def main():
         print(f"\n[kernel profile: {tot / 8 / 1000:.1f} ms of GPU time per token]")
         for k, t, c in sorted(rows, key=lambda r: -r[1])[:22]:
             print(f"  {t / 8 / 1000:7.2f} ms/token  {c // 8:5d}/token  {k[:90]}")
+    if a.kernel_trace and rt is not None:
+        import json
+        from torch.profiler import ProfilerActivity, profile
+        with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU], record_shapes=True) as prof:
+            rt.step(out[-1], pos)
+            torch.cuda.synchronize()
+        tmp = a.kernel_trace + ".json"
+        prof.export_chrome_trace(tmp)
+        ev = json.load(open(tmp))["traceEvents"]
+        ops = {}
+        for e in ev:
+            if e.get("cat") == "cpu_op" and "External id" in e.get("args", {}):
+                ops.setdefault(e["args"]["External id"], e)  # outermost op for the id
+        ks = sorted([e for e in ev if e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")], key=lambda e: e["ts"])
+        t0 = ks[0]["ts"] if ks else 0
+        with open(a.kernel_trace, "w") as f:
+            f.write(f"# {len(ks)} GPU launches in one decode step ({len(model.blocks)} layers)\n")
+            for e in ks:
+                op = ops.get(e.get("args", {}).get("External id"))
+                shapes = op["args"].get("Input Dims", "") if op else ""
+                f.write(f"{e['ts'] - t0:9.1f} us  {e['dur']:6.1f} us  {e['name'][:60]:60s}  {op['name'][:40] if op else '?':40s} {str(shapes)[:80]}\n")
+        print(f"[kernel trace: {len(ks)} launches written to {a.kernel_trace}]")
     if a.profile and rt is not None and getattr(rt, "cpu_experts", False):
         from collections import defaultdict
         rt.prof = defaultdict(float)
@@ -125,6 +150,10 @@ def main():
         print(f"[offload decode stages, per token; cold experts per token: {rt.n_cold / max(len(out) + 8, 1):.1f} of {40 * 6}]")
         for k, v in sorted(rt.prof.items(), key=lambda kv: -kv[1]):
             print(f"  {k:26s} {v / 8 * 1000:7.1f} ms  ({v / tot * 100:4.1f}%)")
+        ct = sorted(rt.call_times)
+        if ct:
+            q = lambda f: ct[min(int(len(ct) * f), len(ct) - 1)] * 1e3
+            print(f"  cpumoe_forward per call: median {q(0.5):.2f} ms  p90 {q(0.9):.2f}  p99 {q(0.99):.2f}  max {ct[-1] * 1e3:.2f}")
     if a.profile:
         import dsv41.model as M
         tot = sum(M.PROF.values())

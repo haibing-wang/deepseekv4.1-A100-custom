@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -62,8 +64,55 @@ extern "C" int cpumoe_init_list(const int* cpus, int n, int cores_per_node) {
 extern "C" void* cpumoe_alloc(size_t bytes) {
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return nullptr;
-    madvise(p, bytes, MADV_HUGEPAGE);
+    // THP: in a small benchmark 4 KiB pages streamed faster (524 vs 696 us per 6-expert layer), but with the
+    // real 460 GB of expert memory the page walks dominate (decode 37 -> 55 ms, prefill 40 -> 173 s), so huge pages stay on.
+    if (!getenv("DSV41_NO_THP")) madvise(p, bytes, MADV_HUGEPAGE);
     return p;
+}
+
+// Bind the memory of an [E][N][row_bytes] buffer so that each node's row half lives on that node
+// (MPOL_BIND per range, page granular). Without this the kernel spills to the other node when the
+// local node's free memory is fragmented by the page cache (measured: 45 GB of node-1 rows on node 0,
+// node-1 threads 2x slower). Must be called before the pages are first touched.
+#define DSV41_MPOL_BIND 2
+extern "C" int cpumoe_bind_rows(uint8_t* base, int E, int N, int row_bytes) {
+    const long page = sysconf(_SC_PAGESIZE);
+    int bad = 0;
+    for (int e = 0; e < E; ++e)
+        for (int node = 0; node < g_nodes; ++node) {
+            int n0 = (int)((long)N * node / g_nodes), n1 = (int)((long)N * (node + 1) / g_nodes);
+            uintptr_t a = (uintptr_t)base + ((size_t)e * N + n0) * row_bytes, b = (uintptr_t)base + ((size_t)e * N + n1) * row_bytes;
+            a = (a + page - 1) & ~(uintptr_t)(page - 1); b &= ~(uintptr_t)(page - 1);
+            if (b <= a) continue;
+            unsigned long mask = 1UL << node;
+            if (syscall(SYS_mbind, (void*)a, (size_t)(b - a), DSV41_MPOL_BIND, &mask, 64, 0) != 0) bad++;
+        }
+    return bad;
+}
+
+// Per-thread NUMA policy during first touch: MPOL_BIND to the thread's node, so the copy threads' pages
+// really land on their node (with the default policy the kernel spills to the other node when the local
+// free memory is fragmented by the page cache: measured 45 GB of node-1 rows on node 0, node-1 threads
+// 2x slower). One syscall per thread per region: no VMA splitting (mbind per range hit vm.max_map_count).
+#define DSV41_MPOL_DEFAULT 0
+static inline void bind_self_node(int node) { unsigned long mask = 1UL << node; syscall(SYS_set_mempolicy, DSV41_MPOL_BIND, &mask, 64); }
+static inline void unbind_self() { syscall(SYS_set_mempolicy, DSV41_MPOL_DEFAULT, nullptr, 0); }
+
+// Placement check: fraction of sampled pages (every 2 MiB) of node k's row half that actually live on node k.
+extern "C" double cpumoe_local_fraction(const uint8_t* base, int E, int N, int row_bytes) {
+    long ok = 0, tot = 0;
+    for (int e = 0; e < E; ++e)
+        for (int node = 0; node < g_nodes; ++node) {
+            int n0 = (int)((long)N * node / g_nodes), n1 = (int)((long)N * (node + 1) / g_nodes);
+            const uint8_t* a = base + ((size_t)e * N + n0) * row_bytes; const uint8_t* b = base + ((size_t)e * N + n1) * row_bytes;
+            // only huge pages fully inside the half (the boundary pages are shared by design)
+            uintptr_t a2 = ((uintptr_t)a + (2 << 20) - 1) & ~(uintptr_t)((2 << 20) - 1);
+            for (const uint8_t* p = (const uint8_t*)a2; p + (2 << 20) <= b; p += (2 << 20)) {
+                void* pages[1] = {(void*)p}; int status[1] = {-1};
+                if (syscall(SYS_move_pages, 0, 1, pages, nullptr, status, 0) == 0 && status[0] >= 0) { tot++; if (status[0] == node) ok++; }
+            }
+        }
+    return tot ? (double)ok / tot : -1.0;
 }
 
 // node of the thread that will read row n of an N-row matrix: rows split evenly between nodes
@@ -79,7 +128,9 @@ extern "C" void cpumoe_load_rows(uint8_t* dst, const uint8_t* src, int N, int ro
         int n0 = (int)((long)N * node / g_nodes), n1 = (int)((long)N * (node + 1) / g_nodes);
         int per = (n1 - n0 + g_cores_per_node - 1) / g_cores_per_node;
         int a = n0 + tin * per, b = a + per < n1 ? a + per : n1;
+        bind_self_node(node);
         if (a < b) memcpy(dst + (size_t)a * row_bytes, src + (size_t)a * row_bytes, (size_t)(b - a) * row_bytes);
+        unbind_self();
     }
     restore_master();
 }
@@ -164,7 +215,7 @@ static void init_lut_s8() {
 }
 
 // quantize bf16[K] -> u8[K] (q+128) and per-32 scales (fp32); scale includes the 1/2 of the weight LUT (2*value)
-static void quant_x_u8(const uint16_t* x, int K, uint8_t* xu, float* sx) {
+static void quant_x_u8(const uint16_t* x, int K, uint8_t* xu, float* sx, uint8_t* xe = nullptr, uint8_t* xo = nullptr) {
     for (int b = 0; b < K; b += 32) {
         float amax = 0.f, v[32];
         for (int j = 0; j < 32; ++j) { v[j] = bf16_to_f(x[b + j]); float a = fabsf(v[j]); if (a > amax) amax = a; }
@@ -173,6 +224,54 @@ static void quant_x_u8(const uint16_t* x, int K, uint8_t* xu, float* sx) {
         for (int j = 0; j < 32; ++j) { int q = (int)rintf(v[j] * inv); if (q > 127) q = 127; if (q < -127) q = -127; xu[b + j] = (uint8_t)(q + 128); }
         sx[b / 32] = sc * 0.5f;  // weights are stored as 2*value
     }
+    if (xe) for (int k = 0; k < K; k += 2) { xe[k >> 1] = xu[k]; xo[k >> 1] = xu[k + 1]; }
+}
+
+// v2: 128 k per iteration straight from the packed bytes (no 16-bit widening): the low nibbles are the
+// even k, the high nibbles the odd k, and the activation is pre-split the same way (xe/xo), so lane j of
+// the two accumulated vpdpbusd covers the 8 consecutive k [8j, 8j+8). ~20 vector ops per 128 k for two rows.
+#ifndef PF_DIST
+#define PF_DIST 4096  // software prefetch distance (bytes) for the weight rows
+#endif
+alignas(64) static const int32_t IDX4[16] = {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
+static inline void dot_row_v2(const uint8_t* __restrict w0, const uint8_t* __restrict s0, const uint8_t* __restrict w1, const uint8_t* __restrict s1,
+                              const uint8_t* __restrict xe, const uint8_t* __restrict xo, const float* __restrict sx, int K, float* r0, float* r1) {
+    const __m512i lut = _mm512_load_si512(LUT_S8);
+    const __m512i m4 = _mm512_set1_epi8(0x0F);
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i idx4 = _mm512_load_si512(IDX4);
+    const __m512i zero = _mm512_setzero_si512();
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    for (int c = 0; c < K; c += 128) {
+        _mm_prefetch((const char*)(w0 + c / 2 + PF_DIST), _MM_HINT_T0);
+        _mm_prefetch((const char*)(w1 + c / 2 + PF_DIST), _MM_HINT_T0);
+        const __m512i xev = _mm512_loadu_si512(xe + c / 2);
+        const __m512i xov = _mm512_loadu_si512(xo + c / 2);
+        const int cb = c / 32;
+        const __m512 sxv = _mm512_castps128_ps512(_mm_loadu_ps(sx + cb));
+        // row 0
+        __m512i p = _mm512_loadu_si512(w0 + c / 2);
+        __m512i wlo = _mm512_permutexvar_epi8(_mm512_and_si512(p, m4), lut);
+        __m512i whi = _mm512_permutexvar_epi8(_mm512_and_si512(_mm512_srli_epi16(p, 4), m4), lut);
+        __m512i d = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(zero, xev, wlo), xov, whi);
+        __m512i sw = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(zero, ones, wlo), ones, whi);
+        __m512i v = _mm512_sub_epi32(d, _mm512_slli_epi32(sw, 7));
+        __m512 sc = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int*)(s0 + cb))), 23));
+        sc = _mm512_permutexvar_ps(idx4, _mm512_mul_ps(sc, sxv));
+        acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v), sc, acc0);
+        // row 1
+        p = _mm512_loadu_si512(w1 + c / 2);
+        wlo = _mm512_permutexvar_epi8(_mm512_and_si512(p, m4), lut);
+        whi = _mm512_permutexvar_epi8(_mm512_and_si512(_mm512_srli_epi16(p, 4), m4), lut);
+        d = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(zero, xev, wlo), xov, whi);
+        sw = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(zero, ones, wlo), ones, whi);
+        v = _mm512_sub_epi32(d, _mm512_slli_epi32(sw, 7));
+        sc = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int*)(s1 + cb))), 23));
+        sc = _mm512_permutexvar_ps(idx4, _mm512_mul_ps(sc, sxv));
+        acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v), sc, acc1);
+    }
+    *r0 = _mm512_reduce_add_ps(acc0);
+    *r1 = _mm512_reduce_add_ps(acc1);
 }
 
 // w: packed [K/2]; s: e8m0 [K/32]; xu: u8[K]; sx: fp32[K/32]
@@ -278,7 +377,10 @@ static void swiglu_quant_cols(const float* gu, int inter, float wt, float limit,
 }
 
 // One MoE layer for one token. Pointers per selected expert (E of them).
-static int g_int8 = 1;
+static int g_int8 = 2;
+alignas(64) static int g_ctr1[16 * 8], g_ctr3[16 * 8];  // per-node dynamic work counters (one cache line each)
+static int g_ch1 = 64, g_ch3 = 64;  // rows per dynamic work item (stage 1 / stage 3)
+extern "C" void cpumoe_set_chunks(int ch1, int ch3) { g_ch1 = ch1 > 0 ? ch1 : 64; g_ch3 = ch3 > 0 && ch3 <= 256 ? ch3 : 64; }
 extern "C" void cpumoe_set_int8(int on) { g_int8 = on; }
 
 extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s13, const uint8_t* const* w2, const uint8_t* const* s2,
@@ -286,76 +388,111 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
                               float* gu, uint16_t* h) {
     static int lut_ready = 0;
     if (!lut_ready) { init_lut(); init_lut_s8(); lut_ready = 1; }
-    omp_set_dynamic(0); omp_set_num_threads(g_threads);  // torch resets the shared OpenMP runtime's thread count
+    const double t_entry = omp_get_wtime();
+    if (omp_get_max_threads() != g_threads) { omp_set_dynamic(0); omp_set_num_threads(g_threads); }  // torch resets the shared OpenMP runtime's thread count
     const int N13 = 2 * inter;
     static uint8_t xu[8192]; static float sx[256];            // quantized x
+    static uint8_t xe[4096], xo[4096];                        // even / odd k (v2 kernel)
     static uint8_t hu[16 * 4096]; static float sh[16 * 128];  // quantized h per expert
+    static uint8_t he_[16 * 2048], ho_[16 * 2048];
     const int dbg = getenv("DSV41_CPU_DEBUG") != nullptr;
     double t0 = dbg ? omp_get_wtime() : 0, t1 = 0, t2 = 0, t3 = 0;
-    if (g_int8) quant_x_u8(x, K, xu, sx);
+    if (g_int8) quant_x_u8(x, K, xu, sx, xe, xo);
     if (dbg) t1 = omp_get_wtime();
-    // stage 1: gu[e][n] = x . w13[e][n]
+    static double tdbg[256][4];
+    for (int k = 0; k < g_nodes; ++k) { g_ctr1[k * 16] = 0; g_ctr3[k * 16] = 0; }
+    // one parallel region for the three stages (barriers instead of three fork/joins)
 #pragma omp parallel
     {
         pin_self();
-        int t = omp_get_thread_num(), node = t / g_cores_per_node, tin = t % g_cores_per_node;
-        int n0 = (int)((long)N13 * node / g_nodes), n1 = (int)((long)N13 * (node + 1) / g_nodes);
-        int per = (n1 - n0 + g_cores_per_node - 1) / g_cores_per_node;
-        int a = n0 + tin * per, b = a + per < n1 ? a + per : n1;
-        for (int e = 0; e < E; ++e) {
-            int n = a;
-            if (g_int8)
-                for (; n + 1 < b; n += 2)
-                    dot_row_vnni2(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), w13[e] + (size_t)(n + 1) * (K / 2), s13[e] + (size_t)(n + 1) * (K / 32),
-                                  xu, sx, K, &gu[(size_t)e * N13 + n], &gu[(size_t)e * N13 + n + 1]);
-            for (; n < b; ++n)
-                gu[(size_t)e * N13 + n] = g_int8
-                    ? dot_row_vnni(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), xu, sx, K)
-                    : dot_row(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), x, K);
-        }
-    }
-    if (dbg) t2 = omp_get_wtime();
-    // stage 2: h[e] = fp8(bf16(wt * silu(gate) * up)) (+ int8 quantization for the w2 GEMV)
-    {   // parallel over (expert, 256-column block); the int8 quantization of h is per 32 columns, so blocks are independent
-        const int CB = 256, nb = inter / CB;
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < E * nb; ++i) {
-            pin_self();
-            int e = i / nb, b0 = (i % nb) * CB;
-            swiglu_quant_cols(gu + (size_t)e * N13, inter, wts[e], limit, h + (size_t)e * inter, b0, b0 + CB);
-            if (g_int8) quant_x_u8(h + (size_t)e * inter + b0, CB, hu + (size_t)e * inter + b0, sh + (size_t)e * (inter / 32) + b0 / 32);
-        }
-    }
-    if (dbg) t3 = omp_get_wtime();
-    // stage 3: out[n] = sum_e h[e] . w2[e][n]
-#pragma omp parallel
-    {
-        pin_self();
-        int t = omp_get_thread_num(), node = t / g_cores_per_node, tin = t % g_cores_per_node;
-        int n0 = (int)((long)dim * node / g_nodes), n1 = (int)((long)dim * (node + 1) / g_nodes);
-        int per = (n1 - n0 + g_cores_per_node - 1) / g_cores_per_node;
-        int a = n0 + tin * per, b = a + per < n1 ? a + per : n1;
-        int n = a;
-        if (g_int8)
-            for (; n + 1 < b; n += 2) {
-                float acc0 = 0.f, acc1 = 0.f, r0, r1;
-                for (int e = 0; e < E; ++e) {
-                    dot_row_vnni2(w2[e] + (size_t)n * (inter / 2), s2[e] + (size_t)n * (inter / 32), w2[e] + (size_t)(n + 1) * (inter / 2), s2[e] + (size_t)(n + 1) * (inter / 32),
-                                  hu + (size_t)e * inter, sh + (size_t)e * (inter / 32), inter, &r0, &r1);
-                    acc0 += r0; acc1 += r1;
-                }
-                out[n] = acc0; out[n + 1] = acc1;
+        const int t = omp_get_thread_num(), node = t / g_cores_per_node, tin = t % g_cores_per_node;
+        if (dbg) tdbg[t][0] = omp_get_wtime();
+        // stage 1: gu[e][n] = x . w13[e][n]. Rows are split by node (NUMA-local halves); within a node the
+        // (expert, 32-row chunk) work items are handed out dynamically through an atomic counter, so a thread
+        // that gets descheduled or shares a core with another process just takes fewer chunks.
+        {
+            const int CH = g_ch1;
+            const int n0 = (int)((long)N13 * node / g_nodes), n1 = (int)((long)N13 * (node + 1) / g_nodes);
+            const int nch = (n1 - n0 + CH - 1) / CH, total = E * nch;
+            for (;;) {
+                int c = __atomic_fetch_add(&g_ctr1[node * 16], 1, __ATOMIC_RELAXED);
+                if (c >= total) break;
+                int e = c / nch, a = n0 + (c % nch) * CH, b = a + CH < n1 ? a + CH : n1;
+                int n = a;
+                if (g_int8 == 2)
+                    for (; n + 1 < b; n += 2)
+                        dot_row_v2(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), w13[e] + (size_t)(n + 1) * (K / 2), s13[e] + (size_t)(n + 1) * (K / 32),
+                                   xe, xo, sx, K, &gu[(size_t)e * N13 + n], &gu[(size_t)e * N13 + n + 1]);
+                else if (g_int8)
+                    for (; n + 1 < b; n += 2)
+                        dot_row_vnni2(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), w13[e] + (size_t)(n + 1) * (K / 2), s13[e] + (size_t)(n + 1) * (K / 32),
+                                      xu, sx, K, &gu[(size_t)e * N13 + n], &gu[(size_t)e * N13 + n + 1]);
+                for (; n < b; ++n)
+                    gu[(size_t)e * N13 + n] = g_int8
+                        ? dot_row_vnni(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), xu, sx, K)
+                        : dot_row(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), x, K);
             }
-        for (; n < b; ++n) {
-            float acc = 0.f;
-            for (int e = 0; e < E; ++e)
-                acc += g_int8
-                    ? dot_row_vnni(w2[e] + (size_t)n * (inter / 2), s2[e] + (size_t)n * (inter / 32), hu + (size_t)e * inter, sh + (size_t)e * (inter / 32), inter)
-                    : dot_row(w2[e] + (size_t)n * (inter / 2), s2[e] + (size_t)n * (inter / 32), h + (size_t)e * inter, inter);
-            out[n] = acc;
         }
+        if (dbg) tdbg[t][1] = omp_get_wtime();
+#pragma omp barrier
+        if (dbg && t == 0) t2 = omp_get_wtime();
+        // stage 2: h[e] = fp8(bf16(wt * silu(gate) * up)) (+ int8 quantization for the w2 GEMV); blocks of 256 columns
+        {
+            const int CB = 256, nb = inter / CB;
+#pragma omp for schedule(static)
+            for (int i = 0; i < E * nb; ++i) {
+                int e = i / nb, b0 = (i % nb) * CB;
+                swiglu_quant_cols(gu + (size_t)e * N13, inter, wts[e], limit, h + (size_t)e * inter, b0, b0 + CB);
+                if (g_int8) quant_x_u8(h + (size_t)e * inter + b0, CB, hu + (size_t)e * inter + b0, sh + (size_t)e * (inter / 32) + b0 / 32,
+                                       he_ + ((size_t)e * inter + b0) / 2, ho_ + ((size_t)e * inter + b0) / 2);
+            }
+        }
+        if (dbg && t == 0) t3 = omp_get_wtime();
+        if (dbg) tdbg[t][2] = omp_get_wtime();
+        // stage 3: out[n] = sum_e h[e] . w2[e][n]  (dynamic 32-row output chunks per node; expert-outer inside a chunk)
+        {
+            const int CH = g_ch3;
+            const int n0 = (int)((long)dim * node / g_nodes), n1 = (int)((long)dim * (node + 1) / g_nodes);
+            const int nch = (n1 - n0 + CH - 1) / CH;
+            for (;;) {
+                int c = __atomic_fetch_add(&g_ctr3[node * 16], 1, __ATOMIC_RELAXED);
+                if (c >= nch) break;
+                int a = n0 + c * CH, b = a + CH < n1 ? a + CH : n1;
+                float accs[256];
+                for (int i = 0; i < b - a; ++i) accs[i] = 0.f;
+                if (g_int8 == 2) {
+                    for (int e = 0; e < E; ++e) {
+                        int n = a;
+                        for (; n + 1 < b; n += 2) {
+                            float r0, r1;
+                            dot_row_v2(w2[e] + (size_t)n * (inter / 2), s2[e] + (size_t)n * (inter / 32), w2[e] + (size_t)(n + 1) * (inter / 2), s2[e] + (size_t)(n + 1) * (inter / 32),
+                                       he_ + (size_t)e * inter / 2, ho_ + (size_t)e * inter / 2, sh + (size_t)e * (inter / 32), inter, &r0, &r1);
+                            accs[n - a] += r0; accs[n + 1 - a] += r1;
+                        }
+                        for (; n < b; ++n)
+                            accs[n - a] += dot_row_vnni(w2[e] + (size_t)n * (inter / 2), s2[e] + (size_t)n * (inter / 32), hu + (size_t)e * inter, sh + (size_t)e * (inter / 32), inter);
+                    }
+                } else {
+                    for (int n = a; n < b; ++n)
+                        for (int e = 0; e < E; ++e)
+                            accs[n - a] += g_int8
+                                ? dot_row_vnni(w2[e] + (size_t)n * (inter / 2), s2[e] + (size_t)n * (inter / 32), hu + (size_t)e * inter, sh + (size_t)e * (inter / 32), inter)
+                                : dot_row(w2[e] + (size_t)n * (inter / 2), s2[e] + (size_t)n * (inter / 32), h + (size_t)e * inter, inter);
+                }
+                for (int i = 0; i < b - a; ++i) out[a + i] = accs[i];
+            }
+        }
+        if (dbg) tdbg[t][3] = omp_get_wtime();
     }
-    if (dbg) fprintf(stderr, "[cpumoe] E=%d quant %.0fus stage1 %.0fus stage2 %.0fus stage3 %.0fus\n", E, (t1 - t0) * 1e6, (t2 - t1) * 1e6, (t3 - t2) * 1e6, (omp_get_wtime() - t3) * 1e6);
+    if (dbg) {
+        double smin = 1e9, smax = 0, emin = 1e9, emax = 0;
+        for (int i = 0; i < g_threads; i++) { double a = (tdbg[i][0] - t1) * 1e6, b = (tdbg[i][1] - t1) * 1e6; if (a < smin) smin = a; if (a > smax) smax = a; if (b < emin) emin = b; if (b > emax) emax = b; }
+        double e3min = 1e9, e3max = 0; int slow = -1;
+        for (int i = 0; i < g_threads; i++) { double b = (tdbg[i][3] - t3) * 1e6; if (b < e3min) e3min = b; if (b > e3max) { e3max = b; slow = i; } }
+        restore_master();
+        fprintf(stderr, "[cpumoe] E=%d quant %.0fus stage1 %.0fus (thread start %.0f..%.0f, end %.0f..%.0f) stage2 %.0fus stage3 %.0fus (end %.0f..%.0f slowest t%d) total %.0fus\n", E, (t1 - t0) * 1e6, (t2 - t1) * 1e6, smin, smax, emin, emax, (t3 - t2) * 1e6, (omp_get_wtime() - t3) * 1e6, e3min, e3max, slow, (omp_get_wtime() - t_entry) * 1e6);
+        return 0;
+    }
     restore_master();
     return 0;
 }
@@ -375,6 +512,7 @@ extern "C" void cpumoe_load_layer(uint8_t* w13, uint8_t* s13, uint8_t* w2, uint8
     {
         pin_self();
         int t = omp_get_thread_num(), node = t / g_cores_per_node, tin = t % g_cores_per_node;
+        bind_self_node(node);
         // row ranges owned by this node (same split as the compute)
         int a13 = (int)((long)N13 * node / g_nodes), z13 = (int)((long)N13 * (node + 1) / g_nodes);
         int a2 = (int)((long)dim * node / g_nodes), z2 = (int)((long)dim * (node + 1) / g_nodes);
@@ -392,6 +530,53 @@ extern "C" void cpumoe_load_layer(uint8_t* w13, uint8_t* s13, uint8_t* w2, uint8
             memcpy(w2 + (size_t)e * b2 + (size_t)a2 * rb2, sw2[e] + (size_t)a2 * rb2, (size_t)(z2 - a2) * rb2);
             memcpy(s2 + (size_t)e * bs2 + (size_t)a2 * rs2, ss2[e] + (size_t)a2 * rs2, (size_t)(z2 - a2) * rs2);
         }
+        unbind_self();
+    }
+    restore_master();
+}
+
+// Same as cpumoe_forward, but the expert matrices are addressed by id from the layer's base pointers
+// (the Python side passes one int32 array instead of four pointer arrays).
+extern "C" int cpumoe_forward_ids(const uint8_t* w13, const uint8_t* s13, const uint8_t* w2, const uint8_t* s2,
+                                  size_t b13, size_t bs13, size_t b2, size_t bs2, const int* ids, int E,
+                                  const uint16_t* x, const float* wts, float* out, int K, int inter, int dim, float limit,
+                                  float* gu, uint16_t* h) {
+    const uint8_t* p13[16]; const uint8_t* ps13[16]; const uint8_t* p2[16]; const uint8_t* ps2[16];
+    if (E > 16) return -1;
+    for (int j = 0; j < E; j++) { p13[j] = w13 + (size_t)ids[j] * b13; ps13[j] = s13 + (size_t)ids[j] * bs13; p2[j] = w2 + (size_t)ids[j] * b2; ps2[j] = s2 + (size_t)ids[j] * bs2; }
+    return cpumoe_forward(p13, ps13, p2, ps2, E, x, wts, out, K, inter, dim, limit, gu, h);
+}
+
+// One expert (w1, w3, s1, s3, w2, s2 source rows) into the layer buffers at index e, with the same node
+// split as the compute: w1 rows (first half of w13) by node 0, w3 rows by node 1; w2 rows split in half.
+extern "C" void cpumoe_load_expert(uint8_t* w13, uint8_t* s13, uint8_t* w2, uint8_t* s2, int e,
+                                   const uint8_t* src_w1, const uint8_t* src_w3, const uint8_t* src_s1, const uint8_t* src_s3,
+                                   const uint8_t* src_w2, const uint8_t* src_s2, int inter, int dim) {
+    if (omp_get_max_threads() != g_threads) { omp_set_dynamic(0); omp_set_num_threads(g_threads); }
+    const int N13 = 2 * inter, rb13 = dim / 2, rs13 = dim / 32, rb2 = inter / 2, rs2 = inter / 32;
+#pragma omp parallel
+    {
+        pin_self();
+        int t = omp_get_thread_num(), node = t / g_cores_per_node, tin = t % g_cores_per_node;
+        bind_self_node(node);
+        // w13 / s13 rows [n0, n1) of this node, split among its threads
+        int n0 = (int)((long)N13 * node / g_nodes), n1 = (int)((long)N13 * (node + 1) / g_nodes);
+        int per = (n1 - n0 + g_cores_per_node - 1) / g_cores_per_node;
+        int a = n0 + tin * per, b = a + per < n1 ? a + per : n1;
+        for (int n = a; n < b; ++n) {
+            const uint8_t* sw = n < inter ? src_w1 + (size_t)n * rb13 : src_w3 + (size_t)(n - inter) * rb13;
+            const uint8_t* ss = n < inter ? src_s1 + (size_t)n * rs13 : src_s3 + (size_t)(n - inter) * rs13;
+            memcpy(w13 + ((size_t)e * N13 + n) * rb13, sw, rb13);
+            memcpy(s13 + ((size_t)e * N13 + n) * rs13, ss, rs13);
+        }
+        int m0 = (int)((long)dim * node / g_nodes), m1 = (int)((long)dim * (node + 1) / g_nodes);
+        per = (m1 - m0 + g_cores_per_node - 1) / g_cores_per_node;
+        a = m0 + tin * per; b = a + per < m1 ? a + per : m1;
+        if (a < b) {
+            memcpy(w2 + ((size_t)e * dim + a) * rb2, src_w2 + (size_t)a * rb2, (size_t)(b - a) * rb2);
+            memcpy(s2 + ((size_t)e * dim + a) * rs2, src_s2 + (size_t)a * rs2, (size_t)(b - a) * rs2);
+        }
+        unbind_self();
     }
     restore_master();
 }

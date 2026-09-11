@@ -79,6 +79,8 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False) -> dict:
             for k in cols:
                 cols[k].append(ckpt.get(q + k).view(torch.uint8))
         host.load_layer(cols["w1.weight"], cols["w3.weight"], cols["w1.scale"], cols["w3.scale"], cols["w2.weight"], cols["w2.scale"])
+        if i == 0:
+            print(f"  host experts NUMA-local fraction (layer 0): {host.local_fraction():.3f}", flush=True)
         w13, s13, w2, s2 = host.views()
         w.update({"experts.w13": w13, "experts.s13": s13, "experts.w2": w2, "experts.s2": s2, "experts.offload": True, "experts.host": host})
         hot = HOT_EXPERTS.get(i) if HOT_EXPERTS else None
@@ -137,6 +139,7 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
     ckpt = Checkpoint(ckpt_path)
     n_layers = n_layers or cfg["n_layers"]
     placement = plan_placement(n_layers, devices, budgets_gb, offload=offload_experts)
+    _host_layers = []
     print("placement:", {str(d): placement.count(d) for d in dict.fromkeys(placement)}, flush=True)
     model = Transformer(args)
     t0 = time.time()

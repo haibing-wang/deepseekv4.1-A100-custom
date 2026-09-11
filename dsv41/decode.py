@@ -7,6 +7,7 @@ future positions masked. Host work per step is reduced to: the Engram table gath
 H2D/D2D copies between GPU segments, and one graph launch per GPU."""
 from __future__ import annotations
 
+import os
 import time
 
 import torch
@@ -14,7 +15,10 @@ import torch.nn.functional as F
 
 from .cukern import fp4_gemv_pairs as cukern_fp4
 from .fused import fake_quant_fp4, fake_quant_fp8, rmsnorm, rope_dev_, sparse_attn_decode_split as sparse_attn_decode2, swiglu_quant
+from .fused2 import gate_topk, hc_mix, hc_post2_, hc_pre_norm_quant, kv_write, norm_quant, sattn2
 from .model import Attention, Block, Transformer, _hc_post, _hc_pre, linear_fp8, select_candidate_blocks
+
+FUSED2 = os.environ.get("DSV41_FUSED2", "1") == "1"  # the ~25-launch layer (fused2.py) instead of the ~100-launch one
 
 
 class DecodeRuntime:
@@ -64,6 +68,45 @@ class DecodeRuntime:
         self.index_owner = -1
 
     # ------------------------------------------------------------------ attention (static)
+    def attention2(self, A: Attention, x: torch.Tensor, xq: torch.Tensor, d: torch.device) -> torch.Tensor:
+        """x: rmsnorm output bf16 [1, dim] (unquantized, for the compressor/indexer); xq: its fp8 fake-quantized copy."""
+        pos = self.pos[d]
+        rd, eps = self.rd, A.eps
+        qr = norm_quant(F.linear(xq, A.wq_a), A.q_norm_w, eps)  # q_norm output, already fp8-rounded for wq_b / indexer
+        q = F.linear(qr, A.wq_b).view(1, 1, A.n_heads, A.head_dim)
+        rope_dev_(q, rd, A.cos, A.sin, pos)
+        kv_write(F.linear(xq, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps)
+        if A.ratio:
+            ratio = A.ratio
+            compress_len = torch.div(pos + 1, ratio, rounding_mode="floor")
+            latent = None
+            x3 = x.view(1, 1, -1)
+            if A.is_kv_source:
+                self.kv_owner = A.layer_id
+                latent, should = self.compressor(A, x3, pos)
+                cache = self.m.shared.compress_kv[(A.layer_id, d)]
+                row = torch.where(should, compress_len - 1, torch.full_like(compress_len, cache.shape[1] - 1))
+            if A.is_index_source:
+                idxs = self.indexer(A, x3, qr.view(1, 1, -1), latent, pos, compress_len, d, row if A.is_kv_source else None)
+                self.topk_buf[d].copy_(idxs)
+            else:
+                idxs = self.topk_buf[d]
+            if latent is not None:
+                latent = latent.contiguous()
+                rope_dev_(latent, rd, A.cos, A.sin, pos, add=1 - ratio)
+                latent = fake_quant_fp4(latent, 16, scale_e4m3=True)
+                cache.index_copy_(1, row, latent)
+                val, idx = self.kv_row[A.layer_id]
+                val.copy_(latent)
+                idx.copy_(row)
+            ckv = self.m.shared.compress_kv[(self.kv_owner, d)]
+            o = sattn2(q, A.window_kv_cache, ckv, idxs, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale)
+        else:
+            o = sattn2(q, A.window_kv_cache, None, None, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale)
+        o = o.view(1, 1, A.n_groups, -1)
+        o = torch.einsum("bsgd,grd->bsgr", o, A.wo_a)
+        return linear_fp8(o.flatten(2), A.wo_b)
+
     def attention(self, A: Attention, x: torch.Tensor, d: torch.device) -> torch.Tensor:
         pos = self.pos[d]
         rd, eps = self.rd, A.eps
@@ -151,9 +194,39 @@ class DecodeRuntime:
         elif I.uses_candidates:
             score = score.masked_fill(~self.cand_buf[d][..., :n_pos], -torch.inf)
         idxs = score.topk(self.topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        if FUSED2:
+            return torch.where(idxs < compress_len, idxs, -1).to(torch.int32)
         return torch.where(idxs < compress_len, idxs + self.win, -1).to(torch.int32)
 
     # ------------------------------------------------------------------ block / segment
+    def block2(self, blk: Block, h: torch.Tensor, pre_mix: torch.Tensor):
+        """One layer on the residual buffer h [1, 1, hc, dim] (updated in place); pre_mix: [hc] fp32."""
+        fn, scale, base = blk.hc_attn
+        mixes = hc_mix(h, fn, blk.eps)
+        pre_n, post, comb, x, xq, _ = hc_pre_norm_quant(h, pre_mix, mixes, scale, base, blk.attn_norm_w, blk.eps, blk.hc_eps, blk.sinkhorn_iters)
+        a = self.attention2(blk.attn, x, xq, blk.device)
+        hc_post2_(a.view(1, -1), h, post, comb)
+        fn, scale, base = blk.hc_ffn
+        mixes = hc_mix(h, fn, blk.eps)
+        pre_out, post, comb, x, xq, xf = hc_pre_norm_quant(h, pre_n, mixes, scale, base, blk.ffn_norm_w, blk.eps, blk.hc_eps, blk.sinkhorn_iters, want_f32=True)
+        y2, ys = self.moe2(blk.ffn, xq, xf)
+        hc_post2_(None, h, post, comb, y2=y2, ys=ys)
+        return h, pre_out
+
+    def moe2(self, moe, xq: torch.Tensor, xf: torch.Tensor):
+        """Routed experts (fp32 [topk, dim], one row per selected expert, routing weight applied) and the shared expert (bf16 [1, dim])."""
+        d = xq.device
+        scores = F.linear(xf, moe.gate_w)
+        eid, wt = gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1)
+        tok, pair_rows, ones = moe._pair_tables(1, d)
+        gu = cukern_fp4(xq, moe.w13, moe.s13, tok, eid, ones, moe.topk)
+        hq = swiglu_quant(gu, wt, moe.inter, moe.swiglu_limit)
+        y2 = cukern_fp4(hq, moe.w2, moe.s2, pair_rows, eid, ones, moe.topk)
+        gu_s = F.linear(xq, moe.sh_w13)
+        hs = swiglu_quant(gu_s, None, moe.inter, moe.swiglu_limit)
+        ys = F.linear(hs, moe.sh_w2)
+        return y2, ys
+
     def block(self, blk: Block, x: torch.Tensor, pre_mix: torch.Tensor):
         residual = x
         attn_pre, attn_post, attn_comb = blk.hc_mixes(x, *blk.hc_attn)
@@ -178,10 +251,17 @@ class DecodeRuntime:
                 pre[:, :, 0] = 1.0
             else:
                 h, pre = self.h_in[d], self.pre_in[d]
+            if FUSED2:
+                h = h.contiguous()
+                pre = pre.reshape(-1)
             for blk in blocks:
                 if blk.engram is not None:
                     h = blk.engram.apply(h, self.eng_in[blk.layer_id])
-                h, pre = self.block(blk, h, pre)
+                    if FUSED2:
+                        h = h.contiguous()
+                h, pre = (self.block2 if FUSED2 else self.block)(blk, h, pre)
+            if FUSED2:
+                pre = pre.view(1, 1, -1)
             if si == len(self.segments) - 1:
                 hh = _hc_pre(h, pre)[:, -1]
                 hh = rmsnorm(hh, self.m.norm_w, self.cfg["norm_eps"])
@@ -252,10 +332,19 @@ class DecodeRuntime:
         return self.logits
 
 
+def _gpu_numa_node(d: torch.device) -> int | None:
+    try:
+        pr = torch.cuda.get_device_properties(d)
+        bus = f"{pr.pci_domain_id:04x}:{pr.pci_bus_id:02x}:{pr.pci_device_id:02x}.0"
+        return int(open(f"/sys/bus/pci/devices/{bus}/numa_node").read())
+    except Exception:
+        return None
+
+
 class OffloadDecodeRuntime(DecodeRuntime):
-    """Single-GPU expert-offload decode: each layer is two CUDA graphs with the host-side expert
-    gather (gate result -> DMA from pinned RAM into the staging buffers) in between. Only the dense
-    part of the layer is captured, so the per-layer host sync no longer drains ~40 kernel launches."""
+    """Single-GPU expert-offload decode: each layer is a few CUDA graphs with the host-side expert
+    routing (gate result -> CPU experts / hot-slot ids) in between. The dense half of the layer uses
+    the fused decode kernels on static buffers (h_buf is the residual stream, updated in place)."""
 
     def __init__(self, model: Transformer, use_graphs: bool = True):
         super().__init__(model, use_graphs=False)
@@ -265,108 +354,135 @@ class OffloadDecodeRuntime(DecodeRuntime):
         hc, dim = self.cfg["hc_mult"], self.cfg["dim"]
         d = self.d
         self.h_buf = torch.zeros(1, 1, hc, dim, dtype=torch.bfloat16, device=d)
-        self.pre_buf = torch.zeros(1, 1, hc, dtype=torch.float32, device=d)
-        self.x_buf = torch.zeros(1, dim, dtype=torch.bfloat16, device=d)
-        self.res_buf = torch.zeros(1, 1, hc, dim, dtype=torch.bfloat16, device=d)
-        self.ffn_pre = torch.zeros(1, 1, hc, dtype=torch.float32, device=d)
-        self.ffn_post = torch.zeros(1, 1, hc, dtype=torch.float32, device=d)
-        self.ffn_comb = torch.zeros(1, 1, hc, hc, dtype=torch.float32, device=d)
+        self.pre_buf = torch.zeros(hc, dtype=torch.float32, device=d)
+        self.pre_mid = torch.zeros(hc, dtype=torch.float32, device=d)
+        self.xq_buf = torch.zeros(1, dim, dtype=torch.bfloat16, device=d)
+        self.ffn_pre = torch.zeros(hc, dtype=torch.float32, device=d)
+        self.ffn_post = torch.zeros(hc, dtype=torch.float32, device=d)
+        self.ffn_comb = torch.zeros(hc, hc, dtype=torch.float32, device=d)
         topk = self.cfg["n_activated_experts"]
-        self.gate_w = torch.zeros(1, topk, dtype=torch.float32, device=d)
-        self.gate_idx = torch.zeros(1, topk, dtype=torch.int64, device=d)
+        self.gate_w = torch.zeros(topk, dtype=torch.float32, device=d)
+        self.gate_idx = torch.zeros(topk, dtype=torch.int32, device=d)
         self.g1: dict[int, torch.cuda.CUDAGraph] = {}
         self.g2: dict[int, torch.cuda.CUDAGraph] = {}
         self.g3: dict[int, torch.cuda.CUDAGraph] = {}
         self.cpu_experts = model.blocks[0].ffn.host is not None
         self.prof = None  # set to a defaultdict(float) to collect per-stage seconds
-        self.y_gpu = torch.zeros(1, dim, dtype=torch.float32, device=d)
-        self.y_shared = torch.zeros(1, dim, dtype=torch.float32, device=d)
-        topk = self.cfg["n_activated_experts"]
+        self.y_pair = torch.zeros(2, dim, dtype=torch.float32, device=d)  # row 0: CPU experts, row 1: shared (+ hot) experts
+        self.y_gpu = self.y_pair[0:1]
+        self.y_shared = self.y_pair[1:2]
+        self.ys_zero = torch.zeros(1, dim, dtype=torch.bfloat16, device=d)
         self.slot_ids = torch.zeros(topk, dtype=torch.int32, device=d)
         self.slot_w = torch.zeros(topk, dtype=torch.float32, device=d)
         self.n_cold = 0
+        # pinned host mirrors: the gate result and x go host-side inside graph 1 (D2H memcpy nodes), the hot-slot
+        # table and the CPU expert output go back inside graphs 2 / 3, so the host syncs once per layer
+        self.x_host = torch.zeros(dim, dtype=torch.bfloat16, pin_memory=True)
+        self.ids_host = torch.zeros(topk, dtype=torch.int32, pin_memory=True)
+        self.wts_host = torch.zeros(topk, dtype=torch.float32, pin_memory=True)
+        self.slot_ids_host = torch.zeros(topk, dtype=torch.int32, pin_memory=True)
+        self.slot_w_host = torch.zeros(topk, dtype=torch.float32, pin_memory=True)
+        self.cold_ids_host = torch.zeros(topk, dtype=torch.int32, pin_memory=True)
+        self.cold_w_host = torch.zeros(topk, dtype=torch.float32, pin_memory=True)
+        self.y_host = torch.zeros(dim, dtype=torch.float32, pin_memory=True)
+        # numpy views of the pinned routing tables: filling them is one slice assignment instead of per-element torch ops
+        self.slot_ids_np, self.slot_w_np = self.slot_ids_host.numpy(), self.slot_w_host.numpy()
+        self.cold_ids_np, self.cold_w_np = self.cold_ids_host.numpy(), self.cold_w_host.numpy()
+        self.limit = float(model.blocks[0].ffn.swiglu_limit)
+        self.call_times: list[float] = []
+        if self.cpu_experts:
+            from . import cpumoe
+            cpumoe.lib()
+            cpumoe.pin_main_thread(_gpu_numa_node(d))
 
-    # ---- the two halves of a layer, on static buffers
+    # ---- the halves of a layer, on static buffers
     def part1(self, blk: Block):
         h = self.h_buf
         if blk.engram is not None:
-            h = blk.engram.apply(h, self.eng_in[blk.layer_id])
-        residual = h
-        attn_pre, attn_post, attn_comb = blk.hc_mixes(h, *blk.hc_attn)
-        x = _hc_pre(h, self.pre_buf)
-        x = rmsnorm(x, blk.attn_norm_w, blk.eps)
-        x = self.attention(blk.attn, x, blk.device)
-        h = _hc_post(x, residual, attn_post, attn_comb)
-        self.res_buf.copy_(h)
-        ffn_pre, ffn_post, ffn_comb = blk.hc_mixes(h, *blk.hc_ffn)
-        self.ffn_pre.copy_(ffn_pre)
-        self.ffn_post.copy_(ffn_post)
-        self.ffn_comb.copy_(ffn_comb)
-        x = _hc_pre(h, attn_pre)
-        x = rmsnorm(x, blk.ffn_norm_w, blk.eps).reshape(-1, blk.ffn.dim)
-        self.x_buf.copy_(x)
-        w, idx = blk.ffn.gate(x)
-        self.gate_w.copy_(w)
-        self.gate_idx.copy_(idx)
+            h.copy_(blk.engram.apply(h, self.eng_in[blk.layer_id]))
+        fn, scale, base = blk.hc_attn
+        mixes = hc_mix(h, fn, blk.eps)
+        _, post, comb, x, xq, _ = hc_pre_norm_quant(h, self.pre_buf, mixes, scale, base, blk.attn_norm_w, blk.eps, blk.hc_eps, blk.sinkhorn_iters,
+                                                    out={"pre": self.pre_mid})
+        a = self.attention2(blk.attn, x, xq, blk.device)
+        hc_post2_(a.view(1, -1), h, post, comb)
+        fn, scale, base = blk.hc_ffn
+        mixes = hc_mix(h, fn, blk.eps)
+        _, _, _, _, _, xf = hc_pre_norm_quant(h, self.pre_mid, mixes, scale, base, blk.ffn_norm_w, blk.eps, blk.hc_eps, blk.sinkhorn_iters, want_f32=True,
+                                             out={"pre": self.ffn_pre, "post": self.ffn_post, "comb": self.ffn_comb, "yq": self.xq_buf})
+        moe = blk.ffn
+        scores = F.linear(xf, moe.gate_w)
+        gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1,
+                  eid=self.gate_idx, wt=self.gate_w)
+        if self.cpu_experts:  # D2H for the host-side routing (captured as memcpy nodes)
+            self.x_host.copy_(self.xq_buf.view(-1), non_blocking=True)
+            self.ids_host.copy_(self.gate_idx, non_blocking=True)
+            self.wts_host.copy_(self.gate_w, non_blocking=True)
+
+    def _shared(self, moe):
+        gu_s = F.linear(self.xq_buf, moe.sh_w13)
+        hs = swiglu_quant(gu_s, None, moe.inter, moe.swiglu_limit)
+        return F.linear(hs, moe.sh_w2)
 
     def part2_cpu_shared(self, blk: Block):
         """GPU work that overlaps the CPU expert computation: the shared expert and the hot experts."""
         moe = blk.ffn
-        y = moe.shared_expert(self.x_buf)
+        y = self._shared(moe).float()
         if moe.hot:
-            xq = fake_quant_fp8(self.x_buf, 32)
-            y = y + moe.hot_experts_gpu(xq, self.slot_ids, self.slot_w)
+            self.slot_ids.copy_(self.slot_ids_host, non_blocking=True)  # H2D memcpy nodes at the head of graph 2
+            self.slot_w.copy_(self.slot_w_host, non_blocking=True)
+            y = y + moe.hot_experts_gpu(self.xq_buf, self.slot_ids, self.slot_w)
         self.y_shared.copy_(y)
 
     def part2_cpu_post(self, blk: Block):
-        moe = blk.ffn
-        y = (self.y_gpu + self.y_shared).to(torch.bfloat16).view(1, 1, moe.dim)
-        h = _hc_post(y, self.res_buf, self.ffn_post, self.ffn_comb)
-        self.h_buf.copy_(h)
+        self.y_gpu.view(-1).copy_(self.y_host, non_blocking=True)  # H2D memcpy node at the head of graph 3
+        hc_post2_(None, self.h_buf, self.ffn_post, self.ffn_comb, y2=self.y_pair, ys=self.ys_zero)
         self.pre_buf.copy_(self.ffn_pre)
 
     def _route(self, blk: Block):
-        """After part1: read the gate result, fill the hot-slot buffers (H2D) and return the cold experts."""
+        """After graph 1: wait for its D2H copies (the one host sync per layer), split the experts into hot
+        (GPU slots) and cold (CPU), fill the pinned slot / cold tables. Returns the number of cold experts."""
         moe = blk.ffn
-        xq = fake_quant_fp8(self.x_buf, 32)
-        moe.x_host.copy_(xq.view(-1))  # sync: waits for part1 on the GPU
-        ids = self.gate_idx.flatten().tolist()
-        wts = self.gate_w.flatten().tolist()
+        torch.cuda.current_stream(self.d).synchronize()
+        ids = self.ids_host.tolist()
+        wts = self.wts_host.tolist()
         gs, gw, cid, cw = moe.split_hot(ids, wts)
         if gs is not None:
-            self.slot_ids.copy_(torch.tensor(gs, dtype=torch.int32), non_blocking=True)
-            self.slot_w.copy_(torch.tensor(gw, dtype=torch.float32), non_blocking=True)
-        return cid, cw
+            self.slot_ids_np[:] = gs
+            self.slot_w_np[:] = gw
+        n = len(cid)
+        if n:
+            self.cold_ids_np[:n] = cid
+            self.cold_w_np[:n] = cw
+        return n
 
-    def _cpu_experts(self, blk: Block, cid, cw):
+    def _cpu_experts(self, blk: Block, n_cold: int):
         moe = blk.ffn
-        if cid:
-            y = moe.host.forward(moe.x_host, cid, cw, float(moe.swiglu_limit))
-            moe.y_host.copy_(y)
+        t0 = time.perf_counter() if self.prof is not None else 0.0
+        if n_cold:
+            moe.host.forward_ids(self.x_host.data_ptr(), self.cold_ids_host.data_ptr(), self.cold_w_host.data_ptr(), n_cold, self.y_host.data_ptr(), self.limit)
         else:
-            moe.y_host.zero_()
-        self.y_gpu.copy_(moe.y_host, non_blocking=True)
+            self.y_host.zero_()
+        if self.prof is not None:
+            dt = time.perf_counter() - t0
+            self.prof["  (of which cpumoe_forward call)"] += dt
+            self.call_times.append(dt)
 
     def part2(self, blk: Block):
         moe = blk.ffn
-        n_tok, n_pairs = 1, moe.topk
-        tok, pair_rows, ones = moe._pair_tables(n_tok, self.d)
+        n_pairs = moe.topk
+        tok, pair_rows, ones = moe._pair_tables(1, self.d)
         b = moe._staging(n_pairs, "decode")
-        xq = fake_quant_fp8(self.x_buf, 32)
         local = torch.arange(n_pairs, device=self.d, dtype=torch.int32)
-        gu = cukern_fp4(xq, b["w13"], b["s13"], tok, local, ones, n_pairs)
-        hq = swiglu_quant(gu, self.gate_w.flatten().contiguous(), moe.inter, moe.swiglu_limit)
+        gu = cukern_fp4(self.xq_buf, b["w13"], b["s13"], tok, local, ones, n_pairs)
+        hq = swiglu_quant(gu, self.gate_w, moe.inter, moe.swiglu_limit)
         y2 = cukern_fp4(hq, b["w2"], b["s2"], pair_rows, local, ones, n_pairs)
-        y = y2.view(n_tok, moe.topk, moe.dim).sum(dim=1)
-        y += moe.shared_expert(self.x_buf)
-        y = y.to(torch.bfloat16).view(1, 1, moe.dim)
-        h = _hc_post(y, self.res_buf, self.ffn_post, self.ffn_comb)
-        self.h_buf.copy_(h)
+        hc_post2_(None, self.h_buf, self.ffn_post, self.ffn_comb, y2=y2, ys=self._shared(moe))
         self.pre_buf.copy_(self.ffn_pre)
 
     def _gather(self, moe):
         b = moe._staging(moe.topk, "decode")
-        for i, e in enumerate(self.gate_idx.flatten().tolist()):  # the one host sync per layer
+        for i, e in enumerate(self.gate_idx.tolist()):  # the one host sync per layer
             for gk, src in (("w13", moe.w13), ("s13", moe.s13), ("w2", moe.w2), ("s2", moe.s2)):
                 b[gk][i].copy_(src[e], non_blocking=True)
 
@@ -381,9 +497,9 @@ class OffloadDecodeRuntime(DecodeRuntime):
                     for _ in range(2):
                         self.part1(blk)
                         if self.cpu_experts:
-                            cid, cw = self._route(blk)
+                            n_cold = self._route(blk)
                             self.part2_cpu_shared(blk)
-                            self._cpu_experts(blk, cid, cw)
+                            self._cpu_experts(blk, n_cold)
                             self.part2_cpu_post(blk)
                         else:
                             self._gather(blk.ffn)
@@ -423,7 +539,7 @@ class OffloadDecodeRuntime(DecodeRuntime):
                     self.eng_in[blk.layer_id].copy_(emb)
         self.h_buf.copy_(F.embedding(self.tok, self.m.embed).unsqueeze(2).repeat(1, 1, self.cfg["hc_mult"], 1))
         self.pre_buf.zero_()
-        self.pre_buf[:, :, 0] = 1.0
+        self.pre_buf[0] = 1.0
         prof = self.prof
         for blk in self.m.blocks:
             lid = blk.layer_id
@@ -433,15 +549,15 @@ class OffloadDecodeRuntime(DecodeRuntime):
             else:
                 self.part1(blk)
             if self.cpu_experts:
-                cid, cw = self._route(blk)  # syncs on part1
-                self.n_cold += len(cid)
+                n_cold = self._route(blk)  # syncs on part1
+                self.n_cold += n_cold
                 if prof is not None:
                     t1 = time.perf_counter(); prof["gpu dense+attn (sync)"] += t1 - t0; t0 = t1
                 if self.use_graphs:
                     self.g2[lid].replay()  # shared + hot experts on the GPU, overlapping the CPU cold experts
                 else:
                     self.part2_cpu_shared(blk)
-                self._cpu_experts(blk, cid, cw)
+                self._cpu_experts(blk, n_cold)
                 if prof is not None:
                     t1 = time.perf_counter(); prof["cpu cold experts"] += t1 - t0; t0 = t1
                 if self.use_graphs:
@@ -456,7 +572,7 @@ class OffloadDecodeRuntime(DecodeRuntime):
                 self.g2[lid].replay()
             else:
                 self.part2(blk)
-        hh = _hc_pre(self.h_buf, self.pre_buf)[:, -1]
+        hh = _hc_pre(self.h_buf, self.pre_buf.view(1, 1, -1))[:, -1]
         hh = rmsnorm(hh, self.m.norm_w, self.cfg["norm_eps"])
         self.logits.copy_(F.linear(hh, self.m.head).float())
         return self.logits
