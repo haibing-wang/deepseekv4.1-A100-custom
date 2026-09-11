@@ -39,3 +39,30 @@ extern "C" __global__ void p2p_wait(volatile int* flags, int n, const int* seq_p
 }
 
 extern "C" __global__ void p2p_seq_bump(int* seq_ptr) { *seq_ptr += 1; }
+
+// one launch: copy `n16` uint4 of src into up to 8 destinations (peer inboxes), then signal their flags
+extern "C" __global__ void p2p_multicast(uint4** dsts, int ndst, const uint4* __restrict__ src, int n16,
+                                        int** flags, const int* seq_ptr) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n16) {
+        uint4 v = src[i];
+        for (int d = 0; d < ndst; ++d) dsts[d][i] = v;
+    }
+    // last block to finish signals (counter in shared+global would be needed for multi-block; keep 1 block when signalling)
+    if (flags != nullptr && gridDim.x == 1) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            int v = *seq_ptr;
+            for (int d = 0; d < ndst; ++d) { volatile int* f = (volatile int*)flags[d]; *f = v; }
+            __threadfence_system();
+        }
+    }
+}
+
+// timeline stamp: the global nanosecond timer (same clock on every GPU of the node)
+extern "C" __global__ void p2p_stamp(long long* dst) {
+    long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    *dst = t;
+}

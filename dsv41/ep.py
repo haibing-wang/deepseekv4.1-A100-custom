@@ -16,7 +16,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .cukern import fp4_gemm_tc, p2p_copy, p2p_copy_row, p2p_seq_bump, p2p_signal, p2p_sum_rows, p2p_wait
+import os
+
+from .cukern import fp4_gemm_tc, p2p_copy, p2p_copy_row, p2p_multicast, p2p_seq_bump, p2p_signal, p2p_stamp, p2p_sum_rows, p2p_wait
+
+EP_TRACE = os.environ.get("DSV41_EP_TRACE", "0") == "1"  # per-layer device timestamps (owner: 6 points, peer: 2)
 from .decode import DecodeRuntime, HC_FORK
 from .fused import rmsnorm, swiglu_quant
 from .fused2 import gate_topk, hc_post2_
@@ -48,11 +52,17 @@ class EPRuntime(DecodeRuntime):
         self.hop_h = {d: torch.zeros(1, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devs}
         self.hop_pre = {d: torch.zeros(hc, dtype=torch.float32, device=d) for d in self.devs}
         self.pre_identity = {d: torch.tensor([1.0] + [0.0] * (hc - 1), dtype=torch.float32, device=d) for d in self.devs}
-        self.inbox_x = {d: torch.zeros(1, dim, dtype=torch.bfloat16, device=d) for d in self.devs}
-        self.inbox_eid = {d: torch.zeros(8, dtype=torch.int32, device=d) for d in self.devs}
-        self.inbox_wt = {d: torch.zeros(8, dtype=torch.float32, device=d) for d in self.devs}
-        self.eid8 = {d: torch.zeros(8, dtype=torch.int32, device=d) for d in self.devs}
-        self.wt8 = {d: torch.zeros(8, dtype=torch.float32, device=d) for d in self.devs}
+        # routing message: [xqp bf16 dim | eid int32 x8 | wt fp32 x8] in one buffer (owner's outbox / peers' inbox)
+        msg_bytes = dim * 2 + 64
+        self.outbox = {d: torch.zeros(msg_bytes, dtype=torch.uint8, device=d) for d in self.devs}
+        self.inbox = {d: torch.zeros(msg_bytes, dtype=torch.uint8, device=d) for d in self.devs}
+        def views(buf):
+            return (buf[: dim * 2].view(torch.bfloat16).view(1, dim), buf[dim * 2 : dim * 2 + 32].view(torch.int32), buf[dim * 2 + 32 :].view(torch.float32))
+        self.xqp_out, self.eid8, self.wt8 = {}, {}, {}
+        self.inbox_x, self.inbox_eid, self.inbox_wt = {}, {}, {}
+        for d in self.devs:
+            self.xqp_out[d], self.eid8[d], self.wt8[d] = views(self.outbox[d])
+            self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d] = views(self.inbox[d])
         self.part_in = {d: torch.zeros(self.nd, dim, dtype=torch.float32, device=d) for d in self.devs}
         self.flag_route = {d: torch.zeros(nl, dtype=torch.int32, device=d) for d in self.devs}
         self.flag_part = {d: torch.zeros(nl, self.nd, dtype=torch.int32, device=d) for d in self.devs}
@@ -65,6 +75,9 @@ class EPRuntime(DecodeRuntime):
             o = blk.device
             peers = [d for d in self.devs if d != o]
             self.sig_route[L] = torch.tensor([self.flag_route[p][L].data_ptr() for p in peers], dtype=torch.int64, device=o)
+            self.sig_inbox = getattr(self, "sig_inbox", {})
+            if o not in self.sig_inbox:
+                self.sig_inbox[o] = torch.tensor([self.inbox[p].data_ptr() for p in peers], dtype=torch.int64, device=o)
             for p in peers:
                 self.sig_part[(L, p)] = torch.tensor([self.flag_part[o][L, self.idx[p]].data_ptr()], dtype=torch.int64, device=p)
             if L + 1 < nl and model.blocks[L + 1].device != o:
@@ -84,6 +97,11 @@ class EPRuntime(DecodeRuntime):
         self.first_layer = {d: min(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
         self.last_layer = {d: max(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
         self.dry = False  # dry pass: no device-side waits / signals (only to compile and load every kernel)
+        self.trace = {d: torch.zeros(nl, 8, dtype=torch.int64, device=d) for d in self.devs} if EP_TRACE else None
+
+    def _stamp(self, d, L, k):
+        if self.trace is not None:
+            p2p_stamp(self.trace[d][L, k], d)
 
     def _wait(self, flags, d):
         if not self.dry:
@@ -118,6 +136,7 @@ class EPRuntime(DecodeRuntime):
     def _owner_layer(self, blk: Block, d, h, pre):
         L = blk.layer_id
         moe = blk.ffn
+        self._stamp(d, L, 0)
         if blk.engram is not None:
             h.copy_(blk.engram.apply(h, self.eng_in[L]))
         (pre_n, post, comb), side, x, xq, _ = self._hc_sub(blk, h, blk.hc_attn, pre, blk.attn_norm_w)
@@ -125,31 +144,46 @@ class EPRuntime(DecodeRuntime):
         self._push_cache_rows(blk, d)
         self._hc_join(side, d)
         hc_post2_(a.view(1, -1), h, post, comb)
-        (pre_out, post, comb), side, x, xq, xf, xqp = self._hc_sub(blk, h, blk.hc_ffn, pre_n, blk.ffn_norm_w, want_f32=True, want_perm=True)
+        self._stamp(d, L, 1)
+        (pre_out, post, comb), side, x, xq, xf, xqp = self._hc_sub(blk, h, blk.hc_ffn, pre_n, blk.ffn_norm_w, want_f32=True, want_perm=True,
+                                                                 out={"yqp": self.xqp_out[d]})
         scores = F.linear(xf, moe.gate_w)
         eid, wt = self.eid8[d][: self.topk_e], self.wt8[d][: self.topk_e]
         gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1, eid=eid, wt=wt)
-        # routing + activation to the peers, then the flag
-        for p in self.devs:
-            if p == d:
-                continue
-            p2p_copy(self.inbox_x[p], xqp, d)
-            p2p_copy(self.inbox_eid[p], self.eid8[d], d)
-            p2p_copy(self.inbox_wt[p], self.wt8[d], d)
-        self._signal(self.sig_route[L], d)
-        # own shard + shared expert while the peers work
+        # routing + activation to every peer and the flags: one launch
+        if not self.dry:
+            p2p_multicast(self.sig_inbox[d], self.outbox[d], self.sig_route[L], self.seq[d], d)
+        self._stamp(d, L, 2)
+        xqp = self.xqp_out[d]
+        # own shard and, on a second stream, the shared expert, while the peers work
+        main = torch.cuda.current_stream(d)
+        side2 = self._side_stream2(d)
+        side2.wait_stream(main)
+        with torch.cuda.stream(side2):
+            ys = self._shared_expert(moe, xq)
         y_loc = self._experts_shard(d, xqp, eid, wt, moe)
         p2p_sum_rows(self.part_in[d][self.idx[d]], y_loc, d)
-        ys = self._shared_expert(moe, xq)
+        main.wait_stream(side2)
+        self._stamp(d, L, 3)
         # wait for the peers' partials (own slot is raised by a local signal so the whole row can be waited on)
         self._signal(self._own_part_ptr(L, d), d)
         self._wait(self.flag_part[d][L], d)
+        self._stamp(d, L, 4)
         self._hc_join(side, d)
         hc_post2_(None, h, post, comb, y2=self.part_in[d], ys=ys)
+        self._stamp(d, L, 5)
         return pre_out
 
     def _own_part_ptr(self, L, d):
         return self._ptrs[("own", L, d)]
+
+    def _side_stream2(self, d):
+        ss = getattr(self, "_side2", None)
+        if ss is None:
+            ss = self._side2 = {}
+        if d not in ss:
+            ss[d] = torch.cuda.Stream(d)
+        return ss[d]
 
     def _shared_expert(self, moe, xq):
         from .w8 import linear_w
@@ -161,9 +195,11 @@ class EPRuntime(DecodeRuntime):
         L = blk.layer_id
         o = blk.device
         self._wait(self.flag_route[d][L : L + 1], d)
+        self._stamp(d, L, 6)
         y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d][: self.topk_e], self.inbox_wt[d][: self.topk_e], blk.ffn)
         p2p_sum_rows(self.part_in[o][self.idx[d]], y, d)  # straight into the owner's inbox row
         self._signal(self.sig_part[(L, d)], d)
+        self._stamp(d, L, 7)
 
     def token_begin(self, d):
         hc = self.cfg["hc_mult"]
@@ -274,3 +310,22 @@ class EPRuntime(DecodeRuntime):
                 self.token_graph(d)
         torch.cuda.synchronize(self.devs[-1])
         return self.logits
+
+
+def trace_report(rt: "EPRuntime") -> str:
+    """Average per-layer timeline (us) from the DSV41_EP_TRACE stamps of the last token."""
+    if rt.trace is None:
+        return "no trace"
+    tr = {d: rt.trace[d].cpu() for d in rt.devs}
+    rows = []
+    agg = {}
+    for L, blk in enumerate(rt.m.blocks):
+        o = blk.device
+        t = tr[o][L]
+        peers = [d for d in rt.devs if d != o]
+        pc = [tr[d][L, 7].item() - tr[d][L, 6].item() for d in peers]  # peer compute + push (its own clock)
+        parts = {"attn+hc": t[1] - t[0], "gate+route": t[2] - t[1], "own experts || shared": t[3] - t[2], "wait partials": t[4] - t[3],
+                 "hc_post": t[5] - t[4], "layer": t[5] - t[0], "peer compute+push (max)": max(pc), "peer compute+push (mean)": sum(pc) / len(pc)}
+        for k, v in parts.items():
+            agg.setdefault(k, []).append(float(v))
+    return "\n".join(f"  {k:28s} {sum(v) / len(v) / 1000:7.1f} us" for k, v in agg.items())

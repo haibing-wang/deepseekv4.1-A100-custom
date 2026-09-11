@@ -125,6 +125,11 @@ def main():
         print(f"\n[kernel profile: {tot / 8 / 1000:.1f} ms of GPU time per token]")
         for k, t, c in sorted(rows, key=lambda r: -r[1])[:22]:
             print(f"  {t / 8 / 1000:7.2f} ms/token  {c // 8:5d}/token  {k[:90]}")
+    if a.ep and os.environ.get("DSV41_EP_TRACE") == "1" and rt is not None:
+        from dsv41.ep import trace_report
+        rt.step(out[-1], pos)
+        torch.cuda.synchronize()
+        print("[EP timeline per layer, averaged over the 40 layers]\n" + trace_report(rt))
     if a.kernel_trace and rt is not None:
         import json
         from torch.profiler import ProfilerActivity, profile

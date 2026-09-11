@@ -222,3 +222,20 @@ def p2p_wait(flags: torch.Tensor, seq: torch.Tensor, device: torch.device):
 def p2p_seq_bump(seq: torch.Tensor, device: torch.device):
     f = get_function("p2p.cu", "p2p_seq_bump", device)
     launch(f, (1, 1, 1), (1, 1, 1), [ctypes.c_void_p(seq.data_ptr())], device)
+
+
+def p2p_multicast(dst_ptrs: torch.Tensor, src: torch.Tensor, flag_ptrs: torch.Tensor | None, seq: torch.Tensor, device: torch.device):
+    """One kernel: src (<= 16 KB, size multiple of 16) into every destination address in dst_ptrs (int64 on `device`),
+    then (single block) set the flags at flag_ptrs to seq."""
+    n = src.numel() * src.element_size()
+    assert n % 16 == 0 and n <= 16 * 1024
+    f = get_function("p2p.cu", "p2p_multicast", device)
+    n16 = n // 16
+    launch(f, (1, 1, 1), (1024, 1, 1), [ctypes.c_void_p(dst_ptrs.data_ptr()), ctypes.c_int(dst_ptrs.numel()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(n16),
+                                       ctypes.c_void_p(flag_ptrs.data_ptr() if flag_ptrs is not None else 0), ctypes.c_void_p(seq.data_ptr())], device)
+
+
+def p2p_stamp(dst: torch.Tensor, device: torch.device):
+    """Write the GPU global timer (ns) into dst (int64 scalar on `device`), stream-ordered."""
+    f = get_function("p2p.cu", "p2p_stamp", device)
+    launch(f, (1, 1, 1), (1, 1, 1), [ctypes.c_void_p(dst.data_ptr())], device)
