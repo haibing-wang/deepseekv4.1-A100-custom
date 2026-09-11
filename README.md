@@ -182,7 +182,13 @@ when its free memory is fragmented, and that node's threads run at half speed), 
 | dense weights kept FP8, decoded in registers to bf16 tensor-core operands (`cuda/fp8_tc.cu`) | 42.6 |
 | FP4 experts decoded in registers to bf16 tensor-core operands, grouped by expert (`cuda/fp4_tc.cu`) | 47.4 |
 | split-K epilogue in the kernel, hyper-connection split on a side stream | 51.9 |
-| expert parallelism over 7 GPUs (`--ep`) | 62.0 |
+| expert parallelism over 7 GPUs (`--ep`) | 65.7 |
+
+Several sequences at once (`--batch B`, the rows advance in lockstep; `--batch-prompts FILE` for distinct
+prompts): the dense weights are read once per step for all rows and the (token, expert) pairs are bucketed by
+expert on the device, so an expert's weights are read once for all the tokens routed to it. Aggregate
+throughput with identical prompts (the best case for bucketing): pipeline B=8 146 tok/s, B=16 169 tok/s;
+expert parallelism over 7 GPUs B=4 150, B=8 231, B=16 302 tok/s (53 ms per step).
 
 GPU time per token on the pipeline: FP8 dense 6.3 ms, FP4 experts 5.0 ms, the rest ~8 ms (attention,
 indexer top-k, small fused kernels). Prefill of a 1,413-token prompt: 4.8 s (296 tok/s). Load: ~70 s with
@@ -193,4 +199,11 @@ value is the FP8 value times 2^-120 (the subnormals line up too), so one bf16x2 
 turns two packed weights into exactly dequantized bf16 operands for `mma.sync`; E2M1 nibbles work the same
 way with 2^126. The weights stay 8-bit / 4-bit in HBM and the tensor cores do the accumulation in fp32.
 
-Not implemented yet: DSpark (MTP) speculative decoding, the vision encoder, batch > 1.
+DSpark (multi-token prediction) is implemented as an eager draft module (`dsv41/dspark.py`; `dsv41/mtp_accept.py`
+measures it): on greedy English text 2.13 of the 5 drafts are accepted on average (78% for the first draft),
+i.e. 3.13 tokens per verified step. The verification path (6-token steps in the graphs) is not built yet.
+`dsv41/route_telemetry.py` records which experts a task uses: the top-64 experts of a layer carry 83-95% of
+the routing weight for a given task and the sets differ a lot between tasks (a conversation-local working
+set of ~80 experts per layer is what the single-GPU cache should hold).
+
+Not implemented yet: the MTP verification step, continuous batching in the server, the vision encoder.

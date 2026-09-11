@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--n-layers", type=int, default=None, help="load only the first N layers (plumbing test)")
     ap.add_argument("--no-engram", action="store_true")
     ap.add_argument("--batch", type=int, default=1, help="decode B copies of the prompt together (throughput test)")
+    ap.add_argument("--batch-prompts", default="", help="file with one prompt per line: distinct prompts for the batch rows (truncated to a common token length)")
     ap.add_argument("--ep", action="store_true", help="expert parallelism over --devices (dense pipelined, experts sharded; dsv41/ep.py)")
     ap.add_argument("--ep-shards", default="", help="experts per device for --ep, e.g. 82,82,68,38,38,38,38 (default: equal)")
     ap.add_argument("--offload-experts", nargs="?", const="cpu", default=False, choices=["gpu", "cpu"], help="single-GPU mode: experts in host RAM; 'cpu' computes them on the CPU (default), 'gpu' streams them over PCIe")
@@ -62,8 +63,21 @@ def main():
         ids = tok.encode(text)
     else:
         ids = tok.encode(a.prompt)
+    if a.batch_prompts:
+        lines = [l.strip() for l in open(a.batch_prompts) if l.strip()][: a.batch]
+        assert len(lines) == a.batch, f"need {a.batch} prompts in {a.batch_prompts}"
+        if a.chat:
+            rows = [tok.encode(encode_messages([{"role": "user", "content": l}], thinking_mode="chat")) for l in lines]
+        else:
+            rows = [tok.encode(l) for l in lines]
+        T = min(len(r) for r in rows)
+        rows = [r[:T] for r in rows]  # lockstep positions: a common prompt length
+        ids = rows[0]
+        print(f"batch prompts: {a.batch} distinct, truncated to {T} tokens each", flush=True)
+        input_ids = torch.tensor(rows, dtype=torch.long)
+    else:
+        input_ids = torch.tensor([ids] * a.batch, dtype=torch.long)
     print(f"prompt tokens: {len(ids)}", flush=True)
-    input_ids = torch.tensor([ids] * a.batch, dtype=torch.long)
 
     rt = None
     if a.decode != "eager":
@@ -105,7 +119,7 @@ def main():
             uniq.append(sum(len(set(eid[l].reshape(-1).tolist())) for l in range(eid.shape[0])) / eid.shape[0])
             pairs_n = eid.shape[1] * eid.shape[2]
         toks = nxt.view(-1).tolist()
-        if B > 1 and len(set(toks)) > 1 and not getattr(main, "_diverged", False):
+        if B > 1 and not a.batch_prompts and len(set(toks)) > 1 and not getattr(main, "_diverged", False):
             main._diverged = True
             print(f"\n[batch rows diverged at step {len(out)}: {toks[:8]}]", flush=True)
         out.append(toks[0])
