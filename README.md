@@ -213,15 +213,24 @@ bytes stored k-permuted so the loaded word is the fragment), `cuda/fp4_tcw.cu` (
 tokens), an attention split kernel that loops over key blocks, and an NVLink-pair relay for the expert
 parallel messages (the cross-pair links are PCIe at ~21 GB/s). 4 GPUs (2,3,0,1), 32 distinct mixed prompts:
 
-| S sequences, K drafts | rows/step | ms/step | tokens/seq/step | tok/s aggregate |
-|---|---|---|---|---|
-| 32, no MTP | 32 | 67 | 1.00 | 466 |
-| 32, K=1 | 64 | 113 | 1.73 | 486 |
-| 32, K=2 | 96 | 136 | 2.22 | 520 |
-| 32, K=3 | 128 | 158 | 2.61 | **527** |
-| 32, K=5 | 192 | 206 | 3.04 | 473 |
-| 16, K=3 | 64 | 103 | 2.53 | 394 (no MTP: 334) |
-| 8, K=5 | 48 | 84 | 3.15 | 299 (no MTP: 244) |
+Parallel contexts on one 4-GPU replica (`dsv41/batch_prompts64.txt`, 64 distinct mixed prompts; per-context
+speed = aggregate / S):
+
+| S contexts | no MTP: ms/step, tok/s | K=3 drafts: ms/step, tok/seq/step, tok/s | K=5 drafts: tok/s |
+|---|---|---|---|
+| 1 | 15.8, 63 | 30.2, 2.52, **84** | 85 |
+| 4 | 27.2, 147 | 48.8, 2.47, **202** | 205 |
+| 8 | 33.7, 237 | 70.0, 2.50, 285 | **301** |
+| 16 | 46.2, 340 | 102.0, 2.54, **398** | 360 |
+| 32 | 66.4, 478 | 157.6, 2.60, **528** | 473 |
+| 48 | 76.0, **624** | 201.9, 2.58, 614 | – |
+| 64 | 86.1, **737** | 244.4, 2.57, 674 | – |
+
+MTP wins up to 32 contexts (5 drafts up to 8, 3 drafts beyond); from 48 contexts on the plain batched step
+is better because the verification rows touch nearly every expert of every layer. Per-context speed drops
+from 63 tok/s alone to 11.5 tok/s at 64 contexts. The chat REPL and the server use `--mtp K`
+(`dsv41.chat --devices 2,3,0,1 --ep --mtp 5`: 61 -> 82 tok/s decode at temperature 0.6 on Japanese;
+English and code accept more drafts).
 
 Per layer at 128 rows: attention + dense 1.4 ms, the shard's experts 1.7 ms (about 90 of its 100 experts
 are touched, ~1 TB/s), partial exchange 0.2 ms. The expert reads are the floor: with 32 prompts of one task
