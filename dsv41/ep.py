@@ -199,6 +199,9 @@ class EPRuntime(DecodeRuntime):
         scores = F.linear(xf, moe.gate_w)
         eid, wt = self.eid8[d], self.wt8[d]
         gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1, eid=eid, wt=wt)
+        if self.route_log:  # telemetry: keep this layer's routing (DSV41_ROUTE_LOG=1)
+            self.route_eid[L].copy_(eid)
+            self.route_wt[L].copy_(wt)
         self._stamp(d, L, 9)
         # routing + activation to every peer, then the flags
         if not self.dry:

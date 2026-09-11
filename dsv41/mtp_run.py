@@ -17,6 +17,7 @@ ap.add_argument("--max-new-tokens", type=int, default=64)
 ap.add_argument("--no-mtp", action="store_true", help="plain batched decode with the same harness (baseline)")
 ap.add_argument("--drafts", type=int, default=5, help="draft tokens verified per sequence per step (1..5)")
 ap.add_argument("--n-layers", type=int, default=None, help="truncated model (plumbing test)")
+ap.add_argument("--route-stats", action="store_true", help="unique experts per layer and per shard of every verification step (needs DSV41_ROUTE_LOG=1)")
 ap.add_argument("--trace", action="store_true", help="print the EP per-layer timeline of the last step (needs DSV41_EP_TRACE=1)")
 ap.add_argument("--profile", type=int, default=0, help="profile this many steps (after 4 warm-up steps) and print kernel time per device")
 a = ap.parse_args()
@@ -81,6 +82,12 @@ t0 = time.time()
 steps = 0
 n_acc = 0
 t_draft = t_verify = 0.0
+uniq_all, uniq_shard, n_stats = 0.0, 0.0, 0
+shard_bounds = None
+if a.route_stats and a.ep:
+    b0, shard_bounds = 0, []
+    for n in [int(v) for v in a.ep_shards.split(",")]:
+        shard_bounds.append((b0, b0 + n)); b0 += n
 done = [False] * S
 prof = None
 if a.profile:
@@ -99,6 +106,16 @@ while steps < a.max_new_tokens and not all(done):
     logits = rt.step(toks, poss, seq=seqs, pmax=pmaxs)
     am = logits.argmax(-1).tolist()
     t_verify += time.time() - tv
+    if a.route_stats and a.ep:
+        eid_log, _ = rt.route_snapshot()  # [layers, rows, topk]
+        per_layer = [torch.unique(eid_log[l]).numel() for l in range(eid_log.shape[0])]
+        uniq_all += sum(per_layer) / len(per_layer)
+        mx = 0.0
+        for lo, hi in shard_bounds:
+            u = [((torch.unique(eid_log[l]) >= lo) & (torch.unique(eid_log[l]) < hi)).sum().item() for l in range(eid_log.shape[0])]
+            mx = max(mx, sum(u) / len(u))
+        uniq_shard += mx
+        n_stats += 1
     if ds is not None:
         mh_all = torch.cat([rt.main_hid[l].to(last) for l in ds.targets], dim=-1)  # [S*K, 3*dim]
         ds.write_main_rows(mh_all, torch.tensor(seqs, device=last), torch.tensor(poss, device=last))
@@ -146,6 +163,9 @@ if prof is not None:
         for name, (us, n) in sorted(per[dev].items(), key=lambda kv: -kv[1][0])[:22]:
             print(f"  {us / 1000:7.2f} ms  {n // a.profile:5d}/step  {name}")
 total = sum(len(g) for g in generated)
+if n_stats:
+    print(f"[routing] rows per step {S * K}: unique experts per layer {uniq_all / n_stats:.1f} of {model.args.n_routed_experts}, "
+          f"busiest shard {uniq_shard / n_stats:.1f} experts per layer")
 if a.trace and a.ep:
     from dsv41.ep import trace_report
     print("[EP timeline per layer, averaged over the layers, last step]\n" + trace_report(rt))

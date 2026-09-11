@@ -199,8 +199,37 @@ large batches:
 
 A 4-GPU group is as fast as an 8-GPU one per step (the per-layer critical path is the owner's attention
 and dense part, not the expert reads), so two 4-GPU replicas give twice the throughput of one 8-GPU
-group. With the measured DSpark acceptance (3.13 tokens per verified step) the two-replica B=32
-configuration would reach ~2,800 tok/s if verification were free; that verification step is the next thing to build.
+group.
+
+### Speculative decoding with DSpark on the batched runtime (`dsv41/mtp_run.py`)
+
+Every sequence contributes `1 + K` rows to one batched step (the bonus token and `K` draft tokens at the
+next positions; rows carry their own sequence id and position), the drafts are accepted greedily on the
+host and the batched DSpark draft (`DSparkRows`, one CUDA graph) proposes the next ones. The verification
+step is therefore an ordinary batched step with `S * (1 + K)` rows, and its cost per row is what decides
+whether MTP pays. Kernels added for many rows: `cuda/fp8_tcw.cu` (17-64 rows: weights as the mma A operand,
+weights read once) and `cuda/fp8_tcg.cu` (more rows: 64x128x128 tiles, `ldmatrix` on both operands, weight
+bytes stored k-permuted so the loaded word is the fragment), `cuda/fp4_tcw.cu` (expert groups of 9-64
+tokens), an attention split kernel that loops over key blocks, and an NVLink-pair relay for the expert
+parallel messages (the cross-pair links are PCIe at ~21 GB/s). 4 GPUs (2,3,0,1), 32 distinct mixed prompts:
+
+| S sequences, K drafts | rows/step | ms/step | tokens/seq/step | tok/s aggregate |
+|---|---|---|---|---|
+| 32, no MTP | 32 | 67 | 1.00 | 466 |
+| 32, K=1 | 64 | 113 | 1.73 | 486 |
+| 32, K=2 | 96 | 136 | 2.22 | 520 |
+| 32, K=3 | 128 | 158 | 2.61 | **527** |
+| 32, K=5 | 192 | 206 | 3.04 | 473 |
+| 16, K=3 | 64 | 103 | 2.53 | 394 (no MTP: 334) |
+| 8, K=5 | 48 | 84 | 3.15 | 299 (no MTP: 244) |
+
+Per layer at 128 rows: attention + dense 1.4 ms, the shard's experts 1.7 ms (about 90 of its 100 experts
+are touched, ~1 TB/s), partial exchange 0.2 ms. The expert reads are the floor: with 32 prompts of one task
+(`dsv41/batch_prompts32_code.txt`, all Python coding) a 128-row step touches 156 distinct experts per
+layer instead of 216 (busiest shard 41 instead of 57), the step drops from 145 to 134 ms, and the drafts
+are accepted more often (2.12 of 3 instead of 1.62): **623 tok/s** for one 4-GPU replica, i.e. task-grouped
+batches are worth more than any single kernel. Two replicas run independently (measured earlier: no
+interference), so the 8-GPU box gives ~1,050 tok/s on mixed prompts and ~1,250 on same-task batches.
 
 GPU time per token on the pipeline: FP8 dense 6.3 ms, FP4 experts 5.0 ms, the rest ~8 ms (attention,
 indexer top-k, small fused kernels). Prefill of a 1,413-token prompt: 4.8 s (296 tok/s). Load: ~70 s with
