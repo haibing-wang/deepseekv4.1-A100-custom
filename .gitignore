@@ -18,3 +18,4 @@ results/sweep*.log
 *.safetensors
 # scratch
 /tmp/
+dsv41/cpu/.*.so

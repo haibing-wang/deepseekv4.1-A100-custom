@@ -20,9 +20,11 @@ def main():
     ap.add_argument("--thinking", action="store_true", help="thinking mode (reasoning before the answer)")
     ap.add_argument("--no-graphs", action="store_true")
     ap.add_argument("--offload-experts", nargs="?", const="cpu", default=False, choices=["gpu", "cpu"], help="single-GPU mode: experts in host RAM; 'cpu' computes them on the CPU (default), 'gpu' streams them over PCIe")
+    ap.add_argument("--hot-experts", type=int, default=0, help="cpu offload mode: experts per layer kept on the GPU (by usage stats)")
+    ap.add_argument("--hot-stats", default="", help="route stats .pt used to pick the hot experts (default: results/route_stats.pt)")
     a = ap.parse_args()
     kw = dict(devices=[int(d) for d in a.devices.split(",")], max_seq_len=a.max_seq_len, budgets=parse_budgets(a.budgets),
-              use_graphs=not a.no_graphs, thinking_mode="thinking" if a.thinking else "chat", offload_experts=a.offload_experts)
+              use_graphs=not a.no_graphs, thinking_mode="thinking" if a.thinking else "chat", offload_experts=a.offload_experts, hot_experts=a.hot_experts, route_stats=a.hot_stats)
     eng = Engine(a.ckpt, **kw) if a.ckpt else Engine(**kw)
     print("DeepSeek-V4.1-Flash on A100. /clear /system <text> /exit", flush=True)
     messages: list[dict] = []

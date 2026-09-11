@@ -120,6 +120,10 @@ This is the `--offload-experts` mode. It has two variants:
   10 KB activation and the 20 KB MoE output cross PCIe per layer; the GPU runs attention, the dense
   projections and the shared expert (overlapped with the CPU) inside CUDA graphs. Measured on this box
   (2× Xeon Silver 4410Y, DDR5-4000 ×16 channels): **12.2 tok/s** on one A100, CPU experts 57 ms/token.
+- `--offload-experts cpu --hot-experts 64`: hybrid. The 64 most used experts of each layer (from a
+  routing profile, `--route-stats` / `results/route_stats.pt`; on this text the top 20% of experts take
+  82% of the hits) also live on the GPU and are computed there together with the shared expert while the
+  CPU computes the cold ones; the two partial sums are added. Uses ~49 GB more GPU memory for 64/layer.
 - `--offload-experts gpu`: the experts are DMA'd from pinned RAM into a GPU staging buffer and computed on
   the GPU. 4.5 GB per token over PCIe 4.0 x16 (25 GB/s measured) → **2.3 tok/s**. Kept for reference.
 

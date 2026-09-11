@@ -281,6 +281,10 @@ class OffloadDecodeRuntime(DecodeRuntime):
         self.prof = None  # set to a defaultdict(float) to collect per-stage seconds
         self.y_gpu = torch.zeros(1, dim, dtype=torch.float32, device=d)
         self.y_shared = torch.zeros(1, dim, dtype=torch.float32, device=d)
+        topk = self.cfg["n_activated_experts"]
+        self.slot_ids = torch.zeros(topk, dtype=torch.int32, device=d)
+        self.slot_w = torch.zeros(topk, dtype=torch.float32, device=d)
+        self.n_cold = 0
 
     # ---- the two halves of a layer, on static buffers
     def part1(self, blk: Block):
@@ -306,8 +310,13 @@ class OffloadDecodeRuntime(DecodeRuntime):
         self.gate_idx.copy_(idx)
 
     def part2_cpu_shared(self, blk: Block):
-        """GPU work that overlaps the CPU expert computation: the shared expert."""
-        self.y_shared.copy_(blk.ffn.shared_expert(self.x_buf))
+        """GPU work that overlaps the CPU expert computation: the shared expert and the hot experts."""
+        moe = blk.ffn
+        y = moe.shared_expert(self.x_buf)
+        if moe.hot:
+            xq = fake_quant_fp8(self.x_buf, 32)
+            y = y + moe.hot_experts_gpu(xq, self.slot_ids, self.slot_w)
+        self.y_shared.copy_(y)
 
     def part2_cpu_post(self, blk: Block):
         moe = blk.ffn
@@ -316,14 +325,26 @@ class OffloadDecodeRuntime(DecodeRuntime):
         self.h_buf.copy_(h)
         self.pre_buf.copy_(self.ffn_pre)
 
-    def _cpu_experts(self, blk: Block):
+    def _route(self, blk: Block):
+        """After part1: read the gate result, fill the hot-slot buffers (H2D) and return the cold experts."""
         moe = blk.ffn
         xq = fake_quant_fp8(self.x_buf, 32)
         moe.x_host.copy_(xq.view(-1))  # sync: waits for part1 on the GPU
         ids = self.gate_idx.flatten().tolist()
         wts = self.gate_w.flatten().tolist()
-        y = moe.host.forward(moe.x_host, ids, wts, float(moe.swiglu_limit))
-        moe.y_host.copy_(y)
+        gs, gw, cid, cw = moe.split_hot(ids, wts)
+        if gs is not None:
+            self.slot_ids.copy_(torch.tensor(gs, dtype=torch.int32), non_blocking=True)
+            self.slot_w.copy_(torch.tensor(gw, dtype=torch.float32), non_blocking=True)
+        return cid, cw
+
+    def _cpu_experts(self, blk: Block, cid, cw):
+        moe = blk.ffn
+        if cid:
+            y = moe.host.forward(moe.x_host, cid, cw, float(moe.swiglu_limit))
+            moe.y_host.copy_(y)
+        else:
+            moe.y_host.zero_()
         self.y_gpu.copy_(moe.y_host, non_blocking=True)
 
     def part2(self, blk: Block):
@@ -360,9 +381,9 @@ class OffloadDecodeRuntime(DecodeRuntime):
                     for _ in range(2):
                         self.part1(blk)
                         if self.cpu_experts:
+                            cid, cw = self._route(blk)
                             self.part2_cpu_shared(blk)
-                            torch.cuda.synchronize(self.d)
-                            self._cpu_experts(blk)
+                            self._cpu_experts(blk, cid, cw)
                             self.part2_cpu_post(blk)
                         else:
                             self._gather(blk.ffn)
@@ -412,15 +433,17 @@ class OffloadDecodeRuntime(DecodeRuntime):
             else:
                 self.part1(blk)
             if self.cpu_experts:
+                cid, cw = self._route(blk)  # syncs on part1
+                self.n_cold += len(cid)
+                if prof is not None:
+                    t1 = time.perf_counter(); prof["gpu dense+attn (sync)"] += t1 - t0; t0 = t1
                 if self.use_graphs:
-                    self.g2[lid].replay()  # shared expert on the GPU, overlapping the CPU experts
+                    self.g2[lid].replay()  # shared + hot experts on the GPU, overlapping the CPU cold experts
                 else:
                     self.part2_cpu_shared(blk)
+                self._cpu_experts(blk, cid, cw)
                 if prof is not None:
-                    torch.cuda.synchronize(d); t1 = time.perf_counter(); prof["gpu dense+attn+shared"] += t1 - t0; t0 = t1
-                self._cpu_experts(blk)
-                if prof is not None:
-                    t1 = time.perf_counter(); prof["cpu experts (+sync)"] += t1 - t0; t0 = t1
+                    t1 = time.perf_counter(); prof["cpu cold experts"] += t1 - t0; t0 = t1
                 if self.use_graphs:
                     self.g3[lid].replay()
                 else:

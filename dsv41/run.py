@@ -36,6 +36,9 @@ def main():
     ap.add_argument("--profile", action="store_true", help="per-component timing of the decode steps")
     ap.add_argument("--decode", default="graph", choices=["eager", "static", "graph"], help="decode path")
     ap.add_argument("--kernel-profile", action="store_true", help="after generation, profile 8 decode steps and list the top CUDA kernels")
+    ap.add_argument("--route-stats", default="", help="write per-layer expert hit counts (decode only) to this .pt file")
+    ap.add_argument("--hot-experts", type=int, default=0, help="cpu offload mode: experts per layer kept on the GPU (by usage stats)")
+    ap.add_argument("--hot-stats", default="", help="route stats .pt used to pick the hot experts (default: results/route_stats.pt)")
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -43,7 +46,7 @@ def main():
     devices = [int(d) for d in a.devices.split(",")]
     budgets = {int(k): float(v) for k, v in (kv.split(":") for kv in a.budgets.split(",") if kv)} or None
     model = load_model(a.ckpt, devices, max_seq_len=a.max_seq_len, budgets_gb=budgets, n_layers=a.n_layers,
-                       engram=not a.no_engram, tokenizer=tok, offload_experts=a.offload_experts)
+                       engram=not a.no_engram, tokenizer=tok, offload_experts=a.offload_experts, hot_experts=a.hot_experts, route_stats=a.hot_stats)
 
     if a.chat:
         sys.path.insert(0, os.path.join(a.ckpt, "encoding"))
@@ -80,6 +83,9 @@ def main():
         import dsv41.model as M
         M.PROF = defaultdict(float)
     nxt = sample(logits, a.temperature)
+    if a.route_stats:
+        import dsv41.model as M
+        M.ROUTE_STATS = {}
     t1 = time.time()
     for _ in range(a.max_new_tokens):
         out.append(int(nxt.item()))
@@ -95,6 +101,10 @@ def main():
     torch.cuda.synchronize()
     t_dec = time.time() - t1
     print(f"\n\nprefill {len(ids)} tok in {t_prefill:.2f}s ({len(ids)/t_prefill:.1f} tok/s); decode {len(out)} tok in {t_dec:.2f}s ({len(out)/max(t_dec,1e-9):.2f} tok/s)")
+    if a.route_stats:
+        import dsv41.model as M
+        torch.save({k: v for k, v in M.ROUTE_STATS.items()}, a.route_stats)
+        print(f"[route stats for {len(out)} decode tokens saved to {a.route_stats}]")
     if a.kernel_profile and rt is not None:
         from torch.profiler import ProfilerActivity, profile
         with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
@@ -112,7 +122,7 @@ def main():
         for i in range(8):
             rt.step(out[-1], pos + i)
         tot = sum(rt.prof.values())
-        print("[offload decode stages, per token]")
+        print(f"[offload decode stages, per token; cold experts per token: {rt.n_cold / max(len(out) + 8, 1):.1f} of {40 * 6}]")
         for k, v in sorted(rt.prof.items(), key=lambda kv: -kv[1]):
             print(f"  {k:26s} {v / 8 * 1000:7.1f} ms  ({v / tot * 100:4.1f}%)")
     if a.profile:

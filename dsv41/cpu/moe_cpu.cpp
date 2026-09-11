@@ -11,18 +11,43 @@
 #include <sys/mman.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 static int g_threads = 24, g_cores_per_node = 12, g_nodes = 2;
+static int g_cpus[256];
+static cpu_set_t g_master_mask;  // the caller's affinity, restored after every entry point
+static int g_master_saved = 0;
+static void save_master() { if (!g_master_saved) { sched_getaffinity(0, sizeof(g_master_mask), &g_master_mask); g_master_saved = 1; } }
+static void restore_master() { if (g_master_saved) sched_setaffinity(0, sizeof(g_master_mask), &g_master_mask); }
+// pin the calling OpenMP thread to its CPU. Threads torch's shared runtime re-creates inherit the
+// master's mask, so every parallel region re-pins (one cheap syscall per thread per region).
+static inline void pin_self() {
+    int t = omp_get_thread_num();
+    cpu_set_t s; CPU_ZERO(&s); CPU_SET(g_cpus[t], &s);
+    sched_setaffinity(0, sizeof(s), &s);
+}
 
 extern "C" void cpumoe_init(int threads, int cores_per_node) {
+    save_master();
     g_threads = threads; g_cores_per_node = cores_per_node; g_nodes = (threads + cores_per_node - 1) / cores_per_node;
-    omp_set_num_threads(threads);
+    for (int t = 0; t < threads; ++t) g_cpus[t] = t;
+    omp_set_dynamic(0); omp_set_num_threads(threads);
+}
+
+extern "C" int cpumoe_init_list(const int* cpus, int n, int cores_per_node) {
+    save_master();
+    g_threads = n; g_cores_per_node = cores_per_node; g_nodes = (n + cores_per_node - 1) / cores_per_node;
+    for (int t = 0; t < n; ++t) g_cpus[t] = cpus[t];
+    omp_set_dynamic(0); omp_set_num_threads(n);
+    int got = 0;
 #pragma omp parallel
     {
-        int t = omp_get_thread_num();
-        cpu_set_t s; CPU_ZERO(&s); CPU_SET(t, &s);
-        sched_setaffinity(0, sizeof(s), &s);
+        pin_self();
+#pragma omp master
+        got = omp_get_num_threads();
     }
+    restore_master();
+    return got;  // number of threads actually provided by the runtime
 }
 
 extern "C" void* cpumoe_alloc(size_t bytes) {
@@ -37,24 +62,29 @@ static inline int row_node(int n, int N) { return (int)((long)n * g_nodes / N); 
 
 // copy one expert matrix [N, row_bytes] into dst (first touch by the node that will read each row)
 extern "C" void cpumoe_load_rows(uint8_t* dst, const uint8_t* src, int N, int row_bytes) {
+    omp_set_dynamic(0); omp_set_num_threads(g_threads);
 #pragma omp parallel
     {
+        pin_self();
         int t = omp_get_thread_num(), node = t / g_cores_per_node, tin = t % g_cores_per_node;
         int n0 = (int)((long)N * node / g_nodes), n1 = (int)((long)N * (node + 1) / g_nodes);
         int per = (n1 - n0 + g_cores_per_node - 1) / g_cores_per_node;
         int a = n0 + tin * per, b = a + per < n1 ? a + per : n1;
         if (a < b) memcpy(dst + (size_t)a * row_bytes, src + (size_t)a * row_bytes, (size_t)(b - a) * row_bytes);
     }
+    restore_master();
 }
 
 // read bandwidth: node = -1 -> every thread reads its own node's half; node = k -> only node k's threads read node k's half
 extern "C" double cpumoe_bw_test(const uint8_t* p, size_t bytes, int iters, int node_sel) {
+    omp_set_dynamic(0); omp_set_num_threads(g_threads);
     double best = 0;
     static volatile long sinks[64];
     for (int it = 0; it < iters; ++it) {
         double t0 = omp_get_wtime();
 #pragma omp parallel
         {
+            pin_self();
             int t = omp_get_thread_num(), node = t / g_cores_per_node, tin = t % g_cores_per_node;
             if (node_sel < 0 || node == node_sel) {
                 size_t b0 = bytes * node / g_nodes, b1 = bytes * (node + 1) / g_nodes;
@@ -70,6 +100,7 @@ extern "C" double cpumoe_bw_test(const uint8_t* p, size_t bytes, int iters, int 
         double gbs = read / dt / 1e9;
         if (gbs > best) best = gbs;
     }
+    restore_master();
     return best;
 }
 
@@ -114,6 +145,7 @@ static inline float dot_row(const uint8_t* __restrict w, const uint8_t* __restri
 }
 
 static inline float bf16_to_f(uint16_t b);
+static inline float u32_as_f32(uint32_t u);
 // ---------------------------------------------------------------- INT8 VNNI path (W4A8)
 // activations: per-32 symmetric int8 (u8 = q + 128 for vpdpbusd), weights: E2M1 -> 2*value as int8 via vpermb
 alignas(64) static int8_t LUT_S8[64];
@@ -158,6 +190,38 @@ static inline float dot_row_vnni(const uint8_t* __restrict w, const uint8_t* __r
         acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v), sv, acc);
     }
     return _mm512_reduce_add_ps(acc);
+}
+
+// two rows (w0, w1) against the same activation; returns both dot products
+static inline void dot_row_vnni2(const uint8_t* __restrict w0, const uint8_t* __restrict s0, const uint8_t* __restrict w1, const uint8_t* __restrict s1,
+                                 const uint8_t* __restrict xu, const float* __restrict sx, int K, float* r0, float* r1) {
+    const __m512i lut = _mm512_load_si512(LUT_S8);
+    const __m512i m4 = _mm512_set1_epi16(0x0F);
+    const __m512i ones = _mm512_set1_epi8(1);
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    for (int c = 0; c < K; c += 64) {
+        __m512i xv = _mm512_loadu_si512(xu + c);
+        int cb = c / 32;
+        float sxa = sx[cb], sxb = sx[cb + 1];
+        // row 0
+        __m512i b16 = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*)(w0 + c / 2)));
+        __m512i codes = _mm512_or_si512(_mm512_and_si512(b16, m4), _mm512_slli_epi16(_mm512_srli_epi16(b16, 4), 8));
+        __m512i ws = _mm512_permutexvar_epi8(codes, lut);
+        __m512i v = _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xv, ws), _mm512_slli_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, ws), 7));
+        float sa = (s0[cb] == 0) ? 0.f : u32_as_f32((uint32_t)s0[cb] << 23) * sxa;
+        float sb = (s0[cb + 1] == 0) ? 0.f : u32_as_f32((uint32_t)s0[cb + 1] << 23) * sxb;
+        acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v), _mm512_mask_blend_ps(0xFF00, _mm512_set1_ps(sa), _mm512_set1_ps(sb)), acc0);
+        // row 1
+        b16 = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*)(w1 + c / 2)));
+        codes = _mm512_or_si512(_mm512_and_si512(b16, m4), _mm512_slli_epi16(_mm512_srli_epi16(b16, 4), 8));
+        ws = _mm512_permutexvar_epi8(codes, lut);
+        v = _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xv, ws), _mm512_slli_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, ws), 7));
+        sa = (s1[cb] == 0) ? 0.f : u32_as_f32((uint32_t)s1[cb] << 23) * sxa;
+        sb = (s1[cb + 1] == 0) ? 0.f : u32_as_f32((uint32_t)s1[cb + 1] << 23) * sxb;
+        acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v), _mm512_mask_blend_ps(0xFF00, _mm512_set1_ps(sa), _mm512_set1_ps(sb)), acc1);
+    }
+    *r0 = _mm512_reduce_add_ps(acc0);
+    *r1 = _mm512_reduce_add_ps(acc1);
 }
 
 static inline float bf16_to_f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
@@ -212,6 +276,7 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
                               float* gu, uint16_t* h) {
     static int lut_ready = 0;
     if (!lut_ready) { init_lut(); init_lut_s8(); lut_ready = 1; }
+    omp_set_dynamic(0); omp_set_num_threads(g_threads);  // torch resets the shared OpenMP runtime's thread count
     const int N13 = 2 * inter;
     static uint8_t xu[8192]; static float sx[256];            // quantized x
     static uint8_t hu[16 * 4096]; static float sh[16 * 128];  // quantized h per expert
@@ -219,30 +284,55 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
     // stage 1: gu[e][n] = x . w13[e][n]
 #pragma omp parallel
     {
+        pin_self();
         int t = omp_get_thread_num(), node = t / g_cores_per_node, tin = t % g_cores_per_node;
         int n0 = (int)((long)N13 * node / g_nodes), n1 = (int)((long)N13 * (node + 1) / g_nodes);
         int per = (n1 - n0 + g_cores_per_node - 1) / g_cores_per_node;
         int a = n0 + tin * per, b = a + per < n1 ? a + per : n1;
-        for (int e = 0; e < E; ++e)
-            for (int n = a; n < b; ++n)
+        for (int e = 0; e < E; ++e) {
+            int n = a;
+            if (g_int8)
+                for (; n + 1 < b; n += 2)
+                    dot_row_vnni2(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), w13[e] + (size_t)(n + 1) * (K / 2), s13[e] + (size_t)(n + 1) * (K / 32),
+                                  xu, sx, K, &gu[(size_t)e * N13 + n], &gu[(size_t)e * N13 + n + 1]);
+            for (; n < b; ++n)
                 gu[(size_t)e * N13 + n] = g_int8
                     ? dot_row_vnni(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), xu, sx, K)
                     : dot_row(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), x, K);
+        }
     }
     // stage 2: h[e] = fp8(bf16(wt * silu(gate) * up)) (+ int8 quantization for the w2 GEMV)
 #pragma omp parallel for
     for (int e = 0; e < E; ++e) {
+        pin_self();
         swiglu_quant_row(gu + (size_t)e * N13, inter, wts[e], limit, h + (size_t)e * inter);
         if (g_int8) quant_x_u8(h + (size_t)e * inter, inter, hu + (size_t)e * inter, sh + (size_t)e * (inter / 32));
+    }
+    if (getenv("DSV41_CPU_DEBUG")) {
+        double hs = 0; for (int i = 0; i < E * inter; ++i) hs += fabs(bf16_to_f(h[i]));
+        double gs = 0; for (int i = 0; i < E * N13; ++i) gs += fabs(gu[i]);
+        fprintf(stderr, "[cpumoe] threads=%d E=%d wts0=%g sum|gu|=%g sum|h|=%g limit=%g\n", g_threads, E, wts[0], gs, hs, limit);
     }
     // stage 3: out[n] = sum_e h[e] . w2[e][n]
 #pragma omp parallel
     {
+        pin_self();
         int t = omp_get_thread_num(), node = t / g_cores_per_node, tin = t % g_cores_per_node;
         int n0 = (int)((long)dim * node / g_nodes), n1 = (int)((long)dim * (node + 1) / g_nodes);
         int per = (n1 - n0 + g_cores_per_node - 1) / g_cores_per_node;
         int a = n0 + tin * per, b = a + per < n1 ? a + per : n1;
-        for (int n = a; n < b; ++n) {
+        int n = a;
+        if (g_int8)
+            for (; n + 1 < b; n += 2) {
+                float acc0 = 0.f, acc1 = 0.f, r0, r1;
+                for (int e = 0; e < E; ++e) {
+                    dot_row_vnni2(w2[e] + (size_t)n * (inter / 2), s2[e] + (size_t)n * (inter / 32), w2[e] + (size_t)(n + 1) * (inter / 2), s2[e] + (size_t)(n + 1) * (inter / 32),
+                                  hu + (size_t)e * inter, sh + (size_t)e * (inter / 32), inter, &r0, &r1);
+                    acc0 += r0; acc1 += r1;
+                }
+                out[n] = acc0; out[n + 1] = acc1;
+            }
+        for (; n < b; ++n) {
             float acc = 0.f;
             for (int e = 0; e < E; ++e)
                 acc += g_int8
@@ -251,5 +341,42 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
             out[n] = acc;
         }
     }
+    restore_master();
     return 0;
+}
+
+// Copy one whole layer (E experts) into the NUMA-split host buffers in a single parallel region.
+// dst layouts: w13 [E][2*inter][dim/2] (w1 rows then w3 rows), s13 [E][2*inter][dim/32], w2 [E][dim][inter/2], s2 [E][dim][inter/32].
+// Node 0 threads copy the rows their node will read (w1 half of w13, first half of w2), node 1 the rest;
+// experts are dealt round-robin to the threads of each node so the page faults on the source mmap run in parallel.
+extern "C" void cpumoe_load_layer(uint8_t* w13, uint8_t* s13, uint8_t* w2, uint8_t* s2,
+                                  const uint8_t* const* sw1, const uint8_t* const* sw3, const uint8_t* const* ss1, const uint8_t* const* ss3,
+                                  const uint8_t* const* sw2, const uint8_t* const* ss2, int E, int inter, int dim) {
+    omp_set_dynamic(0); omp_set_num_threads(g_threads);
+    const size_t rb13 = dim / 2, rs13 = dim / 32, rb2 = inter / 2, rs2 = inter / 32;
+    const size_t b13 = (size_t)2 * inter * rb13, bs13 = (size_t)2 * inter * rs13, b2 = (size_t)dim * rb2, bs2 = (size_t)dim * rs2;
+    const int N13 = 2 * inter;
+#pragma omp parallel
+    {
+        pin_self();
+        int t = omp_get_thread_num(), node = t / g_cores_per_node, tin = t % g_cores_per_node;
+        // row ranges owned by this node (same split as the compute)
+        int a13 = (int)((long)N13 * node / g_nodes), z13 = (int)((long)N13 * (node + 1) / g_nodes);
+        int a2 = (int)((long)dim * node / g_nodes), z2 = (int)((long)dim * (node + 1) / g_nodes);
+        for (int e = tin; e < E; e += g_cores_per_node) {
+            // w13 / s13: rows [a13, z13) of the concatenated [w1; w3]
+            for (int r = a13; r < z13;) {
+                int seg_end = r < inter ? inter : N13;
+                if (seg_end > z13) seg_end = z13;
+                const uint8_t* srcw = (r < inter) ? sw1[e] + (size_t)r * rb13 : sw3[e] + (size_t)(r - inter) * rb13;
+                const uint8_t* srcs = (r < inter) ? ss1[e] + (size_t)r * rs13 : ss3[e] + (size_t)(r - inter) * rs13;
+                memcpy(w13 + (size_t)e * b13 + (size_t)r * rb13, srcw, (size_t)(seg_end - r) * rb13);
+                memcpy(s13 + (size_t)e * bs13 + (size_t)r * rs13, srcs, (size_t)(seg_end - r) * rs13);
+                r = seg_end;
+            }
+            memcpy(w2 + (size_t)e * b2 + (size_t)a2 * rb2, sw2[e] + (size_t)a2 * rb2, (size_t)(z2 - a2) * rb2);
+            memcpy(s2 + (size_t)e * bs2 + (size_t)a2 * rs2, ss2[e] + (size_t)a2 * rs2, (size_t)(z2 - a2) * rs2);
+        }
+    }
+    restore_master();
 }

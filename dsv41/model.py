@@ -37,6 +37,7 @@ class Args:
 
 
 PROF: dict[str, float] | None = None  # set to a dict to collect per-component seconds (with syncs)
+ROUTE_STATS: dict | None = None  # layer -> expert hit counts
 
 
 def _tick(key: str, t0: float) -> float:
@@ -344,6 +345,7 @@ class Attention:
 # --------------------------------------------------------------------------- MoE
 class MoE:
     def __init__(self, args: Args, layer_id: int, w: dict, device):
+        self.layer_id = layer_id
         self.dim = args.dim
         self.n_experts = args.n_routed_experts
         self.topk = args.n_activated_experts
@@ -361,9 +363,11 @@ class MoE:
         self.inter = self.w2.shape[2] * 2
         self.offload = bool(w.get("experts.offload", False))  # experts in host RAM (streamed to the GPU, or computed on the CPU)
         self.host = w.get("experts.host")  # HostExperts: compute the selected experts on the CPU
+        self.hot = w.get("experts.hot")  # GPU-resident subset (slot map) computed on the GPU, overlapping the CPU
         if self.host is not None:
             self.x_host = torch.empty(self.dim, dtype=torch.bfloat16, pin_memory=True)
             self.y_host = torch.empty(self.dim, dtype=torch.float32, pin_memory=True)
+            self.y_host.zero_()
         # shared expert: one GEMM for gate and up (rows [w1; w3])
         self.sh_w13 = torch.cat([w["ffn.shared_experts.w1.weight"], w["ffn.shared_experts.w3.weight"]], dim=0).contiguous()
         self.sh_w2 = w["ffn.shared_experts.w2.weight"]
@@ -434,14 +438,48 @@ class MoE:
         y2 = cukern.fp4_gemv_pairs(hq, b["w2"][:n_pairs], b["s2"][:n_pairs], pair_rows.to(torch.int32), local, ones, n_pairs)
         return y2.view(n_tok, self.topk, self.dim).sum(dim=1)
 
+    def split_hot(self, ids: list[int], wts: list[float]):
+        """(gpu slot ids [6], gpu weights [6], cold ids, cold weights): cold experts map to the zero dummy slot."""
+        if not self.hot:
+            return None, None, ids, wts
+        slot, dummy = self.hot["slot"], self.hot["dummy"]
+        gs, gw, cid, cw = [], [], [], []
+        for e, w in zip(ids, wts):
+            k = slot.get(e)
+            if k is None:
+                gs.append(dummy); gw.append(0.0); cid.append(e); cw.append(w)
+            else:
+                gs.append(k); gw.append(w)
+        return gs, gw, cid, cw
+
+    def hot_experts_gpu(self, xq, slot_ids, slot_w):
+        """GPU GEMV over the hot slots (static shapes; cold pairs hit the dummy slot with weight 0)."""
+        n = slot_ids.numel()
+        hot = self.hot
+        local = torch.arange(n, device=xq.device, dtype=torch.int32)
+        tok0 = torch.zeros(n, device=xq.device, dtype=torch.int32)
+        ones = torch.ones(n, device=xq.device)
+        gu = cukern.fp4_gemv_pairs(xq.view(1, -1), hot["w13"], hot["s13"], tok0, slot_ids, ones, n)
+        hq = swiglu_quant(gu, slot_w, self.inter, self.swiglu_limit)
+        y2 = cukern.fp4_gemv_pairs(hq, hot["w2"], hot["s2"], local, slot_ids, ones, n)
+        return y2.sum(dim=0, keepdim=True)
+
     def _decode_cpu(self, xq, indices, weights):
-        """Selected experts computed on the CPU from RAM; only x (10 KB) and y (20 KB) cross PCIe."""
+        """Selected experts on the CPU (cold) and on the GPU (hot cache); only x/y cross PCIe."""
         self.x_host.copy_(xq.view(-1))  # sync D2H
         ids = indices.flatten().tolist()
         wts = weights.flatten().tolist()
-        y = self.host.forward(self.x_host, ids, wts, float(self.swiglu_limit))
-        self.y_host.copy_(y)
-        return self.y_host.to(xq.device, non_blocking=True).view(1, self.dim)
+        gs, gw, cid, cw = self.split_hot(ids, wts)
+        y_gpu = None
+        if gs is not None:
+            y_gpu = self.hot_experts_gpu(xq, torch.tensor(gs, device=xq.device, dtype=torch.int32), torch.tensor(gw, device=xq.device))
+        if cid:
+            y = self.host.forward(self.x_host, cid, cw, float(self.swiglu_limit))
+            self.y_host.copy_(y)
+            y_c = self.y_host.to(xq.device, non_blocking=True).view(1, self.dim)
+        else:
+            y_c = torch.zeros(1, self.dim, device=xq.device)
+        return y_c if y_gpu is None else y_c + y_gpu
 
     def _prefill_offload(self, xq, indices, weights, n_tok, n_pairs, tok, pair_rows, ones, chunk: int = 64):
         """Stream all experts through the GPU in chunks; each pair is computed in the chunk of its expert."""
@@ -476,6 +514,9 @@ class MoE:
         x = x.reshape(-1, self.dim)
         n_tok = x.size(0)
         weights, indices = self.gate(x)
+        if ROUTE_STATS is not None:  # expert usage histogram per layer (for the hot-expert cache design)
+            ROUTE_STATS.setdefault(self.layer_id, torch.zeros(self.n_experts, dtype=torch.int64)).add_(
+                torch.bincount(indices.flatten().cpu(), minlength=self.n_experts))
         # routed experts: pairs (token, expert)
         n_pairs = n_tok * self.topk
         tok, pair_rows, ones = self._pair_tables(n_tok, x.device)

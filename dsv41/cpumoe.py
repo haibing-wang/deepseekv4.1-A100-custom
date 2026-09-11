@@ -28,9 +28,19 @@ def lib():
         _lib.cpumoe_load_rows.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         _lib.cpumoe_forward.restype = ctypes.c_int
         _lib.cpumoe_set_int8(int(os.environ.get("DSV41_CPU_INT8", "1")))
-        threads = int(os.environ.get("DSV41_CPU_THREADS", "24"))
-        cores_per_node = int(os.environ.get("DSV41_CORES_PER_NODE", "12"))
-        _lib.cpumoe_init(threads, cores_per_node)
+        cpus = os.environ.get("DSV41_CPU_LIST")  # e.g. "0-11,24-35,12-23,36-47" (node 0 first, then node 1)
+        if cpus:
+            lst = []
+            for part in cpus.split(","):
+                a, _, b = part.partition("-")
+                lst.extend(range(int(a), int(b or a) + 1))
+            arr = (ctypes.c_int * len(lst))(*lst)
+            got = _lib.cpumoe_init_list(arr, len(lst), int(os.environ.get("DSV41_CORES_PER_NODE", str(len(lst) // 2))))
+            assert got == len(lst), f"OpenMP gave {got} threads, wanted {len(lst)} (set OMP_THREAD_LIMIT / check cpu affinity)"
+        else:
+            threads = int(os.environ.get("DSV41_CPU_THREADS", "24"))
+            cores_per_node = int(os.environ.get("DSV41_CORES_PER_NODE", "12"))
+            _lib.cpumoe_init(threads, cores_per_node)
     return _lib
 
 
@@ -77,6 +87,18 @@ class HostExperts:
         E = self.E
         return (v(self.w13, E * self.bytes13, (E, self.n13, self.rb13)), v(self.s13, E * self.bytes_s13, (E, self.n13, self.rs13)),
                 v(self.w2, E * self.bytes2, (E, self.dim, self.rb2)), v(self.s2, E * self.bytes_s2, (E, self.dim, self.rs2)))
+
+    def load_layer(self, w1: list, w3: list, s1: list, s3: list, w2: list, s2: list):
+        """All experts of the layer at once (lists of E contiguous CPU tensors, e.g. mmap views of the checkpoint)."""
+        L = lib()
+        E = self.E
+        assert len(w1) == E
+        P = ctypes.c_void_p * E
+        ptrs = [P(*[t.contiguous().data_ptr() for t in lst]) for lst in (w1, w3, s1, s3, w2, s2)]
+        self._keep = (w1, w3, s1, s3, w2, s2)  # keep the source tensors alive during the copy
+        L.cpumoe_load_layer(ctypes.c_void_p(self.w13), ctypes.c_void_p(self.s13), ctypes.c_void_p(self.w2), ctypes.c_void_p(self.s2),
+                            *ptrs, E, self.inter, self.dim)
+        self._keep = None
 
     def forward(self, x_bf16: torch.Tensor, expert_ids: list[int], weights: list[float], limit: float) -> torch.Tensor:
         """x_bf16: CPU bf16 [K]; returns fp32 [dim] = sum_e w_e * expert_e(x)."""

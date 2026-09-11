@@ -12,6 +12,7 @@ from .model import Args, Block, Transformer
 from .quant import dequant_fp8_block
 from .stio import Checkpoint
 
+HOT_EXPERTS: dict[int, list[int]] = {}  # layer -> expert ids to keep on the GPU (cpu offload mode)
 LAYER_GB = 7.1  # experts (6.72 GiB fp4 + scales) + dense bf16 (0.34 GiB) per layer
 LAYER_GB_OFFLOAD = 0.4  # dense bf16 only; experts live in host RAM
 RESERVE_GB = 2.0  # activations / temporaries per device
@@ -30,6 +31,8 @@ def plan_placement(n_layers: int, devices: list[int], budgets_gb: dict[int, floa
             free[d] = f / 2**30
     placement: list[torch.device] = []
     layer_gb = LAYER_GB_OFFLOAD if offload else LAYER_GB
+    if offload and HOT_EXPERTS:
+        layer_gb += 18.8e6 * (max(len(v) for v in HOT_EXPERTS.values()) + 1) / 2**30
     reserve = RESERVE_GB_OFFLOAD if offload else RESERVE_GB
     for d in devices:
         n = int(max(0, free[d] - reserve - (2.6 if d == devices[0] else 0)) // layer_gb)
@@ -70,12 +73,23 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False) -> dict:
     if offload == "cpu":  # experts in NUMA-split host RAM, computed on the CPU (dsv41/cpu/moe_cpu.cpp)
         from .cpumoe import HostExperts
         host = HostExperts(E, inter, dim)
+        cols = {k: [] for k in ("w1.weight", "w3.weight", "w1.scale", "w3.scale", "w2.weight", "w2.scale")}
         for e in e_names:
             q = f"{p}ffn.experts.{e}."
-            host.load_expert(e, ckpt.get(q + "w1.weight"), ckpt.get(q + "w3.weight"), ckpt.get(q + "w1.scale"), ckpt.get(q + "w3.scale"),
-                             ckpt.get(q + "w2.weight"), ckpt.get(q + "w2.scale"))
+            for k in cols:
+                cols[k].append(ckpt.get(q + k).view(torch.uint8))
+        host.load_layer(cols["w1.weight"], cols["w3.weight"], cols["w1.scale"], cols["w3.scale"], cols["w2.weight"], cols["w2.scale"])
         w13, s13, w2, s2 = host.views()
         w.update({"experts.w13": w13, "experts.s13": s13, "experts.w2": w2, "experts.s2": s2, "experts.offload": True, "experts.host": host})
+        hot = HOT_EXPERTS.get(i) if HOT_EXPERTS else None
+        if hot:
+            # GPU-resident copies of the most used experts of this layer; slot len(hot) is a zero dummy
+            n = len(hot)
+            g = lambda src: torch.zeros(n + 1, *src.shape[1:], dtype=torch.uint8, device=device)
+            hw13, hs13, hw2, hs2 = g(w13), g(s13), g(w2), g(s2)
+            for slot, e in enumerate(hot):
+                hw13[slot].copy_(w13[e]); hs13[slot].copy_(s13[e]); hw2[slot].copy_(w2[e]); hs2[slot].copy_(s2[e])
+            w["experts.hot"] = {"w13": hw13, "s13": hs13, "w2": hw2, "s2": hs2, "slot": {int(e): k for k, e in enumerate(hot)}, "dummy": n}
         torch.cuda.synchronize(device)
         return w
     if offload:  # experts stay in page-locked host memory; the MoE streams the selected ones per token
@@ -99,10 +113,26 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False) -> dict:
     return w
 
 
+def choose_hot_experts(stats_path: str, per_layer: int, n_layers: int) -> dict[int, list[int]]:
+    """Top-`per_layer` experts of each layer by decode hit count (from --route-stats)."""
+    st = torch.load(stats_path)
+    return {l: st[l].topk(per_layer).indices.tolist() for l in range(n_layers) if l in st}
+
+
 def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max_batch: int = 1,
                budgets_gb: dict[int, float] | None = None, n_layers: int | None = None, engram: bool = True,
-               tokenizer=None, offload_experts=False) -> Transformer:
+               tokenizer=None, offload_experts=False, hot_experts: int = 0, route_stats: str = "") -> Transformer:
+    global HOT_EXPERTS
     cfg = json.load(open(os.path.join(ckpt_path, "inference", "config.json")))
+    if offload_experts == "cpu" and hot_experts > 0:
+        stats = route_stats or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results", "route_stats.pt")
+        if os.path.exists(stats):
+            HOT_EXPERTS = choose_hot_experts(stats, hot_experts, n_layers or cfg["n_layers"])
+        else:
+            HOT_EXPERTS = {l: list(range(hot_experts)) for l in range(n_layers or cfg["n_layers"])}
+        print(f"hot experts on GPU: {hot_experts}/layer ({'from ' + stats if os.path.exists(stats) else 'no stats: first N'})", flush=True)
+    else:
+        HOT_EXPERTS = {}
     args = Args(cfg, max_batch_size=max_batch, max_seq_len=max_seq_len)
     ckpt = Checkpoint(ckpt_path)
     n_layers = n_layers or cfg["n_layers"]
