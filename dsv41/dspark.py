@@ -35,8 +35,9 @@ class DSpark:
         self.blocks: list[Block] = []
         self.ws = []
         for i in range(cfg["n_mtp_layers"]):
-            w = load_layer(ckpt, n_layers + i, device, prefix=f"mtp.{i}.")
-            blk = Block(args, n_layers + i, w, device, shared)
+            lid = cfg["n_layers"] + i  # the DSpark blocks' own ids (window-only attention), independent of a truncated model
+            w = load_layer(ckpt, lid, device, prefix=f"mtp.{i}.")
+            blk = Block(args, lid, w, device, shared)
             blk.ffn.topk = cfg["dspark_n_activated_experts"]
             blk.ffn.n_experts = cfg["dspark_n_routed_experts"]
             self.blocks.append(blk)
@@ -121,3 +122,96 @@ class DSpark:
             out.append(int(logits[i].argmax()))
         conf = F.linear(torch.cat([x.float(), torch.stack(embeds).float()], dim=-1), self.conf_w).view(-1)
         return out[1:], conf
+
+
+# ---------------------------------------------------------------------------- batched (static-shape) draft
+from .fused import fake_quant_fp8 as _fq8, rope_dev_
+from .fused2 import gate_topk, hc_mix, hc_post2_, hc_pre_norm_quant2, hc_sinkhorn, kv_write, norm_quant, sattn2
+
+
+class DSparkRows(DSpark):
+    """Same computation as DSpark.draft, for S sequences at once on the runtime's fused kernels (rows = S x block).
+    The draft blocks' window rings hold kv(main_x) of the main positions (write_main_rows, per row: sequence + position)."""
+
+    def __init__(self, ckpt, args, device, embed, head, shared, n_layers, rt):
+        super().__init__(ckpt, args, device, embed, head, shared, n_layers)
+        self.rt = rt
+        self.S = args.max_batch_size  # sequence slots (the caches are sized by it)
+        for blk in self.blocks:
+            blk.attn.draft_kv = torch.zeros(self.S, self.block, args.head_dim, dtype=torch.bfloat16, device=device)
+
+    @torch.no_grad()
+    def write_main_rows(self, main_hidden: torch.Tensor, seq: torch.Tensor, pos: torch.Tensor):
+        """main_hidden [R, 3*dim] (rows of the main forward), seq / pos int64 [R] on the device."""
+        main_x = norm_quant(linear_fp8(main_hidden.to(self.device), self.main_proj), self.main_norm_w, self.eps)  # fp8-rounded for wkv
+        for blk in self.blocks:
+            A = blk.attn
+            from .w8 import linear_w
+            kv_write(linear_w(main_x, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, self.rd, A.eps, seq)
+
+    def _attention_rows(self, A, x, xq, seq_row, pos_row, pmax_row, plim_row, idx5):
+        """x, xq: [R, dim] (R = S * block draft rows); attends to the sequence's main ring (positions <= plim) and all
+        block drafts of the sequence (non-causal)."""
+        from .w8 import linear_w, oproj_a
+        R = x.shape[0]
+        qr = norm_quant(linear_w(xq, A.wq_a), A.q_norm_w, A.eps)
+        q = linear_w(qr, A.wq_b).view(R, 1, A.n_heads, A.head_dim)
+        rope_dev_(q, self.rd, A.cos, A.sin, pos_row)
+        kv = rmsnorm(linear_w(xq, A.wkv), A.kv_norm_w, A.eps).view(R, 1, -1).contiguous()
+        rope_dev_(kv, self.rd, A.cos, A.sin, pos_row)
+        kv = _fq8(kv, 32)
+        A.draft_kv[seq_row, self.slot_row] = kv[:, 0]
+        o = sattn2(q, A.window_kv_cache, A.draft_kv, idx5, pos_row, A.attn_sink, A.cos, A.sin, self.rd, A.softmax_scale, seq_row, pmax_row, plim=plim_row)
+        o = oproj_a(o.view(R, 1, A.n_groups, -1), A.wo_a, A.n_groups, A.o_lora_rank)
+        return linear_fp8(o, A.wo_b).view(R, -1)
+
+    @torch.no_grad()
+    def draft_rows(self, tokens: torch.Tensor, pos_last: torch.Tensor, main_hidden: torch.Tensor, written_max: torch.Tensor):
+        """tokens [S] (the token just accepted, at position pos_last+1... i.e. t_{p+1} with p = pos_last), pos_last [S]
+        (position p whose forward produced the token; the main rings hold positions <= written_max [S], only <= p are visible),
+        main_hidden [S, 3*dim] (target-layer inputs at position p). Returns drafts int64 [S, block] on the device."""
+        S, B = tokens.shape[0], self.block
+        dev = self.device
+        R = S * B
+        rt = self.rt
+        j = torch.arange(B, device=dev)
+        seq_row = torch.arange(S, device=dev).repeat_interleave(B)
+        self.slot_row = j.repeat(S)
+        pos_row = (pos_last.repeat_interleave(B) + 1 + self.slot_row)
+        pmax_row = written_max.repeat_interleave(B)
+        plim_row = pos_last.repeat_interleave(B)
+        idx5 = j.to(torch.int32).view(1, 1, B).expand(R, 1, B).contiguous()
+        ids = torch.full((S, B), self.noise, dtype=torch.int64, device=dev)
+        ids[:, 0] = tokens
+        h = F.embedding(ids.view(-1), self.embed).view(R, 1, 1, self.dim).repeat(1, 1, self.hc, 1).contiguous()
+        pre = torch.zeros(R, self.hc, device=dev)
+        pre[:, 0] = 1.0
+        for blk in self.blocks:
+            fn, scale, base = blk.hc_attn
+            pre_n, post, comb = hc_sinkhorn(hc_mix(h, fn, blk.eps), scale, base, blk.hc, blk.sinkhorn_iters, blk.hc_eps)
+            x, xq, _ = hc_pre_norm_quant2(h, pre, blk.attn_norm_w, blk.eps)
+            a = self._attention_rows(blk.attn, x, xq, seq_row, pos_row, pmax_row, plim_row, idx5)
+            hc_post2_(a, h, post, comb)
+            fn, scale, base = blk.hc_ffn
+            pre_f, post, comb = hc_sinkhorn(hc_mix(h, fn, blk.eps), scale, base, blk.hc, blk.sinkhorn_iters, blk.hc_eps)
+            x, xq, xf, xqp = hc_pre_norm_quant2(h, pre_n, blk.ffn_norm_w, blk.eps, want_f32=True, want_perm=True)
+            moe = blk.ffn
+            scores = F.linear(xf, moe.gate_w)
+            eid, wt = gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1)
+            y2 = rt.experts_tc(xqp, True, moe.w13, moe.s13, moe.w2, moe.s2, eid, wt, moe.inter, moe.swiglu_limit, R * moe.topk, dev, topk=moe.topk)
+            from .w8 import linear_w
+            gu_s = linear_w(xq, moe.sh_w13)
+            from .fused import swiglu_quant
+            ys = linear_w(swiglu_quant(gu_s, None, moe.inter, moe.swiglu_limit), moe.sh_w2)
+            hc_post2_(None, h, post, comb, y2=y2.view(R, moe.topk, -1), ys=ys)
+            pre = pre_f
+        x, _, _ = hc_pre_norm_quant2(h, pre, self.norm_w, self.eps)  # normed [R, dim] (the quantized copy is unused)
+        logits = F.linear(x, self.head).float().view(S, B, -1)
+        prev = tokens
+        out = []
+        for i in range(B):
+            e = self.markov_embed[prev]  # [S, 256]
+            logits[:, i] += F.linear(e.float(), self.markov_head.float())
+            prev = logits[:, i].argmax(-1)
+            out.append(prev)
+        return torch.stack(out, dim=1)
