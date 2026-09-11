@@ -43,7 +43,7 @@ def sample_token(logits: torch.Tensor, temperature: float, top_p: float, gen: to
 class Engine:
     def __init__(self, ckpt: str = CKPT, devices: list[int] | None = None, max_seq_len: int = 8192,
                  budgets: dict[int, float] | None = None, use_graphs: bool = True, thinking_mode: str = "chat",
-                 offload_experts=False, hot_experts: int = 0, route_stats: str = ""):
+                 offload_experts=False, hot_experts: int = 0, route_stats: str = "", ep: bool = False, ep_shards: list[int] | None = None):
         from transformers import AutoTokenizer
 
         sys.path.insert(0, os.path.join(ckpt, "encoding"))
@@ -56,10 +56,13 @@ class Engine:
         self.max_seq_len = max_seq_len
         self.model = load_model(ckpt, devices or list(range(torch.cuda.device_count())), max_seq_len=max_seq_len,
                                 budgets_gb=budgets, tokenizer=self.tok, offload_experts=offload_experts,
-                                hot_experts=hot_experts, route_stats=route_stats)
+                                hot_experts=hot_experts, route_stats=route_stats, ep=ep, ep_shards=ep_shards)
         if offload_experts:
             from .decode import OffloadDecodeRuntime
             self.rt = OffloadDecodeRuntime(self.model, use_graphs=use_graphs)
+        elif ep:
+            from .ep import EPRuntime
+            self.rt = EPRuntime(self.model, use_graphs=use_graphs)
         else:
             self.rt = DecodeRuntime(self.model, use_graphs=use_graphs)
         if use_graphs:
