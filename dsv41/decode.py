@@ -194,6 +194,8 @@ class DecodeRuntime:
         xf = x.float()
         kv, score = F.linear(xf, C.wkv)[:, 0], F.linear(xf, C.wgate)[:, 0]
         R = C.RING
+        if os.environ.get("DSV41_DBG_RING"):
+            print("[ring]", A.layer_id, C.kv_ring.shape, C.kv_ring.device, "seq", seq.tolist(), seq.device, "pos", pos.tolist(), "kv", kv.shape, kv.device, flush=True)
         C.kv_ring[seq, pos % R] = kv
         C.score_ring[seq, pos % R] = score
         prev = (pos - 1) % R

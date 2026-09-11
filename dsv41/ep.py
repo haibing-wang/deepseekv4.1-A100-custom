@@ -55,7 +55,7 @@ class EPRuntime(DecodeRuntime):
                 if a != b:
                     torch.zeros(1, device=a).to(b)
         # static buffers
-        self.seq = {d: torch.ones(1, dtype=torch.int32, device=d) for d in self.devs}
+        self.seqno = {d: torch.ones(1, dtype=torch.int32, device=d) for d in self.devs}  # per-token flag sequence number (not the row sequence ids)
         self.hop_h = {d: torch.zeros(B, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devs}
         self.hop_pre = {d: torch.zeros(B, hc, dtype=torch.float32, device=d) for d in self.devs}
         self.pre_identity = {d: torch.tensor([[1.0] + [0.0] * (hc - 1)] * B, dtype=torch.float32, device=d) for d in self.devs}
@@ -120,11 +120,11 @@ class EPRuntime(DecodeRuntime):
 
     def _wait(self, flags, d):
         if not self.dry:
-            p2p_wait(flags, self.seq[d], d)
+            p2p_wait(flags, self.seqno[d], d)
 
     def _signal(self, ptrs, d):
         if not self.dry:
-            p2p_signal(ptrs, self.seq[d], d)
+            p2p_signal(ptrs, self.seqno[d], d)
 
     # ------------------------------------------------------------------ pieces
     def _experts_shard(self, d, xqp, eid, wt, moe):
@@ -172,9 +172,9 @@ class EPRuntime(DecodeRuntime):
                 for p in self.devs:
                     if p != d:
                         memcpy_async(self.inbox[p], self.outbox[d], d)
-                p2p_signal(self.sig_route[L], self.seq[d], d)
+                p2p_signal(self.sig_route[L], self.seqno[d], d)
             else:
-                p2p_multicast(self.sig_inbox[d], self.outbox[d], self.sig_route[L], self.seq[d], d, counter=self.mcast_counter[d])
+                p2p_multicast(self.sig_inbox[d], self.outbox[d], self.sig_route[L], self.seqno[d], d, counter=self.mcast_counter[d])
         self._stamp(d, L, 2)
         xqp = self.xqp_out[d]
         # own shard and, on a second stream, the shared expert, while the peers work
@@ -270,7 +270,7 @@ class EPRuntime(DecodeRuntime):
 
     def token_end(self, d):
         with torch.cuda.device(d):
-            p2p_seq_bump(self.seq[d], d)
+            p2p_seq_bump(self.seqno[d], d)
 
     def token_graph(self, d):
         """The whole token on device d (owner and peer sections in layer order)."""
@@ -291,7 +291,7 @@ class EPRuntime(DecodeRuntime):
             torch.cuda.synchronize(d)
         self.dry = False
         for d in self.devs:
-            self.seq[d].fill_(1)
+            self.seqno[d].fill_(1)
             self.flag_route[d].zero_()
             self.flag_part[d].zero_()
             self.flag_hop[d].zero_()
