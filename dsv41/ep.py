@@ -96,7 +96,7 @@ class EPRuntime(DecodeRuntime):
             self._tc_tables(B * topk, d, topk)
         self.mcast_counter = {d: torch.zeros(1, dtype=torch.int32, device=d) for d in self.devs}
         self.graphs = {}
-        self.logits = torch.zeros(1, self.cfg["vocab_size"], dtype=torch.float32, device=self.devs[-1])
+        self.logits = torch.zeros(B, self.cfg["vocab_size"], dtype=torch.float32, device=self.devs[-1])
         self.first_layer = {d: min(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
         self.last_layer = {d: max(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
         self.dry = False  # dry pass: no device-side waits / signals (only to compile and load every kernel)
@@ -119,11 +119,8 @@ class EPRuntime(DecodeRuntime):
         """This GPU's experts for the B * topk (token, expert) pairs: fp32 [B * topk, dim] (rows of other shards zero)."""
         start, n = self.shard[d]
         sh = [s for s in moe.ep if s["device"] == d][0]
-        npairs = self.B * self.topk_e
-        starts, tok, rows = self._tc_tables(npairs, d, self.topk_e)
-        gu = fp4_gemm_tc(xqp, sh["w13"], sh["s13"], eid.reshape(-1), starts, tok, npairs, 1, shard_start=start, shard_n=n, zero_out=False)
-        hqp = swiglu_quant(gu, wt.reshape(-1), moe.inter, moe.swiglu_limit, permute=True)
-        return fp4_gemm_tc(hqp, sh["w2"], sh["s2"], eid.reshape(-1), starts, rows, npairs, 1, shard_start=start, shard_n=n, zero_out=True)
+        return self.experts_tc(xqp, True, sh["w13"], sh["s13"], sh["w2"], sh["s2"], eid, wt, moe.inter, moe.swiglu_limit,
+                               self.B * self.topk_e, d, topk=self.topk_e, shard=(start, n))
 
     def _push_cache_rows(self, blk: Block, d):
         """After an owner ran a KV / index source layer: mirror the written rows to the later devices."""
@@ -298,8 +295,11 @@ class EPRuntime(DecodeRuntime):
             torch.cuda.synchronize(d)
 
     @torch.inference_mode()
-    def step(self, token: int, pos: int) -> torch.Tensor:
-        self.tok.fill_(token)
+    def step(self, token, pos: int) -> torch.Tensor:
+        if isinstance(token, int):
+            self.tok.fill_(token)
+        else:
+            self.tok.copy_(torch.as_tensor(token, dtype=torch.int64).view(-1, 1))
         for d in self.devs:
             self.pos[d].fill_(pos)
         if self.m.engram_hash is not None:

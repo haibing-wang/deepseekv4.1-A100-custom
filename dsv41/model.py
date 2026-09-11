@@ -403,9 +403,10 @@ class MoE:
     def _forward_ep(self, xq, eid, tok, weights, n_tok, n_pairs):
         """Eager / prefill path with sharded experts: each shard computes its pairs on its own device, the
         per-token sums come back to the owner device (used for prefill; decode uses dsv41/ep.py)."""
-        y = torch.zeros(n_tok, self.dim, device=xq.device, dtype=torch.float32)
+        # one output row per (token, expert) pair, filled by the shard that holds the expert, summed in a fixed
+        # order per token: deterministic (no atomics across a token's experts)
+        yp = torch.zeros(n_pairs, self.dim, device=xq.device, dtype=torch.float32)
         wflat = weights.flatten().float()
-        pair_rows = torch.arange(n_pairs, device=xq.device, dtype=torch.int32)
         for sh in self.ep:
             sel = ((eid >= sh["start"]) & (eid < sh["start"] + sh["n"])).nonzero().flatten()
             if sel.numel() == 0:
@@ -422,10 +423,10 @@ class MoE:
             p1 = GroupedPairs(le, tk, local_rows, ones, block_m)
             gu = grouped_fp4_gemm(xs, sh["w13"], sh["s13"], p1, m)
             hq = swiglu_quant(gu, wt.contiguous(), self.inter, self.swiglu_limit)
-            p2 = GroupedPairs(le, local_rows, tk, ones, block_m)
-            ys = grouped_fp4_gemm(hq, sh["w2"], sh["s2"], p2, n_tok)
-            y += ys.to(xq.device)
-        return y
+            p2 = GroupedPairs(le, local_rows, local_rows, ones, block_m)
+            ys = grouped_fp4_gemm(hq, sh["w2"], sh["s2"], p2, m)
+            yp[sel] = ys.to(xq.device)
+        return yp.view(n_tok, self.topk, self.dim).sum(dim=1)
 
     def _pair_tables(self, n_tok: int, device):
         """Constant index tensors for a dispatch of n_tok tokens (cached: no per-step allocations)."""
