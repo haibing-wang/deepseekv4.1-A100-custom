@@ -147,9 +147,10 @@ def choose_hot_experts(stats_path: str, per_layer: int, n_layers: int) -> dict[i
 
 def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max_batch: int = 1,
                budgets_gb: dict[int, float] | None = None, n_layers: int | None = None, engram: bool = True,
-               tokenizer=None, offload_experts=False, hot_experts: int = 0, route_stats: str = "", ep: bool = False) -> Transformer:
+               tokenizer=None, offload_experts=False, hot_experts: int = 0, route_stats: str = "", ep: bool = False,
+               ep_shards: list[int] | None = None) -> Transformer:
     """ep: expert parallelism over `devices` (dense layers pipelined over them in order, every layer's experts
-    sharded across all of them; see dsv41/ep.py)."""
+    sharded across all of them; see dsv41/ep.py). ep_shards: experts per device (default: equal split)."""
     global HOT_EXPERTS
     cfg = json.load(open(os.path.join(ckpt_path, "inference", "config.json")))
     if offload_experts == "cpu" and hot_experts > 0:
@@ -168,8 +169,13 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
         nd = len(devices)
         placement = [torch.device(f"cuda:{devices[min(i * nd // n_layers, nd - 1)]}") for i in range(n_layers)]
         E = cfg["n_routed_experts"]
-        bounds = [E * j // nd for j in range(nd + 1)]
+        if ep_shards:
+            assert len(ep_shards) == nd and sum(ep_shards) == E, (ep_shards, E)
+            bounds = [sum(ep_shards[:j]) for j in range(nd + 1)]
+        else:
+            bounds = [E * j // nd for j in range(nd + 1)]
         ep_shards = [(torch.device(f"cuda:{devices[j]}"), bounds[j], bounds[j + 1] - bounds[j]) for j in range(nd)]
+        print("expert shards:", {str(d): n for d, _, n in ep_shards}, flush=True)
     else:
         placement = plan_placement(n_layers, devices, budgets_gb, offload=offload_experts)
         ep_shards = None

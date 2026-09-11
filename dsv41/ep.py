@@ -203,7 +203,7 @@ class EPRuntime(DecodeRuntime):
         # bookkeeping of the source layers (attention2 on later owners reads these; same on every device)
         if blk.attn.is_kv_source:
             self.kv_owner = L
-        if blk.attn.is_index_source:
+        if blk.attn.indexer is not None and blk.attn.indexer.owns_k:
             self.index_owner = L
 
     def token_end(self, d):

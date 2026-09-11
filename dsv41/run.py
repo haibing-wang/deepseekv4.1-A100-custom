@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--n-layers", type=int, default=None, help="load only the first N layers (plumbing test)")
     ap.add_argument("--no-engram", action="store_true")
     ap.add_argument("--ep", action="store_true", help="expert parallelism over --devices (dense pipelined, experts sharded; dsv41/ep.py)")
+    ap.add_argument("--ep-shards", default="", help="experts per device for --ep, e.g. 82,82,68,38,38,38,38 (default: equal)")
     ap.add_argument("--offload-experts", nargs="?", const="cpu", default=False, choices=["gpu", "cpu"], help="single-GPU mode: experts in host RAM; 'cpu' computes them on the CPU (default), 'gpu' streams them over PCIe")
     ap.add_argument("--profile", action="store_true", help="per-component timing of the decode steps")
     ap.add_argument("--decode", default="graph", choices=["eager", "static", "graph"], help="decode path")
@@ -50,7 +51,8 @@ def main():
     devices = [int(d) for d in a.devices.split(",")]
     budgets = {int(k): float(v) for k, v in (kv.split(":") for kv in a.budgets.split(",") if kv)} or None
     model = load_model(a.ckpt, devices, max_seq_len=a.max_seq_len, budgets_gb=budgets, n_layers=a.n_layers,
-                       engram=not a.no_engram, tokenizer=tok, offload_experts=a.offload_experts, hot_experts=a.hot_experts, route_stats=a.hot_stats, ep=a.ep)
+                       engram=not a.no_engram, tokenizer=tok, offload_experts=a.offload_experts, hot_experts=a.hot_experts, route_stats=a.hot_stats, ep=a.ep,
+                       ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None)
 
     if a.chat:
         sys.path.insert(0, os.path.join(a.ckpt, "encoding"))

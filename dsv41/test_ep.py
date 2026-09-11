@@ -32,10 +32,10 @@ else:
     from dsv41.decode import DecodeRuntime
     rt = DecodeRuntime(model, use_graphs=True)
 rt.capture()
-model.forward(torch.tensor([ids]), 0)
+pre = model.forward(torch.tensor([ids]), 0)
 pos = len(ids)
 feed = [19920, 36300, 118795, 28859, 17706, 100003, 2000, 3000, 4000, 5000]  # fixed tokens (teacher forcing)
-outs = []
+outs = [pre.float().reshape(1, -1).clone().cpu()]  # prefill logits first
 for t in feed:
     outs.append(rt.step(t, pos).clone().cpu())
     pos += 1
