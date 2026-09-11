@@ -19,7 +19,7 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--thinking", action="store_true", help="thinking mode (reasoning before the answer)")
     ap.add_argument("--no-graphs", action="store_true")
-    ap.add_argument("--offload-experts", action="store_true", help="keep the FP4 experts in host RAM (single-GPU mode, ~460 GiB RAM)")
+    ap.add_argument("--offload-experts", nargs="?", const="cpu", default=False, choices=["gpu", "cpu"], help="single-GPU mode: experts in host RAM; 'cpu' computes them on the CPU (default), 'gpu' streams them over PCIe")
     a = ap.parse_args()
     kw = dict(devices=[int(d) for d in a.devices.split(",")], max_seq_len=a.max_seq_len, budgets=parse_budgets(a.budgets),
               use_graphs=not a.no_graphs, thinking_mode="thinking" if a.thinking else "chat", offload_experts=a.offload_experts)

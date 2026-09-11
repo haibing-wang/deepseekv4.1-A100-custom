@@ -112,19 +112,26 @@ keep the experts in host memory and stream the 6 selected experts per layer for 
 | expected decode speed | **~5 tok/s** single stream, bounded by PCIe, not by the GPU |
 | prefill | all experts of a layer are needed → the whole 269 GiB streams through once per prompt (~11 s at 24 GB/s) |
 
-This is the `--offload-experts` mode:
+This is the `--offload-experts` mode. It has two variants:
+
+- `--offload-experts cpu` (default): the experts stay in host RAM **and are computed on the CPU**
+  (`dsv41/cpu/moe_cpu.cpp`: E2M1 nibbles expanded in registers, AVX-512 VNNI int8 dot products, rows split
+  across the two NUMA nodes with node-local first touch, threads pinned to physical cores). Only the
+  10 KB activation and the 20 KB MoE output cross PCIe per layer; the GPU runs attention, the dense
+  projections and the shared expert (overlapped with the CPU) inside CUDA graphs. Measured on this box
+  (2× Xeon Silver 4410Y, DDR5-4000 ×16 channels): **12.2 tok/s** on one A100, CPU experts 57 ms/token.
+- `--offload-experts gpu`: the experts are DMA'd from pinned RAM into a GPU staging buffer and computed on
+  the GPU. 4.5 GB per token over PCIe 4.0 x16 (25 GB/s measured) → **2.3 tok/s**. Kept for reference.
 
 ```
 python -m dsv41.chat  --devices 2 --offload-experts          # REPL on one GPU (CUDA_VISIBLE_DEVICES also works)
 python -m dsv41.serve --devices 2 --offload-experts --port 8000
 ```
 
-The loader keeps every layer's experts in page-locked host memory (269 GiB, allocation takes a few
-minutes), the dense weights go to the GPU. At decode the MoE moves the six selected experts of the
-layer into a GPU staging buffer (one host sync per layer) and runs the same CUDA GEMV; for prefill
-(more than 16 tokens) all experts of a layer stream through the GPU in chunks of 64 and each
-(token, expert) pair is computed in its expert's chunk. CUDA graphs are disabled in this mode because
-of the per-layer host syncs, so decode is limited by PCIe plus launch overhead (see the numbers below).
+The dense weights go to the GPU (~20 GiB used in total). Prefill (more than 16 tokens) currently streams
+all experts of a layer through the GPU in chunks of 64 (each (token, expert) pair is computed in its
+expert's chunk); from pageable NUMA memory this takes ~40 s per prompt and is the next thing to fix.
+Decode uses three CUDA graphs per layer (dense part → CPU experts → post-processing).
 
 ## Numbers (8× A100 80GB PCIe, shared with other jobs)
 

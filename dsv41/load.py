@@ -51,7 +51,7 @@ def _dense(ckpt: Checkpoint, name: str, device) -> torch.Tensor:
     return w
 
 
-def load_layer(ckpt: Checkpoint, i: int, device, offload: bool = False) -> dict:
+def load_layer(ckpt: Checkpoint, i: int, device, offload=False) -> dict:
     p = f"layers.{i}."
     w: dict[str, torch.Tensor] = {}
     for n in ckpt.names(p):
@@ -67,6 +67,17 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload: bool = False) -> dict:
     E = len(e_names)
     inter, dimh = ckpt.meta(p + "ffn.experts.0.w1.weight")[1]
     dim = ckpt.meta(p + "ffn.experts.0.w2.weight")[1][0]
+    if offload == "cpu":  # experts in NUMA-split host RAM, computed on the CPU (dsv41/cpu/moe_cpu.cpp)
+        from .cpumoe import HostExperts
+        host = HostExperts(E, inter, dim)
+        for e in e_names:
+            q = f"{p}ffn.experts.{e}."
+            host.load_expert(e, ckpt.get(q + "w1.weight"), ckpt.get(q + "w3.weight"), ckpt.get(q + "w1.scale"), ckpt.get(q + "w3.scale"),
+                             ckpt.get(q + "w2.weight"), ckpt.get(q + "w2.scale"))
+        w13, s13, w2, s2 = host.views()
+        w.update({"experts.w13": w13, "experts.s13": s13, "experts.w2": w2, "experts.s2": s2, "experts.offload": True, "experts.host": host})
+        torch.cuda.synchronize(device)
+        return w
     if offload:  # experts stay in page-locked host memory; the MoE streams the selected ones per token
         alloc = lambda *shape: torch.empty(*shape, dtype=torch.uint8, pin_memory=True)
     else:
@@ -90,7 +101,7 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload: bool = False) -> dict:
 
 def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max_batch: int = 1,
                budgets_gb: dict[int, float] | None = None, n_layers: int | None = None, engram: bool = True,
-               tokenizer=None, offload_experts: bool = False) -> Transformer:
+               tokenizer=None, offload_experts=False) -> Transformer:
     cfg = json.load(open(os.path.join(ckpt_path, "inference", "config.json")))
     args = Args(cfg, max_batch_size=max_batch, max_seq_len=max_seq_len)
     ckpt = Checkpoint(ckpt_path)

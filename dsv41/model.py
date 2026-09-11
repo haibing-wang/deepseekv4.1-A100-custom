@@ -359,7 +359,11 @@ class MoE:
         self.w2 = w["experts.w2"]  # uint8 [E, dim, inter/2]
         self.s2 = w["experts.s2"]  # uint8 [E, dim, inter/32]
         self.inter = self.w2.shape[2] * 2
-        self.offload = bool(w.get("experts.offload", False))  # experts in pinned host RAM, streamed per token
+        self.offload = bool(w.get("experts.offload", False))  # experts in host RAM (streamed to the GPU, or computed on the CPU)
+        self.host = w.get("experts.host")  # HostExperts: compute the selected experts on the CPU
+        if self.host is not None:
+            self.x_host = torch.empty(self.dim, dtype=torch.bfloat16, pin_memory=True)
+            self.y_host = torch.empty(self.dim, dtype=torch.float32, pin_memory=True)
         # shared expert: one GEMM for gate and up (rows [w1; w3])
         self.sh_w13 = torch.cat([w["ffn.shared_experts.w1.weight"], w["ffn.shared_experts.w3.weight"]], dim=0).contiguous()
         self.sh_w2 = w["ffn.shared_experts.w2.weight"]
@@ -430,6 +434,15 @@ class MoE:
         y2 = cukern.fp4_gemv_pairs(hq, b["w2"][:n_pairs], b["s2"][:n_pairs], pair_rows.to(torch.int32), local, ones, n_pairs)
         return y2.view(n_tok, self.topk, self.dim).sum(dim=1)
 
+    def _decode_cpu(self, xq, indices, weights):
+        """Selected experts computed on the CPU from RAM; only x (10 KB) and y (20 KB) cross PCIe."""
+        self.x_host.copy_(xq.view(-1))  # sync D2H
+        ids = indices.flatten().tolist()
+        wts = weights.flatten().tolist()
+        y = self.host.forward(self.x_host, ids, wts, float(self.swiglu_limit))
+        self.y_host.copy_(y)
+        return self.y_host.to(xq.device, non_blocking=True).view(1, self.dim)
+
     def _prefill_offload(self, xq, indices, weights, n_tok, n_pairs, tok, pair_rows, ones, chunk: int = 64):
         """Stream all experts through the GPU in chunks; each pair is computed in the chunk of its expert."""
         E = self.w13.shape[0]
@@ -469,7 +482,9 @@ class MoE:
         xq = fake_quant_fp8(x, 32)
         eid = indices.flatten().to(torch.int32)
         if self.offload:
-            if n_tok <= 16:
+            if n_tok == 1 and self.host is not None:
+                y = self._decode_cpu(xq, indices, weights)
+            elif n_tok <= 16:
                 y = self._decode_offload(xq, indices, weights, n_tok, n_pairs, tok, pair_rows, ones)
             else:
                 y = self._prefill_offload(xq, indices, weights, n_tok, n_pairs, tok, pair_rows, ones)

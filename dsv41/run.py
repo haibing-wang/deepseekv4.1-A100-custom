@@ -32,7 +32,7 @@ def main():
     ap.add_argument("--max-seq-len", type=int, default=8192)
     ap.add_argument("--n-layers", type=int, default=None, help="load only the first N layers (plumbing test)")
     ap.add_argument("--no-engram", action="store_true")
-    ap.add_argument("--offload-experts", action="store_true", help="experts in host RAM (single-GPU mode)")
+    ap.add_argument("--offload-experts", nargs="?", const="cpu", default=False, choices=["gpu", "cpu"], help="single-GPU mode: experts in host RAM; 'cpu' computes them on the CPU (default), 'gpu' streams them over PCIe")
     ap.add_argument("--profile", action="store_true", help="per-component timing of the decode steps")
     ap.add_argument("--decode", default="graph", choices=["eager", "static", "graph"], help="decode path")
     ap.add_argument("--kernel-profile", action="store_true", help="after generation, profile 8 decode steps and list the top CUDA kernels")
@@ -59,8 +59,11 @@ def main():
     if a.decode != "eager":
         # capture before the prefill: the warm-up/capture runs scribble on the caches at position 0,
         # and the prefill rewrites everything they touched
-        from dsv41.decode import DecodeRuntime
-        rt = DecodeRuntime(model, use_graphs=(a.decode == "graph" and not a.offload_experts))
+        from dsv41.decode import DecodeRuntime, OffloadDecodeRuntime
+        if a.offload_experts:
+            rt = OffloadDecodeRuntime(model, use_graphs=(a.decode == "graph"))
+        else:
+            rt = DecodeRuntime(model, use_graphs=(a.decode == "graph"))
         if a.decode == "graph":
             tc = time.time()
             rt.capture()
@@ -103,6 +106,15 @@ def main():
         print(f"\n[kernel profile: {tot / 8 / 1000:.1f} ms of GPU time per token]")
         for k, t, c in sorted(rows, key=lambda r: -r[1])[:22]:
             print(f"  {t / 8 / 1000:7.2f} ms/token  {c // 8:5d}/token  {k[:90]}")
+    if a.profile and rt is not None and getattr(rt, "cpu_experts", False):
+        from collections import defaultdict
+        rt.prof = defaultdict(float)
+        for i in range(8):
+            rt.step(out[-1], pos + i)
+        tot = sum(rt.prof.values())
+        print("[offload decode stages, per token]")
+        for k, v in sorted(rt.prof.items(), key=lambda kv: -kv[1]):
+            print(f"  {k:26s} {v / 8 * 1000:7.1f} ms  ({v / tot * 100:4.1f}%)")
     if a.profile:
         import dsv41.model as M
         tot = sum(M.PROF.values())

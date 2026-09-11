@@ -7,10 +7,13 @@ future positions masked. Host work per step is reduced to: the Engram table gath
 H2D/D2D copies between GPU segments, and one graph launch per GPU."""
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.nn.functional as F
 
-from .fused import fake_quant_fp4, fake_quant_fp8, rmsnorm, rope_dev_, sparse_attn_decode_split as sparse_attn_decode2
+from .cukern import fp4_gemv_pairs as cukern_fp4
+from .fused import fake_quant_fp4, fake_quant_fp8, rmsnorm, rope_dev_, sparse_attn_decode_split as sparse_attn_decode2, swiglu_quant
 from .model import Attention, Block, Transformer, _hc_post, _hc_pre, linear_fp8, select_candidate_blocks
 
 
@@ -246,4 +249,191 @@ class DecodeRuntime:
             else:
                 self.run_segment(si)
             self._propagate(si)
+        return self.logits
+
+
+class OffloadDecodeRuntime(DecodeRuntime):
+    """Single-GPU expert-offload decode: each layer is two CUDA graphs with the host-side expert
+    gather (gate result -> DMA from pinned RAM into the staging buffers) in between. Only the dense
+    part of the layer is captured, so the per-layer host sync no longer drains ~40 kernel launches."""
+
+    def __init__(self, model: Transformer, use_graphs: bool = True):
+        super().__init__(model, use_graphs=False)
+        assert len(self.devices) == 1, "offload mode runs all layers on one GPU"
+        self.d = self.devices[0]
+        self.use_graphs = use_graphs
+        hc, dim = self.cfg["hc_mult"], self.cfg["dim"]
+        d = self.d
+        self.h_buf = torch.zeros(1, 1, hc, dim, dtype=torch.bfloat16, device=d)
+        self.pre_buf = torch.zeros(1, 1, hc, dtype=torch.float32, device=d)
+        self.x_buf = torch.zeros(1, dim, dtype=torch.bfloat16, device=d)
+        self.res_buf = torch.zeros(1, 1, hc, dim, dtype=torch.bfloat16, device=d)
+        self.ffn_pre = torch.zeros(1, 1, hc, dtype=torch.float32, device=d)
+        self.ffn_post = torch.zeros(1, 1, hc, dtype=torch.float32, device=d)
+        self.ffn_comb = torch.zeros(1, 1, hc, hc, dtype=torch.float32, device=d)
+        topk = self.cfg["n_activated_experts"]
+        self.gate_w = torch.zeros(1, topk, dtype=torch.float32, device=d)
+        self.gate_idx = torch.zeros(1, topk, dtype=torch.int64, device=d)
+        self.g1: dict[int, torch.cuda.CUDAGraph] = {}
+        self.g2: dict[int, torch.cuda.CUDAGraph] = {}
+        self.g3: dict[int, torch.cuda.CUDAGraph] = {}
+        self.cpu_experts = model.blocks[0].ffn.host is not None
+        self.prof = None  # set to a defaultdict(float) to collect per-stage seconds
+        self.y_gpu = torch.zeros(1, dim, dtype=torch.float32, device=d)
+        self.y_shared = torch.zeros(1, dim, dtype=torch.float32, device=d)
+
+    # ---- the two halves of a layer, on static buffers
+    def part1(self, blk: Block):
+        h = self.h_buf
+        if blk.engram is not None:
+            h = blk.engram.apply(h, self.eng_in[blk.layer_id])
+        residual = h
+        attn_pre, attn_post, attn_comb = blk.hc_mixes(h, *blk.hc_attn)
+        x = _hc_pre(h, self.pre_buf)
+        x = rmsnorm(x, blk.attn_norm_w, blk.eps)
+        x = self.attention(blk.attn, x, blk.device)
+        h = _hc_post(x, residual, attn_post, attn_comb)
+        self.res_buf.copy_(h)
+        ffn_pre, ffn_post, ffn_comb = blk.hc_mixes(h, *blk.hc_ffn)
+        self.ffn_pre.copy_(ffn_pre)
+        self.ffn_post.copy_(ffn_post)
+        self.ffn_comb.copy_(ffn_comb)
+        x = _hc_pre(h, attn_pre)
+        x = rmsnorm(x, blk.ffn_norm_w, blk.eps).reshape(-1, blk.ffn.dim)
+        self.x_buf.copy_(x)
+        w, idx = blk.ffn.gate(x)
+        self.gate_w.copy_(w)
+        self.gate_idx.copy_(idx)
+
+    def part2_cpu_shared(self, blk: Block):
+        """GPU work that overlaps the CPU expert computation: the shared expert."""
+        self.y_shared.copy_(blk.ffn.shared_expert(self.x_buf))
+
+    def part2_cpu_post(self, blk: Block):
+        moe = blk.ffn
+        y = (self.y_gpu + self.y_shared).to(torch.bfloat16).view(1, 1, moe.dim)
+        h = _hc_post(y, self.res_buf, self.ffn_post, self.ffn_comb)
+        self.h_buf.copy_(h)
+        self.pre_buf.copy_(self.ffn_pre)
+
+    def _cpu_experts(self, blk: Block):
+        moe = blk.ffn
+        xq = fake_quant_fp8(self.x_buf, 32)
+        moe.x_host.copy_(xq.view(-1))  # sync: waits for part1 on the GPU
+        ids = self.gate_idx.flatten().tolist()
+        wts = self.gate_w.flatten().tolist()
+        y = moe.host.forward(moe.x_host, ids, wts, float(moe.swiglu_limit))
+        moe.y_host.copy_(y)
+        self.y_gpu.copy_(moe.y_host, non_blocking=True)
+
+    def part2(self, blk: Block):
+        moe = blk.ffn
+        n_tok, n_pairs = 1, moe.topk
+        tok, pair_rows, ones = moe._pair_tables(n_tok, self.d)
+        b = moe._staging(n_pairs, "decode")
+        xq = fake_quant_fp8(self.x_buf, 32)
+        local = torch.arange(n_pairs, device=self.d, dtype=torch.int32)
+        gu = cukern_fp4(xq, b["w13"], b["s13"], tok, local, ones, n_pairs)
+        hq = swiglu_quant(gu, self.gate_w.flatten().contiguous(), moe.inter, moe.swiglu_limit)
+        y2 = cukern_fp4(hq, b["w2"], b["s2"], pair_rows, local, ones, n_pairs)
+        y = y2.view(n_tok, moe.topk, moe.dim).sum(dim=1)
+        y += moe.shared_expert(self.x_buf)
+        y = y.to(torch.bfloat16).view(1, 1, moe.dim)
+        h = _hc_post(y, self.res_buf, self.ffn_post, self.ffn_comb)
+        self.h_buf.copy_(h)
+        self.pre_buf.copy_(self.ffn_pre)
+
+    def _gather(self, moe):
+        b = moe._staging(moe.topk, "decode")
+        for i, e in enumerate(self.gate_idx.flatten().tolist()):  # the one host sync per layer
+            for gk, src in (("w13", moe.w13), ("s13", moe.s13), ("w2", moe.w2), ("s2", moe.s2)):
+                b[gk][i].copy_(src[e], non_blocking=True)
+
+    def capture(self):
+        if not self.use_graphs:
+            return
+        with torch.cuda.device(self.d):
+            s = torch.cuda.Stream(self.d)
+            s.wait_stream(torch.cuda.current_stream(self.d))
+            for blk in self.m.blocks:
+                with torch.cuda.stream(s):
+                    for _ in range(2):
+                        self.part1(blk)
+                        if self.cpu_experts:
+                            self.part2_cpu_shared(blk)
+                            torch.cuda.synchronize(self.d)
+                            self._cpu_experts(blk)
+                            self.part2_cpu_post(blk)
+                        else:
+                            self._gather(blk.ffn)
+                            self.part2(blk)
+                torch.cuda.synchronize(self.d)
+                g1 = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g1, stream=s):
+                    self.part1(blk)
+                if self.cpu_experts:
+                    g2 = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g2, stream=s):
+                        self.part2_cpu_shared(blk)
+                    g3 = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g3, stream=s):
+                        self.part2_cpu_post(blk)
+                    self.g3[blk.layer_id] = g3
+                else:
+                    g2 = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g2, stream=s):
+                        self.part2(blk)
+                self.g1[blk.layer_id], self.g2[blk.layer_id] = g1, g2
+            torch.cuda.current_stream(self.d).wait_stream(s)
+            torch.cuda.synchronize(self.d)
+
+    @torch.inference_mode()
+    def step(self, token: int, pos: int) -> torch.Tensor:
+        d = self.d
+        self.tok.fill_(token)
+        self.pos[d].fill_(pos)
+        self.kv_owner = -1
+        self.index_owner = -1
+        if self.m.engram_hash is not None:
+            hashes = self.m.engram_hash(self.tok, pos)
+            for blk in self.m.blocks:
+                if blk.engram is not None:
+                    emb = blk.engram.table.lookup(hashes[:, :, blk.engram.layer_hash_index, :], d).flatten(-2)
+                    self.eng_in[blk.layer_id].copy_(emb)
+        self.h_buf.copy_(F.embedding(self.tok, self.m.embed).unsqueeze(2).repeat(1, 1, self.cfg["hc_mult"], 1))
+        self.pre_buf.zero_()
+        self.pre_buf[:, :, 0] = 1.0
+        prof = self.prof
+        for blk in self.m.blocks:
+            lid = blk.layer_id
+            t0 = time.perf_counter() if prof is not None else 0.0
+            if self.use_graphs:
+                self.g1[lid].replay()
+            else:
+                self.part1(blk)
+            if self.cpu_experts:
+                if self.use_graphs:
+                    self.g2[lid].replay()  # shared expert on the GPU, overlapping the CPU experts
+                else:
+                    self.part2_cpu_shared(blk)
+                if prof is not None:
+                    torch.cuda.synchronize(d); t1 = time.perf_counter(); prof["gpu dense+attn+shared"] += t1 - t0; t0 = t1
+                self._cpu_experts(blk)
+                if prof is not None:
+                    t1 = time.perf_counter(); prof["cpu experts (+sync)"] += t1 - t0; t0 = t1
+                if self.use_graphs:
+                    self.g3[lid].replay()
+                else:
+                    self.part2_cpu_post(blk)
+                if prof is not None:
+                    torch.cuda.synchronize(d); prof["gpu post"] += time.perf_counter() - t0
+                continue
+            self._gather(blk.ffn)
+            if self.use_graphs:
+                self.g2[lid].replay()
+            else:
+                self.part2(blk)
+        hh = _hc_pre(self.h_buf, self.pre_buf)[:, -1]
+        hh = rmsnorm(hh, self.m.norm_w, self.cfg["norm_eps"])
+        self.logits.copy_(F.linear(hh, self.m.head).float())
         return self.logits
