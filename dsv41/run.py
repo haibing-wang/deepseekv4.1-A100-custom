@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--max-seq-len", type=int, default=8192)
     ap.add_argument("--n-layers", type=int, default=None, help="load only the first N layers (plumbing test)")
     ap.add_argument("--no-engram", action="store_true")
+    ap.add_argument("--offload-experts", action="store_true", help="experts in host RAM (single-GPU mode)")
     ap.add_argument("--profile", action="store_true", help="per-component timing of the decode steps")
     ap.add_argument("--decode", default="graph", choices=["eager", "static", "graph"], help="decode path")
     ap.add_argument("--kernel-profile", action="store_true", help="after generation, profile 8 decode steps and list the top CUDA kernels")
@@ -42,7 +43,7 @@ def main():
     devices = [int(d) for d in a.devices.split(",")]
     budgets = {int(k): float(v) for k, v in (kv.split(":") for kv in a.budgets.split(",") if kv)} or None
     model = load_model(a.ckpt, devices, max_seq_len=a.max_seq_len, budgets_gb=budgets, n_layers=a.n_layers,
-                       engram=not a.no_engram, tokenizer=tok)
+                       engram=not a.no_engram, tokenizer=tok, offload_experts=a.offload_experts)
 
     if a.chat:
         sys.path.insert(0, os.path.join(a.ckpt, "encoding"))
@@ -59,7 +60,7 @@ def main():
         # capture before the prefill: the warm-up/capture runs scribble on the caches at position 0,
         # and the prefill rewrites everything they touched
         from dsv41.decode import DecodeRuntime
-        rt = DecodeRuntime(model, use_graphs=(a.decode == "graph"))
+        rt = DecodeRuntime(model, use_graphs=(a.decode == "graph" and not a.offload_experts))
         if a.decode == "graph":
             tc = time.time()
             rt.capture()

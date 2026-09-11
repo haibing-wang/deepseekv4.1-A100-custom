@@ -155,9 +155,10 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-graphs", action="store_true")
+    ap.add_argument("--offload-experts", action="store_true", help="keep the FP4 experts in host RAM (single-GPU mode, ~460 GiB RAM)")
     a = ap.parse_args()
     kw = dict(devices=[int(d) for d in a.devices.split(",")], max_seq_len=a.max_seq_len, budgets=parse_budgets(a.budgets),
-              use_graphs=not a.no_graphs)
+              use_graphs=not a.no_graphs, offload_experts=a.offload_experts)
     ENGINE = Engine(a.ckpt, **kw) if a.ckpt else Engine(**kw)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print(f"serving OpenAI-compatible API on http://{a.host}:{a.port}/v1 (model '{ENGINE.model_name}')", flush=True)

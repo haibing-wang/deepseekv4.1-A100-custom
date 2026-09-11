@@ -112,10 +112,19 @@ keep the experts in host memory and stream the 6 selected experts per layer for 
 | expected decode speed | **~5 tok/s** single stream, bounded by PCIe, not by the GPU |
 | prefill | all experts of a layer are needed → the whole 269 GiB streams through once per prompt (~11 s at 24 GB/s) |
 
-This offload path is not implemented in this repository yet (the loader places whole layers on GPUs);
-the numbers above follow directly from the sizes and the interconnect. With a machine that has the
-RAM, the changes are confined to `MoE.__call__` (gather the selected experts from pinned host tensors
-into a per-layer GPU staging buffer before `fp4_gemv_pairs`) and `load.py`.
+This is the `--offload-experts` mode:
+
+```
+python -m dsv41.chat  --devices 2 --offload-experts          # REPL on one GPU (CUDA_VISIBLE_DEVICES also works)
+python -m dsv41.serve --devices 2 --offload-experts --port 8000
+```
+
+The loader keeps every layer's experts in page-locked host memory (269 GiB, allocation takes a few
+minutes), the dense weights go to the GPU. At decode the MoE moves the six selected experts of the
+layer into a GPU staging buffer (one host sync per layer) and runs the same CUDA GEMV; for prefill
+(more than 16 tokens) all experts of a layer stream through the GPU in chunks of 64 and each
+(token, expert) pair is computed in its expert's chunk. CUDA graphs are disabled in this mode because
+of the per-layer host syncs, so decode is limited by PCIe plus launch overhead (see the numbers below).
 
 ## Numbers (8× A100 80GB PCIe, shared with other jobs)
 

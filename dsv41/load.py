@@ -13,10 +13,13 @@ from .quant import dequant_fp8_block
 from .stio import Checkpoint
 
 LAYER_GB = 7.1  # experts (6.72 GiB fp4 + scales) + dense bf16 (0.34 GiB) per layer
+LAYER_GB_OFFLOAD = 0.4  # dense bf16 only; experts live in host RAM
 RESERVE_GB = 2.0  # activations / temporaries per device
+RESERVE_GB_OFFLOAD = 6.0  # + expert staging buffers (decode 1.8 GiB, prefill chunk 1.2 GiB) and prefill temporaries
 
 
-def plan_placement(n_layers: int, devices: list[int], budgets_gb: dict[int, float] | None = None) -> list[torch.device]:
+def plan_placement(n_layers: int, devices: list[int], budgets_gb: dict[int, float] | None = None,
+                   offload: bool = False) -> list[torch.device]:
     """Greedy: fill each device (in the given order) with as many layers as its free memory allows."""
     free = {}
     for d in devices:
@@ -26,8 +29,10 @@ def plan_placement(n_layers: int, devices: list[int], budgets_gb: dict[int, floa
             f, _ = torch.cuda.mem_get_info(d)
             free[d] = f / 2**30
     placement: list[torch.device] = []
+    layer_gb = LAYER_GB_OFFLOAD if offload else LAYER_GB
+    reserve = RESERVE_GB_OFFLOAD if offload else RESERVE_GB
     for d in devices:
-        n = int(max(0, free[d] - RESERVE_GB - (2.6 if d == devices[0] else 0)) // LAYER_GB)
+        n = int(max(0, free[d] - reserve - (2.6 if d == devices[0] else 0)) // layer_gb)
         for _ in range(n):
             if len(placement) < n_layers:
                 placement.append(torch.device(f"cuda:{d}"))
@@ -46,7 +51,7 @@ def _dense(ckpt: Checkpoint, name: str, device) -> torch.Tensor:
     return w
 
 
-def load_layer(ckpt: Checkpoint, i: int, device) -> dict:
+def load_layer(ckpt: Checkpoint, i: int, device, offload: bool = False) -> dict:
     p = f"layers.{i}."
     w: dict[str, torch.Tensor] = {}
     for n in ckpt.names(p):
@@ -62,31 +67,35 @@ def load_layer(ckpt: Checkpoint, i: int, device) -> dict:
     E = len(e_names)
     inter, dimh = ckpt.meta(p + "ffn.experts.0.w1.weight")[1]
     dim = ckpt.meta(p + "ffn.experts.0.w2.weight")[1][0]
-    w13 = torch.empty(E, 2 * inter, dimh, dtype=torch.uint8, device=device)
-    s13 = torch.empty(E, 2 * inter, dimh * 2 // 32, dtype=torch.uint8, device=device)
-    w2 = torch.empty(E, dim, inter // 2, dtype=torch.uint8, device=device)
-    s2 = torch.empty(E, dim, inter // 32, dtype=torch.uint8, device=device)
+    if offload:  # experts stay in page-locked host memory; the MoE streams the selected ones per token
+        alloc = lambda *shape: torch.empty(*shape, dtype=torch.uint8, pin_memory=True)
+    else:
+        alloc = lambda *shape: torch.empty(*shape, dtype=torch.uint8, device=device)
+    w13 = alloc(E, 2 * inter, dimh)
+    s13 = alloc(E, 2 * inter, dimh * 2 // 32)
+    w2 = alloc(E, dim, inter // 2)
+    s2 = alloc(E, dim, inter // 32)
     for e in e_names:
         q = f"{p}ffn.experts.{e}."
-        w13[e, :inter] = ckpt.get(q + "w1.weight").view(torch.uint8).to(device, non_blocking=True)
-        w13[e, inter:] = ckpt.get(q + "w3.weight").view(torch.uint8).to(device, non_blocking=True)
-        s13[e, :inter] = ckpt.get(q + "w1.scale").to(device, non_blocking=True)
-        s13[e, inter:] = ckpt.get(q + "w3.scale").to(device, non_blocking=True)
-        w2[e] = ckpt.get(q + "w2.weight").view(torch.uint8).to(device, non_blocking=True)
-        s2[e] = ckpt.get(q + "w2.scale").to(device, non_blocking=True)
-    w.update({"experts.w13": w13, "experts.s13": s13, "experts.w2": w2, "experts.s2": s2})
+        w13[e, :inter].copy_(ckpt.get(q + "w1.weight").view(torch.uint8), non_blocking=True)
+        w13[e, inter:].copy_(ckpt.get(q + "w3.weight").view(torch.uint8), non_blocking=True)
+        s13[e, :inter].copy_(ckpt.get(q + "w1.scale"), non_blocking=True)
+        s13[e, inter:].copy_(ckpt.get(q + "w3.scale"), non_blocking=True)
+        w2[e].copy_(ckpt.get(q + "w2.weight").view(torch.uint8), non_blocking=True)
+        s2[e].copy_(ckpt.get(q + "w2.scale"), non_blocking=True)
+    w.update({"experts.w13": w13, "experts.s13": s13, "experts.w2": w2, "experts.s2": s2, "experts.offload": offload})
     torch.cuda.synchronize(device)
     return w
 
 
 def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max_batch: int = 1,
                budgets_gb: dict[int, float] | None = None, n_layers: int | None = None, engram: bool = True,
-               tokenizer=None) -> Transformer:
+               tokenizer=None, offload_experts: bool = False) -> Transformer:
     cfg = json.load(open(os.path.join(ckpt_path, "inference", "config.json")))
     args = Args(cfg, max_batch_size=max_batch, max_seq_len=max_seq_len)
     ckpt = Checkpoint(ckpt_path)
     n_layers = n_layers or cfg["n_layers"]
-    placement = plan_placement(n_layers, devices, budgets_gb)
+    placement = plan_placement(n_layers, devices, budgets_gb, offload=offload_experts)
     print("placement:", {str(d): placement.count(d) for d in dict.fromkeys(placement)}, flush=True)
     model = Transformer(args)
     t0 = time.time()
@@ -100,7 +109,7 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
             model.shared.index_k[(owner, d)] = torch.zeros(max_batch, rows, cfg["index_head_dim"], dtype=torch.bfloat16, device=d)
     for i in range(n_layers):
         dev = placement[i]
-        w = load_layer(ckpt, i, dev)
+        w = load_layer(ckpt, i, dev, offload=offload_experts)
         model.blocks.append(Block(args, i, w, dev, model.shared))
         del w
         print(f"  layer {i:2d} -> {dev}  ({time.time() - t0:5.0f}s)", flush=True)

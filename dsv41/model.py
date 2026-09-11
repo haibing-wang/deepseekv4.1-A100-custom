@@ -359,6 +359,7 @@ class MoE:
         self.w2 = w["experts.w2"]  # uint8 [E, dim, inter/2]
         self.s2 = w["experts.s2"]  # uint8 [E, dim, inter/32]
         self.inter = self.w2.shape[2] * 2
+        self.offload = bool(w.get("experts.offload", False))  # experts in pinned host RAM, streamed per token
         # shared expert: one GEMM for gate and up (rows [w1; w3])
         self.sh_w13 = torch.cat([w["ffn.shared_experts.w1.weight"], w["ffn.shared_experts.w3.weight"]], dim=0).contiguous()
         self.sh_w2 = w["ffn.shared_experts.w2.weight"]
@@ -400,6 +401,63 @@ class MoE:
             t = self._cache[key] = (tok, pair_rows, ones)
         return t
 
+    # ---- expert offload: host -> GPU staging (shared per device)
+    _stage: dict = {}
+
+    def _staging(self, n: int, kind: str):
+        """GPU buffers for `n` experts (and pinned host buffers for gathered decode experts)."""
+        key = (self.device, kind, n)
+        b = MoE._stage.get(key)
+        if b is None:
+            E, n13, kh = self.w13.shape
+            dim, ih = self.w2.shape[1], self.w2.shape[2]
+            g = lambda *shape: torch.empty(*shape, dtype=torch.uint8, device=self.device)
+            b = {"w13": g(n, n13, kh), "s13": g(n, n13, kh * 2 // 32), "w2": g(n, dim, ih), "s2": g(n, dim, ih * 2 // 32)}
+            MoE._stage[key] = b
+        return b
+
+    def _decode_offload(self, xq, indices, weights, n_tok, n_pairs, tok, pair_rows, ones):
+        """Gather the selected experts from host RAM into GPU staging buffers, then the normal GEMV."""
+        b = self._staging(n_pairs, "decode")
+        eids = indices.flatten().tolist()  # one sync per layer
+        # DMA each selected expert straight from the pinned host tensors (no CPU-side gather)
+        for i, e in enumerate(eids):
+            for gk, src in (("w13", self.w13), ("s13", self.s13), ("w2", self.w2), ("s2", self.s2)):
+                b[gk][i].copy_(src[e], non_blocking=True)
+        local = torch.arange(n_pairs, device=xq.device, dtype=torch.int32)  # staged experts are in pair order
+        gu = cukern.fp4_gemv_pairs(xq, b["w13"][:n_pairs], b["s13"][:n_pairs], tok.to(torch.int32), local, ones, n_pairs)
+        hq = swiglu_quant(gu, weights.flatten().float().contiguous(), self.inter, self.swiglu_limit)
+        y2 = cukern.fp4_gemv_pairs(hq, b["w2"][:n_pairs], b["s2"][:n_pairs], pair_rows.to(torch.int32), local, ones, n_pairs)
+        return y2.view(n_tok, self.topk, self.dim).sum(dim=1)
+
+    def _prefill_offload(self, xq, indices, weights, n_tok, n_pairs, tok, pair_rows, ones, chunk: int = 64):
+        """Stream all experts through the GPU in chunks; each pair is computed in the chunk of its expert."""
+        E = self.w13.shape[0]
+        b = self._staging(chunk, "prefill")
+        eid = indices.flatten()
+        gu = torch.zeros(n_pairs, 2 * self.inter, device=xq.device, dtype=torch.float32)
+        for c0 in range(0, E, chunk):
+            n = min(chunk, E - c0)
+            for gk, src in (("w13", self.w13), ("s13", self.s13)):
+                b[gk][:n].copy_(src[c0 : c0 + n], non_blocking=True)
+            sel = ((eid >= c0) & (eid < c0 + n)).nonzero().flatten()
+            if sel.numel() == 0:
+                continue
+            p1 = GroupedPairs((eid[sel] - c0).to(torch.int32), tok[sel], pair_rows[sel], ones[sel], 64)
+            grouped_fp4_gemm(xq, b["w13"][:n], b["s13"][:n], p1, n_pairs, out=gu)
+        hq = swiglu_quant(gu, weights.flatten().float().contiguous(), self.inter, self.swiglu_limit)
+        y = torch.zeros(n_tok, self.dim, device=xq.device, dtype=torch.float32)
+        for c0 in range(0, E, chunk):
+            n = min(chunk, E - c0)
+            for gk, src in (("w2", self.w2), ("s2", self.s2)):
+                b[gk][:n].copy_(src[c0 : c0 + n], non_blocking=True)
+            sel = ((eid >= c0) & (eid < c0 + n)).nonzero().flatten()
+            if sel.numel() == 0:
+                continue
+            p2 = GroupedPairs((eid[sel] - c0).to(torch.int32), pair_rows[sel], tok[sel], ones[sel], 64)
+            grouped_fp4_gemm(hq, b["w2"][:n], b["s2"][:n], p2, n_tok, out=y)
+        return y
+
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.reshape(-1, self.dim)
@@ -410,7 +468,12 @@ class MoE:
         tok, pair_rows, ones = self._pair_tables(n_tok, x.device)
         xq = fake_quant_fp8(x, 32)
         eid = indices.flatten().to(torch.int32)
-        if n_tok <= 16:
+        if self.offload:
+            if n_tok <= 16:
+                y = self._decode_offload(xq, indices, weights, n_tok, n_pairs, tok, pair_rows, ones)
+            else:
+                y = self._prefill_offload(xq, indices, weights, n_tok, n_pairs, tok, pair_rows, ones)
+        elif n_tok <= 16:
             # decode: bandwidth-bound CUDA GEMV, one output row per (token, expert) pair, no atomics
             gu = cukern.fp4_gemv_pairs(xq, self.w13, self.s13, tok.to(torch.int32), eid, ones, n_pairs)
             hq = swiglu_quant(gu, weights.flatten().float().contiguous(), self.inter, self.swiglu_limit)
