@@ -44,55 +44,67 @@ class DecodeRuntime:
                 self.segments.append((blk.device, [blk]))
         self.devices = [d for d, _ in self.segments]
         hc, dim = self.cfg["hc_mult"], self.cfg["dim"]
-        self.pos = {d: torch.zeros((), dtype=torch.int64, device=d) for d in self.devices}
-        self.h_in = {d: torch.zeros(1, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devices}
-        self.h_out = {d: torch.zeros(1, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devices}
-        self.pre_in = {d: torch.zeros(1, 1, hc, dtype=torch.float32, device=d) for d in self.devices}
-        self.pre_out = {d: torch.zeros(1, 1, hc, dtype=torch.float32, device=d) for d in self.devices}
-        self.topk_buf = {d: torch.full((1, 1, self.topk), -1, dtype=torch.int32, device=d) for d in self.devices}
+        B = self.B = args.max_batch_size  # sequences decoded together (all at the same position)
+        # per-batch-row positions (one value replicated: the rows advance in lockstep)
+        self.pos = {d: torch.zeros(B, dtype=torch.int64, device=d) for d in self.devices}
+        self.h_in = {d: torch.zeros(B, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devices}
+        self.h_out = {d: torch.zeros(B, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devices}
+        self.pre_in = {d: torch.zeros(B, 1, hc, dtype=torch.float32, device=d) for d in self.devices}
+        self.pre_out = {d: torch.zeros(B, 1, hc, dtype=torch.float32, device=d) for d in self.devices}
+        self.topk_buf = {d: torch.full((B, 1, self.topk), -1, dtype=torch.int32, device=d) for d in self.devices}
         n_cand = args.max_seq_len + 1
-        self.cand_buf = {d: torch.zeros(1, 1, n_cand, dtype=torch.bool, device=d) for d in self.devices}
-        self.tok = torch.zeros(1, 1, dtype=torch.int64, device=self.devices[0])
-        self.logits = torch.zeros(1, self.cfg["vocab_size"], dtype=torch.float32, device=self.devices[-1])
+        self.cand_buf = {d: torch.zeros(B, 1, n_cand, dtype=torch.bool, device=d) for d in self.devices}
+        self.tok = torch.zeros(B, 1, dtype=torch.int64, device=self.devices[0])
+        self.logits = torch.zeros(B, self.cfg["vocab_size"], dtype=torch.float32, device=self.devices[-1])
         self.eng_in: dict[int, torch.Tensor] = {}
         for blk in model.blocks:
             if blk.engram is not None:
                 cols = blk.engram.wkv.shape[1]
-                self.eng_in[blk.layer_id] = torch.zeros(1, 1, cols, dtype=torch.bfloat16, device=blk.device)
+                self.eng_in[blk.layer_id] = torch.zeros(B, 1, cols, dtype=torch.bfloat16, device=blk.device)
         # owners: the row written this step (value + index), to propagate to mirrors on other devices
         self.kv_row: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.ik_row: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for blk in model.blocks:
             if blk.attn.is_kv_source:
                 d = blk.device
-                self.kv_row[blk.layer_id] = (torch.zeros(1, 1, self.cfg["head_dim"], dtype=torch.bfloat16, device=d), torch.zeros(1, dtype=torch.int64, device=d))
-                self.ik_row[blk.layer_id] = (torch.zeros(1, 1, self.cfg["index_head_dim"], dtype=torch.bfloat16, device=d), torch.zeros(1, dtype=torch.int64, device=d))
+                self.kv_row[blk.layer_id] = (torch.zeros(B, 1, self.cfg["head_dim"], dtype=torch.bfloat16, device=d), torch.zeros(1, dtype=torch.int64, device=d))
+                self.ik_row[blk.layer_id] = (torch.zeros(B, 1, self.cfg["index_head_dim"], dtype=torch.bfloat16, device=d), torch.zeros(1, dtype=torch.int64, device=d))
         self.arange_win = {d: torch.arange(self.win, device=d) for d in self.devices}
+        # DSpark: the attention inputs of the target layers (mean over the hc copies), captured inside the graphs
+        self.target_layers = list(self.cfg.get("dspark_target_layer_ids", []))
+        # routing telemetry (DSV41_ROUTE_LOG=1): the gate result of every layer in persistent buffers
+        self.route_log = os.environ.get("DSV41_ROUTE_LOG") == "1"
+        topk_e = self.cfg["n_activated_experts"]
+        self.route_eid = {b.layer_id: torch.zeros(B, topk_e, dtype=torch.int32, device=b.device) for b in model.blocks} if self.route_log else {}
+        self.route_wt = {b.layer_id: torch.zeros(B, topk_e, dtype=torch.float32, device=b.device) for b in model.blocks} if self.route_log else {}
+        self.main_hid = {lid: torch.zeros(B, dim, dtype=torch.bfloat16, device=model.blocks[lid].device) for lid in self.target_layers if lid < len(model.blocks)}
         self.graphs: dict[torch.device, torch.cuda.CUDAGraph] = {}
         self.kv_owner = -1
         self.index_owner = -1
 
     # ------------------------------------------------------------------ attention (static)
     def attention2(self, A: Attention, x: torch.Tensor, xq: torch.Tensor, d: torch.device) -> torch.Tensor:
-        """x: rmsnorm output bf16 [1, dim] (unquantized, for the compressor/indexer); xq: its fp8 fake-quantized copy."""
+        """x: rmsnorm output bf16 [B, dim] (unquantized, for the compressor/indexer); xq: its fp8 fake-quantized copy."""
+        B = x.shape[0]
         pos = self.pos[d]
+        pos0 = pos[0]  # the rows share the position
         rd, eps = self.rd, A.eps
         qr = norm_quant(linear_w(xq, A.wq_a), A.q_norm_w, eps)  # q_norm output, already fp8-rounded for wq_b / indexer
-        q = linear_w(qr, A.wq_b).view(1, 1, A.n_heads, A.head_dim)
+        q = linear_w(qr, A.wq_b).view(B, 1, A.n_heads, A.head_dim)
         rope_dev_(q, rd, A.cos, A.sin, pos)
         kv_write(linear_w(xq, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps)
         if A.ratio:
             ratio = A.ratio
-            compress_len = torch.div(pos + 1, ratio, rounding_mode="floor")
+            compress_len = torch.div(pos0 + 1, ratio, rounding_mode="floor")
             latent = None
-            x3 = x.view(1, 1, -1)
+            x3 = x.view(B, 1, -1)
             if A.is_kv_source:
                 self.kv_owner = A.layer_id
-                latent, should = self.compressor(A, x3, pos)
+                latent, should = self.compressor(A, x3, pos0)
                 cache = self.m.shared.compress_kv[(A.layer_id, d)]
                 row = torch.where(should, compress_len - 1, torch.full_like(compress_len, cache.shape[1] - 1))
             if A.is_index_source:
-                idxs = self.indexer(A, x3, qr.view(1, 1, -1), latent, pos, compress_len, d, row if A.is_kv_source else None)
+                idxs = self.indexer(A, x3, qr.view(B, 1, -1), latent, pos, compress_len, d, row if A.is_kv_source else None)
                 self.topk_buf[d].copy_(idxs)
             else:
                 idxs = self.topk_buf[d]
@@ -100,15 +112,15 @@ class DecodeRuntime:
                 latent = latent.contiguous()
                 rope_dev_(latent, rd, A.cos, A.sin, pos, add=1 - ratio)
                 latent = fake_quant_fp4(latent, 16, scale_e4m3=True)
-                cache.index_copy_(1, row, latent)
+                cache.index_copy_(1, row.view(1), latent)
                 val, idx = self.kv_row[A.layer_id]
                 val.copy_(latent)
-                idx.copy_(row)
+                idx.copy_(row.view(1))
             ckv = self.m.shared.compress_kv[(self.kv_owner, d)]
             o = sattn2(q, A.window_kv_cache, ckv, idxs, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale)
         else:
             o = sattn2(q, A.window_kv_cache, None, None, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale)
-        o = oproj_a(o.view(1, 1, A.n_groups, -1), A.wo_a, A.n_groups, A.o_lora_rank)
+        o = oproj_a(o.view(B, 1, A.n_groups, -1), A.wo_a, A.n_groups, A.o_lora_rank)
         return linear_fp8(o, A.wo_b)
 
     def attention(self, A: Attention, x: torch.Tensor, d: torch.device) -> torch.Tensor:
@@ -178,10 +190,10 @@ class DecodeRuntime:
             rope_dev_(k, rd, I.cos, I.sin, pos, add=1 - ratio)
             k = fake_quant_fp4(k, 32)
             cache = self.m.shared.index_k[(A.layer_id, d)]
-            cache.index_copy_(1, row, k)
+            cache.index_copy_(1, row.view(1), k)
             val, idx = self.ik_row[A.layer_id]
             val.copy_(k)
-            idx.copy_(row)
+            idx.copy_(row.view(1))
         q = linear_fp8(qr, I.wq_b).unflatten(-1, (I.n_heads, I.head_dim))
         rope_dev_(q, rd, I.cos, I.sin, pos)
         q = fake_quant_fp4(q, 32)
@@ -208,7 +220,7 @@ class DecodeRuntime:
         stream (a parallel graph branch; it is only needed at hc_post) and `side` must be joined by _hc_join first.
         want_perm: also the 8-k permuted copy of xq for the tensor-core expert GEMM."""
         fn, scale, base = params
-        if not HC_FORK:
+        if not HC_FORK and h.shape[0] == 1:  # the single fused kernel is one row only
             mixes = hc_mix(h, fn, blk.eps)
             r = hc_pre_norm_quant(h, pre_in, mixes, scale, base, norm_w, blk.eps, blk.hc_eps, blk.sinkhorn_iters, want_f32=want_f32, out=out, want_perm=want_perm)
             return (r[0], r[1], r[2]), None, *r[3:]
@@ -241,7 +253,7 @@ class DecodeRuntime:
             torch.cuda.current_stream(d).wait_stream(side)
 
     def block2(self, blk: Block, h: torch.Tensor, pre_mix: torch.Tensor):
-        """One layer on the residual buffer h [1, 1, hc, dim] (updated in place); pre_mix: [hc] fp32."""
+        """One layer on the residual buffer h [B, 1, hc, dim] (updated in place); pre_mix: [B, hc] fp32."""
         d = blk.device
         (pre_n, post, comb), side, x, xq, _ = self._hc_sub(blk, h, blk.hc_attn, pre_mix, blk.attn_norm_w)
         a = self.attention2(blk.attn, x, xq, d)
@@ -253,31 +265,36 @@ class DecodeRuntime:
         hc_post2_(None, h, post, comb, y2=y2, ys=ys)
         return h, pre_out
 
-    def _tc_tables(self, n: int, d):
-        """Constant group tables for n single-token pairs: group p = pair p (grp_start = 0..n, pair_tok = 0)."""
-        key = (n, d)
+    def _tc_tables(self, n: int, d, topk: int = 0):
+        """Constant group tables for n (token, expert) pairs, one group per pair: grp_start = 0..n, the token of pair p
+        is p // topk (0 when topk == 0), and the w2 input row of pair p is p."""
+        key = (n, d, topk)
         t = self._tc_cache.get(key) if hasattr(self, "_tc_cache") else None
         if t is None:
             if not hasattr(self, "_tc_cache"):
                 self._tc_cache = {}
-            t = self._tc_cache[key] = (torch.arange(n + 1, device=d, dtype=torch.int32), torch.zeros(n, device=d, dtype=torch.int32),
-                                       torch.arange(n, device=d, dtype=torch.int32))
+            tok = torch.arange(n, device=d, dtype=torch.int32) // topk if topk else torch.zeros(n, device=d, dtype=torch.int32)
+            t = self._tc_cache[key] = (torch.arange(n + 1, device=d, dtype=torch.int32), tok, torch.arange(n, device=d, dtype=torch.int32))
         return t
 
-    def experts_tc(self, xqp, hq_permute, w13, s13, w2, s2, eid, wt, inter, limit, n, d):
-        """n single-token (expert, weight) pairs on the tensor-core FP4 GEMM: fp32 [n, dim]. xqp: 8-k permuted x."""
-        starts, tok0, rows = self._tc_tables(n, d)
-        gu = fp4_gemm_tc(xqp, w13, s13, eid, starts, tok0, n, 1)
-        hqp = swiglu_quant(gu, wt, inter, limit, permute=True)
-        return fp4_gemm_tc(hqp, w2, s2, eid, starts, rows, n, 1)
+    def experts_tc(self, xqp, hq_permute, w13, s13, w2, s2, eid, wt, inter, limit, n, d, topk: int = 0):
+        """n (token, expert, weight) pairs on the tensor-core FP4 GEMM: fp32 [n, dim]. xqp: 8-k permuted x [B, K];
+        eid / wt: [n] (or [B, topk] flattened, pair p = token p // topk when topk is given)."""
+        starts, tok, rows = self._tc_tables(n, d, topk)
+        gu = fp4_gemm_tc(xqp, w13, s13, eid.reshape(-1), starts, tok, n, 1)
+        hqp = swiglu_quant(gu, wt.reshape(-1), inter, limit, permute=True)
+        return fp4_gemm_tc(hqp, w2, s2, eid.reshape(-1), starts, rows, n, 1)
 
     def moe2(self, moe, xq: torch.Tensor, xf: torch.Tensor, xqp=None):
         """Routed experts (fp32 [topk, dim], one row per selected expert, routing weight applied) and the shared expert (bf16 [1, dim])."""
         d = xq.device
         scores = F.linear(xf, moe.gate_w)
-        eid, wt = gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1)
+        eid, wt = gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1,
+                            eid=self.route_eid.get(moe.layer_id), wt=self.route_wt.get(moe.layer_id))
         if FP4_TC and xqp is not None:
-            y2 = self.experts_tc(xqp, True, moe.w13, moe.s13, moe.w2, moe.s2, eid, wt, moe.inter, moe.swiglu_limit, moe.topk, d)
+            B = xq.shape[0]
+            y2 = self.experts_tc(xqp, True, moe.w13, moe.s13, moe.w2, moe.s2, eid, wt, moe.inter, moe.swiglu_limit, B * moe.topk, d, topk=moe.topk)
+            y2 = y2.view(B, moe.topk, -1)
         else:
             tok, pair_rows, ones = moe._pair_tables(1, d)
             gu = cukern_fp4(xq, moe.w13, moe.s13, tok, eid, ones, moe.topk)
@@ -287,6 +304,15 @@ class DecodeRuntime:
         hs = swiglu_quant(gu_s, None, moe.inter, moe.swiglu_limit)
         ys = linear_w(hs, moe.sh_w2)
         return y2, ys
+
+    def route_snapshot(self):
+        """(eid [layers, topk] int64, wt [layers, topk] fp32) of the last step (route logging on)."""
+        L = sorted(self.route_eid)
+        eid = torch.stack([self.route_eid[l].cpu() for l in L]).long()  # [layers, B, topk]
+        wt = torch.stack([self.route_wt[l].cpu() for l in L])
+        if self.B == 1:
+            return eid[:, 0], wt[:, 0]
+        return eid, wt
 
     def block(self, blk: Block, x: torch.Tensor, pre_mix: torch.Tensor):
         residual = x
@@ -308,21 +334,23 @@ class DecodeRuntime:
         with torch.cuda.device(d):
             if si == 0:
                 h = F.embedding(self.tok, self.m.embed).unsqueeze(2).repeat(1, 1, self.cfg["hc_mult"], 1)
-                pre = torch.zeros(1, 1, self.cfg["hc_mult"], dtype=torch.float32, device=d)
+                pre = torch.zeros(self.B, 1, self.cfg["hc_mult"], dtype=torch.float32, device=d)
                 pre[:, :, 0] = 1.0
             else:
                 h, pre = self.h_in[d], self.pre_in[d]
             if FUSED2:
                 h = h.contiguous()
-                pre = pre.reshape(-1)
+                pre = pre.reshape(self.B, -1)
             for blk in blocks:
                 if blk.engram is not None:
                     h = blk.engram.apply(h, self.eng_in[blk.layer_id])
                     if FUSED2:
                         h = h.contiguous()
+                if blk.layer_id in self.main_hid:
+                    self.main_hid[blk.layer_id].copy_(h.mean(2).view(self.B, -1))
                 h, pre = (self.block2 if FUSED2 else self.block)(blk, h, pre)
             if FUSED2:
-                pre = pre.view(1, 1, -1)
+                pre = pre.view(self.B, 1, -1)
             if si == len(self.segments) - 1:
                 hh = _hc_pre(h, pre)[:, -1]
                 hh = rmsnorm(hh, self.m.norm_w, self.cfg["norm_eps"])
@@ -370,9 +398,12 @@ class DecodeRuntime:
         torch.cuda.synchronize()
 
     @torch.inference_mode()
-    def step(self, token: int, pos: int) -> torch.Tensor:
-        """One decode step for the token at `pos`; returns logits [1, vocab] on the last device."""
-        self.tok.fill_(token)
+    def step(self, token, pos: int) -> torch.Tensor:
+        """One decode step for the token(s) at `pos` (an int, or one per batch row); returns logits [B, vocab] on the last device."""
+        if isinstance(token, int):
+            self.tok.fill_(token)
+        else:
+            self.tok.copy_(torch.as_tensor(token, dtype=torch.int64).view(-1, 1))
         for d in self.devices:
             self.pos[d].fill_(pos)
         # the owner bookkeeping mirrors the eager path: sources set themselves as they run (in layer order)

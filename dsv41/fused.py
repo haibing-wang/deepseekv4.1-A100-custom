@@ -320,7 +320,7 @@ def swiglu_quant(gu: torch.Tensor, weights: torch.Tensor | None, inter: int, lim
 @triton.jit(do_not_specialize=["n_rows", "add", "pos_stride", "H", "S"])
 def _rope_dev_kernel(X, COS, SIN, POS, n_rows, add, pos_stride, H, S, D: tl.constexpr, RD: tl.constexpr, INVERSE: tl.constexpr):
     row = tl.program_id(0)
-    pos = tl.load(POS) + add + ((row // H) % S) * pos_stride
+    pos = tl.load(POS + row // (H * S)) + add + ((row // H) % S) * pos_stride  # POS: one position per batch row
     j = tl.arange(0, RD // 2)
     base = X + row * D + (D - RD)
     xr = tl.load(base + 2 * j).to(tl.float32)

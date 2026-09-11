@@ -671,6 +671,8 @@ class Transformer:
         h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
         pre_mix = h.new_zeros(h.size(0), h.size(1), self.hc, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
+        targets = set(getattr(self, "collect_main_hidden", ()))
+        main_hiddens = []
         for blk in self.blocks:
             t = time.perf_counter()
             if h.device != blk.device:
@@ -680,7 +682,11 @@ class Transformer:
             if blk.engram is not None:
                 h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :])
                 _tick("engram", t)
+            if blk.layer_id in targets:  # DSpark reads the attention input of its target layers
+                main_hiddens.append(h.mean(dim=2))
             h, pre_mix = blk(h, start_pos, pre_mix)
+        if main_hiddens:
+            self.main_hidden = torch.cat([m.to(main_hiddens[-1].device) for m in main_hiddens], dim=-1)  # [b, s, 3*dim]
         h = self.blocks[-1].hc_pre(h, pre_mix)[:, -1]
         h = rmsnorm(h, self.norm_w, self.args.norm_eps)
         return F.linear(h, self.head).float()

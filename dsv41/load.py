@@ -58,9 +58,10 @@ def _dense(ckpt: Checkpoint, name: str, device):
     return w
 
 
-def load_layer(ckpt: Checkpoint, i: int, device, offload=False, ep: list | None = None) -> dict:
-    """ep: expert parallelism, a list of (device, first_expert, n_experts) shards; the dense part goes to `device`."""
-    p = f"layers.{i}."
+def load_layer(ckpt: Checkpoint, i: int, device, offload=False, ep: list | None = None, prefix: str | None = None) -> dict:
+    """ep: expert parallelism, a list of (device, first_expert, n_experts) shards; the dense part goes to `device`.
+    prefix: checkpoint namespace (default layers.{i}.; the DSpark blocks live under mtp.{i}.)."""
+    p = prefix if prefix is not None else f"layers.{i}."
     w: dict[str, torch.Tensor] = {}
     for n in ckpt.names(p):
         key = n[len(p):]

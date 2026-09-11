@@ -61,7 +61,7 @@ def oproj_a(o: torch.Tensor, wo_a, n_groups: int, rank: int) -> torch.Tensor:
     b, s, g, d = o.shape
     if not isinstance(wo_a, W8):
         return torch.einsum("bsgd,grd->bsgr", o, wo_a.view(n_groups, rank, -1)).flatten(2)
-    if b * s == 1:
+    if b * s <= MAX_TC_ROWS:
         from .cukern import fp8_gemm_tc
-        return fp8_gemm_tc(o.reshape(g, d).contiguous(), wo_a.w8, wo_a.s8, group_cols=rank).view(b, s, -1)
+        return fp8_gemm_tc(o.reshape(b * s * g, d).contiguous(), wo_a.w8, wo_a.s8, group_cols=rank).view(b, s, -1)
     return torch.einsum("bsgd,grd->bsgr", o, wo_a.bf16().view(n_groups, rank, -1)).flatten(2)

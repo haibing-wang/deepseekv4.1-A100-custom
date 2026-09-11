@@ -108,12 +108,14 @@ def _splits_for(N: int, K: int) -> int:
 def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols: int = 0, out_dtype=torch.bfloat16) -> torch.Tensor:
     """x: bf16 [M, K] (M <= 16, contiguous); w8: uint8 (e4m3 bits) [N, K]; s8: uint8 (E8M0) [ceil(N/32), K/32].
     Returns x @ dequant(w8, s8)^T as [M, N] (fp32 accumulation, rounded to out_dtype).
-    group_cols > 0: block-diagonal use (x: [N/group_cols, K]; column n uses x row n // group_cols) -> [1, N]."""
+    group_cols > 0: block-diagonal use (x: [B * N/group_cols, K]; output row b, column n uses x row
+    b * (N/group_cols) + n // group_cols) -> [B, N]."""
     M, K = x.shape
     N = w8.shape[0]
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and w8.is_contiguous() and s8.is_contiguous()
-    assert K % 64 == 0 and N % 8 == 0 and (group_cols == 0 and M <= 16 or group_cols > 0 and group_cols % 8 == 0)
-    Mo = 1 if group_cols else M
+    assert K % 64 == 0 and N % 8 == 0 and (group_cols == 0 and M <= 16 or group_cols > 0 and group_cols % 8 == 0 and N % group_cols == 0)
+    Mo = M // (N // group_cols) if group_cols else M
+    assert Mo <= 16
     splits = _splits_for(N, K)
     kps = -(-K // splits)
     kps = -(-kps // 128) * 128
@@ -193,18 +195,26 @@ def p2p_copy(dst: torch.Tensor, src: torch.Tensor, device: torch.device):
 
 
 def p2p_copy_row(dst_base: torch.Tensor, row_idx: torch.Tensor, src: torch.Tensor, device: torch.device):
-    """dst_base[row_idx] = src (row index is an int64 device scalar; rows are src.numel() elements)."""
-    n = src.numel() * src.element_size()
-    assert n % 16 == 0
+    """dst_base[b, row_idx] = src[b] for every batch row b (dst_base: [B, rows, D], src: [B, 1, D]; row index: int64 device scalar)."""
+    B = dst_base.shape[0]
+    n = src.numel() * src.element_size() // B
+    assert n % 16 == 0 and src.numel() == B * dst_base.shape[-1]
     f = get_function("p2p.cu", "p2p_copy_row", device)
-    n16 = n // 16
-    launch(f, ((n16 + 255) // 256, 1, 1), (256, 1, 1), [ctypes.c_void_p(dst_base.data_ptr()), ctypes.c_void_p(row_idx.data_ptr()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(n16)], device)
+    row16 = n // 16
+    bstride16 = dst_base.stride(0) * dst_base.element_size() // 16
+    launch(f, ((row16 * B + 255) // 256, 1, 1), (256, 1, 1), [ctypes.c_void_p(dst_base.data_ptr()), ctypes.c_void_p(row_idx.data_ptr()), ctypes.c_void_p(src.data_ptr()),
+                                                            ctypes.c_int(row16), ctypes.c_int(B), ctypes.c_longlong(bstride16)], device)
 
 
-def p2p_sum_rows(dst: torch.Tensor, src: torch.Tensor, device: torch.device):
-    rows, n = src.shape
+def p2p_sum_rows(dst: torch.Tensor, src: torch.Tensor, device: torch.device, groups: int = 1, dst_stride: int | None = None):
+    """dst[g] = sum of the `rows` rows of group g of src [groups * rows, n] (dst rows `dst_stride` elements apart)."""
+    total, n = src.shape
+    rows = total // groups
+    if dst_stride is None:
+        dst_stride = dst.stride(0) if dst.dim() > 1 else n
     f = get_function("p2p.cu", "p2p_sum_rows", device)
-    launch(f, ((n + 255) // 256, 1, 1), (256, 1, 1), [ctypes.c_void_p(dst.data_ptr()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(rows), ctypes.c_int(n)], device)
+    launch(f, ((n + 255) // 256, groups, 1), (256, 1, 1), [ctypes.c_void_p(dst.data_ptr()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(rows), ctypes.c_int(n),
+                                                          ctypes.c_int(groups), ctypes.c_longlong(dst_stride)], device)
 
 
 def p2p_signal(flag_ptrs: torch.Tensor, seq: torch.Tensor, device: torch.device):
@@ -224,15 +234,19 @@ def p2p_seq_bump(seq: torch.Tensor, device: torch.device):
     launch(f, (1, 1, 1), (1, 1, 1), [ctypes.c_void_p(seq.data_ptr())], device)
 
 
-def p2p_multicast(dst_ptrs: torch.Tensor, src: torch.Tensor, flag_ptrs: torch.Tensor | None, seq: torch.Tensor, device: torch.device):
-    """One kernel: src (<= 16 KB, size multiple of 16) into every destination address in dst_ptrs (int64 on `device`),
-    then (single block) set the flags at flag_ptrs to seq."""
+def p2p_multicast(dst_ptrs: torch.Tensor, src: torch.Tensor, flag_ptrs: torch.Tensor | None, seq: torch.Tensor, device: torch.device, counter: torch.Tensor | None = None):
+    """One kernel: src (size multiple of 16) into every destination address in dst_ptrs (int64 on `device`), then the last
+    block sets the flags at flag_ptrs to seq (counter: an int32 device scalar, zero at first use, self-resetting)."""
     n = src.numel() * src.element_size()
-    assert n % 16 == 0 and n <= 16 * 1024
+    assert n % 16 == 0
     f = get_function("p2p.cu", "p2p_multicast", device)
     n16 = n // 16
-    launch(f, (1, 1, 1), (1024, 1, 1), [ctypes.c_void_p(dst_ptrs.data_ptr()), ctypes.c_int(dst_ptrs.numel()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(n16),
-                                       ctypes.c_void_p(flag_ptrs.data_ptr() if flag_ptrs is not None else 0), ctypes.c_void_p(seq.data_ptr())], device)
+    blocks = (n16 + 1023) // 1024
+    if flag_ptrs is not None and counter is None:
+        counter = _tile_counters(device, 8192)[-1:]
+    launch(f, (blocks, 1, 1), (1024, 1, 1), [ctypes.c_void_p(dst_ptrs.data_ptr()), ctypes.c_int(dst_ptrs.numel()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(n16),
+                                            ctypes.c_void_p(flag_ptrs.data_ptr() if flag_ptrs is not None else 0), ctypes.c_void_p(seq.data_ptr()),
+                                            ctypes.c_void_p(counter.data_ptr() if counter is not None else 0)], device)
 
 
 def p2p_stamp(dst: torch.Tensor, device: torch.device):

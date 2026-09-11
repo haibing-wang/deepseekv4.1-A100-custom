@@ -8,19 +8,23 @@ extern "C" __global__ void p2p_copy(uint4* __restrict__ dst, const uint4* __rest
     if (i < n16) dst[i] = src[i];
 }
 
-// copy a row of `row16` uint4 from src into dst_base + row_idx * row16 (row index read from device memory)
-extern "C" __global__ void p2p_copy_row(uint4* __restrict__ dst_base, const long long* __restrict__ row_idx, const uint4* __restrict__ src, int row16) {
+// for every batch row b: copy row `row16` uint4 from src[b] into dst_base + b * bstride16 + row_idx * row16
+extern "C" __global__ void p2p_copy_row(uint4* __restrict__ dst_base, const long long* __restrict__ row_idx, const uint4* __restrict__ src,
+                                       int row16, int nb, long long bstride16) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < row16) dst_base[(long long)(*row_idx) * row16 + i] = src[i];
+    if (i >= row16 * nb) return;
+    int b = i / row16, j = i - b * row16;
+    dst_base[b * bstride16 + (long long)(*row_idx) * row16 + j] = src[i];
 }
 
-// sum `rows` fp32 rows of src [rows, n] into dst [n] (used to push a partial expert output)
-extern "C" __global__ void p2p_sum_rows(float* __restrict__ dst, const float* __restrict__ src, int rows, int n) {
+// per group g (< groups): dst[g * dst_stride + i] = sum over `rows` rows of src[(g * rows + r) * n + i]
+extern "C" __global__ void p2p_sum_rows(float* __restrict__ dst, const float* __restrict__ src, int rows, int n, int groups, long long dst_stride) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    int g = blockIdx.y;
+    if (i >= n || g >= groups) return;
     float acc = 0.f;
-    for (int r = 0; r < rows; ++r) acc += src[(long long)r * n + i];
-    dst[i] = acc;
+    for (int r = 0; r < rows; ++r) acc += src[((long long)g * rows + r) * n + i];
+    dst[(long long)g * dst_stride + i] = acc;
 }
 
 // after the preceding kernels of this stream have completed: publish `value` (read from seq_ptr) to up to 8 peer flags
@@ -40,23 +44,26 @@ extern "C" __global__ void p2p_wait(volatile int* flags, int n, const int* seq_p
 
 extern "C" __global__ void p2p_seq_bump(int* seq_ptr) { *seq_ptr += 1; }
 
-// one launch: copy `n16` uint4 of src into up to 8 destinations (peer inboxes), then signal their flags
+// one launch: copy `n16` uint4 of src into up to 8 destinations (peer inboxes); the last block to finish
+// signals their flags (counter reset for the next launch)
 extern "C" __global__ void p2p_multicast(uint4** dsts, int ndst, const uint4* __restrict__ src, int n16,
-                                        int** flags, const int* seq_ptr) {
+                                        int** flags, const int* seq_ptr, unsigned int* counter) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n16) {
         uint4 v = src[i];
         for (int d = 0; d < ndst; ++d) dsts[d][i] = v;
     }
-    // last block to finish signals (counter in shared+global would be needed for multi-block; keep 1 block when signalling)
-    if (flags != nullptr && gridDim.x == 1) {
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            __threadfence_system();
-            int v = *seq_ptr;
-            for (int d = 0; d < ndst; ++d) { volatile int* f = (volatile int*)flags[d]; *f = v; }
-            __threadfence_system();
-        }
+    if (flags == nullptr) return;
+    __threadfence_system();
+    __syncthreads();
+    __shared__ unsigned int last;
+    if (threadIdx.x == 0) last = (atomicInc(counter, gridDim.x - 1) == gridDim.x - 1);
+    __syncthreads();
+    if (last && threadIdx.x == 0) {
+        __threadfence_system();
+        int v = *seq_ptr;
+        for (int d = 0; d < ndst; ++d) { volatile int* f = (volatile int*)flags[d]; *f = v; }
+        __threadfence_system();
     }
 }
 

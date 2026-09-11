@@ -64,8 +64,11 @@ __device__ __forceinline__ void fp8_gemm_tc_body(const __nv_bfloat16* __restrict
     const uint8_t* wrow = W + (long long)n * K;
     const uint8_t* srow = S + (long long)(n >> 5) * Kc;
     int xr0, xr1;
-    if (group_cols > 0) { xr0 = n0 / group_cols; xr1 = -1; }
-    else { xr0 = g < M ? g : -1; xr1 = (!M8 && g + 8 < M) ? g + 8 : -1; }
+    if (group_cols > 0) {  // block-diagonal: row b of the output uses x row b * xgroups + (column group)
+        const int xgroups = N / group_cols;
+        xr0 = g < M ? g * xgroups + n0 / group_cols : -1;
+        xr1 = (!M8 && g + 8 < M) ? (g + 8) * xgroups + n0 / group_cols : -1;
+    } else { xr0 = g < M ? g : -1; xr1 = (!M8 && g + 8 < M) ? g + 8 : -1; }
     const __nv_bfloat16* x0 = xr0 >= 0 ? X + (long long)xr0 * ldx : nullptr;
     const __nv_bfloat16* x1 = xr1 >= 0 ? X + (long long)xr1 * ldx : nullptr;
     float c[4] = {0.f, 0.f, 0.f, 0.f};
@@ -117,12 +120,8 @@ __device__ __forceinline__ void fp8_gemm_tc_body(const __nv_bfloat16* __restrict
         }
     }
     float* o = out + (long long)blockIdx.y * M * ldo;
-    if (group_cols > 0) {
-        if (g == 0) { o[n0 + 2 * t] = c[0]; o[n0 + 2 * t + 1] = c[1]; }
-    } else {
-        if (g < M) { o[(long long)g * ldo + n0 + 2 * t] = c[0]; o[(long long)g * ldo + n0 + 2 * t + 1] = c[1]; }
-        if (!M8 && g + 8 < M) { o[(long long)(g + 8) * ldo + n0 + 2 * t] = c[2]; o[(long long)(g + 8) * ldo + n0 + 2 * t + 1] = c[3]; }
-    }
+    if (g < M) { o[(long long)g * ldo + n0 + 2 * t] = c[0]; o[(long long)g * ldo + n0 + 2 * t + 1] = c[1]; }
+    if (!M8 && g + 8 < M) { o[(long long)(g + 8) * ldo + n0 + 2 * t] = c[2]; o[(long long)(g + 8) * ldo + n0 + 2 * t + 1] = c[3]; }
     if (y == nullptr) return;
     // epilogue: the last warp to finish this 8-column tile (over all splits) sums the partials in split
     // order and writes bf16. Counter per tile, reset for the next launch.
@@ -132,7 +131,7 @@ __device__ __forceinline__ void fp8_gemm_tc_body(const __nv_bfloat16* __restrict
     __syncwarp();
     if (!last[warp]) return;
     __threadfence();
-    const int rows = group_cols > 0 ? 1 : M;
+    const int rows = M;
     for (int i = lane; i < rows * 8; i += 32) {
         const int r = i >> 3, col = n0 + (i & 7);
         float acc = 0.f;

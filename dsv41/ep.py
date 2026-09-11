@@ -42,6 +42,7 @@ class EPRuntime(DecodeRuntime):
         nl = len(model.blocks)
         hc, dim, topk = self.cfg["hc_mult"], self.cfg["dim"], self.cfg["n_activated_experts"]
         self.topk_e = topk
+        B = self.B
         # peer access (torch enables it lazily on a copy)
         for a in self.devs:
             for b in self.devs:
@@ -49,21 +50,22 @@ class EPRuntime(DecodeRuntime):
                     torch.zeros(1, device=a).to(b)
         # static buffers
         self.seq = {d: torch.ones(1, dtype=torch.int32, device=d) for d in self.devs}
-        self.hop_h = {d: torch.zeros(1, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devs}
-        self.hop_pre = {d: torch.zeros(hc, dtype=torch.float32, device=d) for d in self.devs}
-        self.pre_identity = {d: torch.tensor([1.0] + [0.0] * (hc - 1), dtype=torch.float32, device=d) for d in self.devs}
-        # routing message: [xqp bf16 dim | eid int32 x8 | wt fp32 x8] in one buffer (owner's outbox / peers' inbox)
-        msg_bytes = dim * 2 + 64
+        self.hop_h = {d: torch.zeros(B, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devs}
+        self.hop_pre = {d: torch.zeros(B, hc, dtype=torch.float32, device=d) for d in self.devs}
+        self.pre_identity = {d: torch.tensor([[1.0] + [0.0] * (hc - 1)] * B, dtype=torch.float32, device=d) for d in self.devs}
+        # routing message: [xqp bf16 [B, dim] | eid int32 [B, topk] | wt fp32 [B, topk]] in one buffer (owner's outbox / peers' inbox)
+        nx, ne = B * dim * 2, B * topk * 4
+        msg_bytes = -(-(nx + 2 * ne) // 16) * 16
         self.outbox = {d: torch.zeros(msg_bytes, dtype=torch.uint8, device=d) for d in self.devs}
         self.inbox = {d: torch.zeros(msg_bytes, dtype=torch.uint8, device=d) for d in self.devs}
         def views(buf):
-            return (buf[: dim * 2].view(torch.bfloat16).view(1, dim), buf[dim * 2 : dim * 2 + 32].view(torch.int32), buf[dim * 2 + 32 :].view(torch.float32))
+            return (buf[:nx].view(torch.bfloat16).view(B, dim), buf[nx : nx + ne].view(torch.int32).view(B, topk), buf[nx + ne : nx + 2 * ne].view(torch.float32).view(B, topk))
         self.xqp_out, self.eid8, self.wt8 = {}, {}, {}
         self.inbox_x, self.inbox_eid, self.inbox_wt = {}, {}, {}
         for d in self.devs:
             self.xqp_out[d], self.eid8[d], self.wt8[d] = views(self.outbox[d])
             self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d] = views(self.inbox[d])
-        self.part_in = {d: torch.zeros(self.nd, dim, dtype=torch.float32, device=d) for d in self.devs}
+        self.part_in = {d: torch.zeros(B, self.nd, dim, dtype=torch.float32, device=d) for d in self.devs}  # [b, sender, dim]
         self.flag_route = {d: torch.zeros(nl, dtype=torch.int32, device=d) for d in self.devs}
         self.flag_part = {d: torch.zeros(nl, self.nd, dtype=torch.int32, device=d) for d in self.devs}
         self.flag_hop = {d: torch.zeros(nl + 1, dtype=torch.int32, device=d) for d in self.devs}
@@ -89,9 +91,10 @@ class EPRuntime(DecodeRuntime):
             self._ptrs[("own", L, o)] = torch.tensor([self.flag_part[o][L, self.idx[o]].data_ptr()], dtype=torch.int64, device=o)
         # the candidate buffers travel between devices with 16-byte copies: pad them
         n_cand = -(-(model.args.max_seq_len + 1) // 16) * 16
-        self.cand_buf = {d: torch.zeros(1, 1, n_cand, dtype=torch.bool, device=d) for d in self.devs}
+        self.cand_buf = {d: torch.zeros(B, 1, n_cand, dtype=torch.bool, device=d) for d in self.devs}
         for d in self.devs:
-            self._tc_tables(topk, d)
+            self._tc_tables(B * topk, d, topk)
+        self.mcast_counter = {d: torch.zeros(1, dtype=torch.int32, device=d) for d in self.devs}
         self.graphs = {}
         self.logits = torch.zeros(1, self.cfg["vocab_size"], dtype=torch.float32, device=self.devs[-1])
         self.first_layer = {d: min(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
@@ -113,12 +116,14 @@ class EPRuntime(DecodeRuntime):
 
     # ------------------------------------------------------------------ pieces
     def _experts_shard(self, d, xqp, eid, wt, moe):
+        """This GPU's experts for the B * topk (token, expert) pairs: fp32 [B * topk, dim] (rows of other shards zero)."""
         start, n = self.shard[d]
         sh = [s for s in moe.ep if s["device"] == d][0]
-        starts, tok0, rows = self._tc_tables(self.topk_e, d)
-        gu = fp4_gemm_tc(xqp, sh["w13"], sh["s13"], eid, starts, tok0, self.topk_e, 1, shard_start=start, shard_n=n, zero_out=False)
-        hqp = swiglu_quant(gu, wt, moe.inter, moe.swiglu_limit, permute=True)
-        return fp4_gemm_tc(hqp, sh["w2"], sh["s2"], eid, starts, rows, self.topk_e, 1, shard_start=start, shard_n=n, zero_out=True)
+        npairs = self.B * self.topk_e
+        starts, tok, rows = self._tc_tables(npairs, d, self.topk_e)
+        gu = fp4_gemm_tc(xqp, sh["w13"], sh["s13"], eid.reshape(-1), starts, tok, npairs, 1, shard_start=start, shard_n=n, zero_out=False)
+        hqp = swiglu_quant(gu, wt.reshape(-1), moe.inter, moe.swiglu_limit, permute=True)
+        return fp4_gemm_tc(hqp, sh["w2"], sh["s2"], eid.reshape(-1), starts, rows, npairs, 1, shard_start=start, shard_n=n, zero_out=True)
 
     def _push_cache_rows(self, blk: Block, d):
         """After an owner ran a KV / index source layer: mirror the written rows to the later devices."""
@@ -148,11 +153,11 @@ class EPRuntime(DecodeRuntime):
         (pre_out, post, comb), side, x, xq, xf, xqp = self._hc_sub(blk, h, blk.hc_ffn, pre_n, blk.ffn_norm_w, want_f32=True, want_perm=True,
                                                                  out={"yqp": self.xqp_out[d]})
         scores = F.linear(xf, moe.gate_w)
-        eid, wt = self.eid8[d][: self.topk_e], self.wt8[d][: self.topk_e]
+        eid, wt = self.eid8[d], self.wt8[d]
         gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1, eid=eid, wt=wt)
         # routing + activation to every peer and the flags: one launch
         if not self.dry:
-            p2p_multicast(self.sig_inbox[d], self.outbox[d], self.sig_route[L], self.seq[d], d)
+            p2p_multicast(self.sig_inbox[d], self.outbox[d], self.sig_route[L], self.seq[d], d, counter=self.mcast_counter[d])
         self._stamp(d, L, 2)
         xqp = self.xqp_out[d]
         # own shard and, on a second stream, the shared expert, while the peers work
@@ -162,7 +167,7 @@ class EPRuntime(DecodeRuntime):
         with torch.cuda.stream(side2):
             ys = self._shared_expert(moe, xq)
         y_loc = self._experts_shard(d, xqp, eid, wt, moe)
-        p2p_sum_rows(self.part_in[d][self.idx[d]], y_loc, d)
+        p2p_sum_rows(self.part_in[d][:, self.idx[d]], y_loc, d, groups=self.B, dst_stride=self.part_in[d].stride(0))
         main.wait_stream(side2)
         self._stamp(d, L, 3)
         # wait for the peers' partials (own slot is raised by a local signal so the whole row can be waited on)
@@ -196,8 +201,8 @@ class EPRuntime(DecodeRuntime):
         o = blk.device
         self._wait(self.flag_route[d][L : L + 1], d)
         self._stamp(d, L, 6)
-        y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d][: self.topk_e], self.inbox_wt[d][: self.topk_e], blk.ffn)
-        p2p_sum_rows(self.part_in[o][self.idx[d]], y, d)  # straight into the owner's inbox row
+        y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d], blk.ffn)
+        p2p_sum_rows(self.part_in[o][:, self.idx[d]], y, d, groups=self.B, dst_stride=self.part_in[o].stride(0))  # straight into the owner's inbox column
         self._signal(self.sig_part[(L, d)], d)
         self._stamp(d, L, 7)
 
@@ -231,7 +236,7 @@ class EPRuntime(DecodeRuntime):
                         p2p_copy(self.cand_buf[nxt], self.cand_buf[d], d)
                         self._signal(self.sig_hop[L], d)
                     else:
-                        hh = _hc_pre(h, pre.view(1, 1, -1))[:, -1]
+                        hh = _hc_pre(h, pre.view(self.B, 1, -1))[:, -1]
                         hh = rmsnorm(hh, self.m.norm_w, self.cfg["norm_eps"])
                         self.logits.copy_(F.linear(hh, self.m.head).float())
             else:
