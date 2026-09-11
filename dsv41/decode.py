@@ -14,6 +14,7 @@ import time
 import torch
 import torch.nn.functional as F
 
+from . import cukern
 from .cukern import fp4_gemm_tc, fp4_gemv_pairs as cukern_fp4
 from .fused import fake_quant_fp4, fake_quant_fp8, rmsnorm, rope_dev_, sparse_attn_decode_split as sparse_attn_decode2, swiglu_quant
 from .fused2 import gate_topk, hc_mix, hc_post2_, hc_pre_norm_quant, hc_pre_norm_quant2, hc_sinkhorn, kv_write, norm_quant, sattn2
@@ -46,7 +47,8 @@ class DecodeRuntime:
         hc, dim = self.cfg["hc_mult"], self.cfg["dim"]
         B = self.B = args.max_batch_size  # rows decoded together; row r is a token at position pos[r] of sequence seq[r]
         self.pos = {d: torch.zeros(B, dtype=torch.int64, device=d) for d in self.devices}
-        self.seq = {d: torch.arange(B, dtype=torch.int64, device=d) for d in self.devices}
+        S = self.S = args.max_seqs or B  # sequence slots (the caches are sized by it)
+        self.seq = {d: torch.arange(B, dtype=torch.int64, device=d) % S for d in self.devices}
         self.pmax = {d: torch.zeros(B, dtype=torch.int64, device=d) for d in self.devices}  # newest position written to the row's sequence this step
         self.h_in = {d: torch.zeros(B, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devices}
         self.h_out = {d: torch.zeros(B, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devices}
@@ -327,18 +329,19 @@ class DecodeRuntime:
         ar = torch.arange(n, device=d)
         is_new = torch.ones(n, dtype=torch.bool, device=d)
         is_new[1:] = se[1:] != se[:-1]
-        if B > 16:  # a group holds at most 16 tokens: split longer runs of the same expert
+        gmax = cukern.FP4_W_MAX if cukern.FP4_W_LAYOUT else 16  # tokens per group the kernels handle
+        if B > gmax:  # split longer runs of the same expert
             gid0 = torch.cumsum(is_new.to(torch.int64), 0) - 1
             first = torch.full((n,), n, dtype=torch.int64, device=d).scatter_reduce_(0, gid0, torch.where(is_new, ar, torch.full_like(ar, n)), "amin")
-            is_new = is_new | (((ar - first[gid0]) % 16) == 0)
+            is_new = is_new | (((ar - first[gid0]) % gmax) == 0)
         gid = torch.cumsum(is_new.to(torch.int64), 0) - 1
         grp_expert = torch.full((n,), -1, dtype=torch.int32, device=d).scatter_(0, gid, se.to(torch.int32))
         grp_start = torch.full((n + 1,), n, dtype=torch.int32, device=d)
         grp_start.scatter_reduce_(0, gid, torch.where(is_new, ar, torch.full_like(ar, n)).to(torch.int32), "amin")
-        gu = fp4_gemm_tc(xqp, w13, s13, grp_expert, grp_start, tok_sorted, n, min(B, 16), shard_start=shard[0], shard_n=shard[1], zero_out=False)
+        gu = fp4_gemm_tc(xqp, w13, s13, grp_expert, grp_start, tok_sorted, n, min(B, gmax), shard_start=shard[0], shard_n=shard[1], zero_out=False)
         hqp = swiglu_quant(gu, wt_sorted, inter, limit, permute=True)
         rows = ar.to(torch.int32)
-        y2s = fp4_gemm_tc(hqp, w2, s2, grp_expert, grp_start, rows, n, min(B, 16), shard_start=shard[0], shard_n=shard[1], zero_out=True)
+        y2s = fp4_gemm_tc(hqp, w2, s2, grp_expert, grp_start, rows, n, min(B, gmax), shard_start=shard[0], shard_n=shard[1], zero_out=True)
         inv = torch.empty_like(order).scatter_(0, order, ar)
         return y2s[inv]
 
@@ -477,7 +480,7 @@ class DecodeRuntime:
         tok = as_rows(token, torch.int64)
         self.tok.copy_(tok.view(-1, 1))
         p = as_rows(pos, torch.int64)
-        sq = as_rows(seq, torch.int64) if seq is not None else torch.arange(B, dtype=torch.int64)
+        sq = as_rows(seq, torch.int64) if seq is not None else torch.arange(B, dtype=torch.int64) % self.S
         pm = as_rows(pmax, torch.int64) if pmax is not None else p
         for d in self.devices:
             self.pos[d].copy_(p)

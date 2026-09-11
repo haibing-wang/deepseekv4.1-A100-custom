@@ -105,6 +105,12 @@ def _splits_for(N: int, K: int) -> int:
     return s
 
 
+FP8_W_LAYOUT = os.environ.get("DSV41_FP8_W", "1") == "1"
+FP8_W_SPLITS = int(os.environ.get("DSV41_FP8_W_SPLITS", "0"))
+FP8_W_STAGES = int(os.environ.get("DSV41_FP8_W_STAGES", "3"))  # x stages in shared memory
+_attr_done: set = set()  # experiment: force the split-K factor
+
+
 def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols: int = 0, out_dtype=torch.bfloat16) -> torch.Tensor:
     """x: bf16 [M, K] (M <= 16, contiguous); w8: uint8 (e4m3 bits) [N, K]; s8: uint8 (E8M0) [ceil(N/32), K/32].
     Returns x @ dequant(w8, s8)^T as [M, N] (fp32 accumulation, rounded to out_dtype).
@@ -115,17 +121,35 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and w8.is_contiguous() and s8.is_contiguous()
     assert K % 64 == 0 and N % 8 == 0 and (group_cols == 0 or group_cols % 8 == 0 and N % group_cols == 0)
     Mo = M // (N // group_cols) if group_cols else M
-    if Mo > 16:  # the kernel handles 16 rows: chunk
+    wlayout = FP8_W_LAYOUT and Mo > 16 and N % 64 == 0 and (group_cols == 0 or group_cols % 64 == 0)
+    rows_per = 64 if wlayout else 16
+    if Mo > rows_per:  # chunk
         per = (N // group_cols) if group_cols else 1
-        return torch.cat([fp8_gemm_tc(x[i * per : (i + 16) * per], w8, s8, group_cols, out_dtype) for i in range(0, Mo, 16)], dim=0)
-    splits = _splits_for(N, K)
+        return torch.cat([fp8_gemm_tc(x[i * per : (i + rows_per) * per], w8, s8, group_cols, out_dtype) for i in range(0, Mo, rows_per)], dim=0)
+    WARPS = 4
+    if wlayout:  # weights as the mma A operand (16 columns per warp), up to 64 rows per pass, weights read once
+        MT = 2 if Mo <= 16 else 4 if Mo <= 32 else 8
+        splits = 1  # ~3 blocks per SM (>= 256 blocks) with the fp32 partials kept under half the weight bytes
+        while (N // 64) * splits < 256 and splits * 2 * Mo * 8 <= K and K // (splits * 2) >= 256:
+            splits *= 2
+        if FP8_W_SPLITS:
+            splits = FP8_W_SPLITS
+    else:
+        splits = _splits_for(N, K)
     kps = -(-K // splits)
     kps = -(-kps // 128) * 128
     splits = -(-K // kps)
     part = torch.empty(splits, Mo, N, device=x.device, dtype=torch.float32)
-    f = get_function("fp8_tc.cu", "fp8_gemm_tc8" if Mo <= 8 else "fp8_gemm_tc16", x.device)
-    WARPS = 4
-    grid = ((N // 8 + WARPS - 1) // WARPS, splits, 1)
+    if wlayout:
+        f = get_function("fp8_tcw.cu", f"fp8_gemm_tcw{MT}s{FP8_W_STAGES}", x.device)
+        grid = (N // 64, splits, 1)
+        shared = FP8_W_STAGES * 8 * MT * 256
+        if (f.value, x.device.index) not in _attr_done:  # dynamic shared memory above 48 KB needs the attribute
+            _check(_cuda.cuFuncSetAttribute(f, 8, ctypes.c_int(shared)), "cuFuncSetAttribute")  # CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+            _attr_done.add((f.value, x.device.index))
+    else:
+        f = get_function("fp8_tc.cu", "fp8_gemm_tc8" if Mo <= 8 else "fp8_gemm_tc16", x.device)
+        grid = ((N // 8 + WARPS - 1) // WARPS, splits, 1)
     fused_epilogue = out_dtype == torch.bfloat16
     y = torch.empty(Mo, N, device=x.device, dtype=torch.bfloat16) if fused_epilogue else None
     counters = _tile_counters(x.device, N // 8) if fused_epilogue else None
@@ -133,7 +157,7 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
             ctypes.c_void_p(w8.data_ptr()), ctypes.c_void_p(s8.data_ptr()), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(s8.shape[1]),
             ctypes.c_void_p(part.data_ptr()), ctypes.c_int(N), ctypes.c_int(kps), ctypes.c_int(group_cols),
             ctypes.c_void_p(y.data_ptr() if y is not None else 0), ctypes.c_void_p(counters.data_ptr() if counters is not None else 0), ctypes.c_int(splits)]
-    launch(f, grid, (WARPS * 32, 1, 1), args, x.device)
+    launch(f, grid, (WARPS * 32, 1, 1), args, x.device, shared=shared if wlayout else 0)
     if fused_epilogue:
         return y
     y = part[0] if splits == 1 else part.sum(dim=0)
@@ -161,28 +185,44 @@ def permute_x(x: torch.Tensor) -> torch.Tensor:
     return x.view(M, K // 8, 8)[:, :, _PERM8].reshape(M, K).contiguous()
 
 
+FP4_W_LAYOUT = os.environ.get("DSV41_FP4_W", "1") == "1"
+FP4_W_MAX = 64  # tokens per group the second layout handles (groups are split at this size)
+
+
 def fp4_gemm_tc(xp: torch.Tensor, w: torch.Tensor, s: torch.Tensor, grp_expert: torch.Tensor, grp_start: torch.Tensor,
                 pair_tok: torch.Tensor, n_pairs: int, max_tokens: int, shard_start: int = 0, shard_n: int = 1 << 30,
                 zero_out: bool = False, out: torch.Tensor | None = None) -> torch.Tensor:
     """xp: permuted bf16 [rows, K]; w: uint8 [E, N, K/2]; s: uint8 [E, N, K/32]; groups g: expert grp_expert[g] with pairs
-    grp_start[g]..grp_start[g+1]-1 (<= 16 each), pair p uses x row pair_tok[p]. Returns fp32 [n_pairs, N].
+    grp_start[g]..grp_start[g+1]-1 (<= max_tokens each), pair p uses x row pair_tok[p]. Returns fp32 [n_pairs, N].
+    Groups of <= 8 tokens run on fp4_tc.cu (x as the mma A operand); larger groups (up to 64) on fp4_tcw.cu, which
+    reads the expert once whatever the token count (fp4_tc.cu's 16-token variant handles 9..16 when disabled).
     Expert parallelism: ids are global, this GPU holds [shard_start, shard_start + shard_n); other groups are skipped
     (zero_out: their output rows are zeroed)."""
     E, N, Kh = w.shape
     K = Kh * 2
-    assert xp.dtype == torch.bfloat16 and xp.is_contiguous() and K % 128 == 0 and N % 8 == 0 and max_tokens <= 16
+    assert xp.dtype == torch.bfloat16 and xp.is_contiguous() and K % 128 == 0 and N % 8 == 0
     G = grp_expert.numel()
     if out is None:
         out = torch.empty(n_pairs, N, device=xp.device, dtype=torch.float32)
-    f = get_function("fp4_tc.cu", "fp4_gemm_tc8" if max_tokens <= 8 else "fp4_gemm_tc16", xp.device)
     WARPS = 4
-    grid = ((N // 8 + WARPS - 1) // WARPS, G, 1)
-    args = [ctypes.c_void_p(xp.data_ptr()), ctypes.c_int(xp.stride(0)),
-            ctypes.c_void_p(w.data_ptr()), ctypes.c_longlong(w.stride(0)), ctypes.c_void_p(s.data_ptr()), ctypes.c_longlong(s.stride(0)),
-            ctypes.c_void_p(grp_expert.data_ptr()), ctypes.c_void_p(grp_start.data_ptr()), ctypes.c_void_p(pair_tok.data_ptr()),
-            ctypes.c_void_p(out.data_ptr()), ctypes.c_int(N), ctypes.c_int(N), ctypes.c_int(K),
-            ctypes.c_int(shard_start), ctypes.c_int(min(shard_n, E)), ctypes.c_int(1 if zero_out else 0)]
-    launch(f, grid, (WARPS * 32, 1, 1), args, xp.device)
+    big = max_tokens > 8 and (FP4_W_LAYOUT or max_tokens > 16)
+    assert max_tokens <= (FP4_W_MAX if big else 16)
+    assert not big or N % 64 == 0
+    common = [ctypes.c_void_p(xp.data_ptr()), ctypes.c_int(xp.stride(0)),
+              ctypes.c_void_p(w.data_ptr()), ctypes.c_longlong(w.stride(0)), ctypes.c_void_p(s.data_ptr()), ctypes.c_longlong(s.stride(0)),
+              ctypes.c_void_p(grp_expert.data_ptr()), ctypes.c_void_p(grp_start.data_ptr()), ctypes.c_void_p(pair_tok.data_ptr()),
+              ctypes.c_void_p(out.data_ptr()), ctypes.c_int(N), ctypes.c_int(N), ctypes.c_int(K),
+              ctypes.c_int(shard_start), ctypes.c_int(min(shard_n, E)), ctypes.c_int(1 if zero_out else 0)]
+    small_max = 8 if (big or max_tokens <= 8) else 16
+    f = get_function("fp4_tc.cu", "fp4_gemm_tc8" if small_max <= 8 else "fp4_gemm_tc16", xp.device)
+    launch(f, ((N // 8 + WARPS - 1) // WARPS, G, 1), (WARPS * 32, 1, 1), common + [ctypes.c_int(0), ctypes.c_int(small_max)], xp.device)
+    if big:
+        f = get_function("fp4_tcw.cu", "fp4_gemm_tcw", xp.device)
+        shared = 3 * 64 * 256
+        if (f.value, xp.device.index) not in _attr_done:
+            _check(_cuda.cuFuncSetAttribute(f, 8, ctypes.c_int(shared)), "cuFuncSetAttribute")
+            _attr_done.add((f.value, xp.device.index))
+        launch(f, (N // 64, G, 1), (WARPS * 32, 1, 1), common + [ctypes.c_int(9), ctypes.c_int(FP4_W_MAX)], xp.device, shared=shared)
     return out
 
 

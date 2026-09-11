@@ -146,7 +146,7 @@ def choose_hot_experts(stats_path: str, per_layer: int, n_layers: int) -> dict[i
     return {l: st[l].topk(per_layer).indices.tolist() for l in range(n_layers) if l in st}
 
 
-def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max_batch: int = 1,
+def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max_batch: int = 1, max_seqs: int | None = None,
                budgets_gb: dict[int, float] | None = None, n_layers: int | None = None, engram: bool = True,
                tokenizer=None, offload_experts=False, hot_experts: int = 0, route_stats: str = "", ep: bool = False,
                ep_shards: list[int] | None = None) -> Transformer:
@@ -163,7 +163,8 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
         print(f"hot experts on GPU: {hot_experts}/layer ({'from ' + stats if os.path.exists(stats) else 'no stats: first N'})", flush=True)
     else:
         HOT_EXPERTS = {}
-    args = Args(cfg, max_batch_size=max_batch, max_seq_len=max_seq_len)
+    args = Args(cfg, max_batch_size=max_batch, max_seq_len=max_seq_len, max_seqs=max_seqs or max_batch)
+    max_seqs = max_seqs or max_batch
     ckpt = Checkpoint(ckpt_path)
     n_layers = n_layers or cfg["n_layers"]
     if ep:
@@ -190,8 +191,8 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
             continue
         rows = max_seq_len // cfg["compress_ratios"][owner] + 1  # + one dummy row for the static decode path
         for d in dict.fromkeys(placement):
-            model.shared.compress_kv[(owner, d)] = torch.zeros(max_batch, rows, cfg["head_dim"], dtype=torch.bfloat16, device=d)
-            model.shared.index_k[(owner, d)] = torch.zeros(max_batch, rows, cfg["index_head_dim"], dtype=torch.bfloat16, device=d)
+            model.shared.compress_kv[(owner, d)] = torch.zeros(max_seqs, rows, cfg["head_dim"], dtype=torch.bfloat16, device=d)
+            model.shared.index_k[(owner, d)] = torch.zeros(max_seqs, rows, cfg["index_head_dim"], dtype=torch.bfloat16, device=d)
     for i in range(n_layers):
         dev = placement[i]
         w = load_layer(ckpt, i, dev, offload=offload_experts, ep=ep_shards)
@@ -205,7 +206,7 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
     if engram and cfg.get("engram_layer_ids"):
         layout = EngramLayout(cfg)
         assert tokenizer is not None, "the Engram hash needs the tokenizer"
-        model.engram_hash = NgramHashState(cfg, layout, tokenizer, max_batch, max_seq_len, dev0)
+        model.engram_hash = NgramHashState(cfg, layout, tokenizer, max_seqs, max_seq_len, dev0)
         for li, lid in enumerate(layout.layer_ids):
             if lid >= n_layers:
                 continue

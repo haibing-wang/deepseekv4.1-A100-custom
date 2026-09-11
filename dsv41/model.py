@@ -27,7 +27,8 @@ from .quant import maybe_compile
 @dataclass
 class Args:
     cfg: dict
-    max_batch_size: int = 1
+    max_batch_size: int = 1  # rows decoded together
+    max_seqs: int = 0  # sequence slots (caches); 0 = max_batch_size
     max_seq_len: int = 16384
 
     def __getattr__(self, k):
@@ -147,14 +148,14 @@ class Compressor:
         self.wkv = w["compressor.wkv.weight"].float() if self.ratio > 1 else w["compressor.wkv.weight"]
         if self.ratio > 1:
             self.wgate = w["compressor.wgate.weight"].float()
-            shape = (args.max_batch_size, self.ratio, args.head_dim)
+            shape = (args.max_seqs or args.max_batch_size, self.ratio, args.head_dim)
             self.kv_state = torch.zeros(shape, dtype=torch.float32, device=device)
             self.score_state = torch.full(shape, -torch.inf, dtype=torch.float32, device=device)
             # ring of the raw kv / score of the last RING positions per sequence (slot = position % RING): the static
             # per-row path pools a pair from it, so several positions of one sequence can be in flight at once
             self.RING = 8
-            self.kv_ring = torch.zeros(args.max_batch_size, self.RING, args.head_dim, dtype=torch.float32, device=device)
-            self.score_ring = torch.full((args.max_batch_size, self.RING, args.head_dim), -torch.inf, dtype=torch.float32, device=device)
+            self.kv_ring = torch.zeros(args.max_seqs or args.max_batch_size, self.RING, args.head_dim, dtype=torch.float32, device=device)
+            self.score_ring = torch.full((args.max_seqs or args.max_batch_size, self.RING, args.head_dim), -torch.inf, dtype=torch.float32, device=device)
 
     def __call__(self, x: torch.Tensor, start_pos: int) -> torch.Tensor | None:
         bsz, seqlen, _ = x.size()
@@ -273,7 +274,7 @@ class Attention:
         self.is_index_source = layer_id in args.index_source_layers
         self.compressor = Compressor(args, layer_id, {k[5:]: v for k, v in w.items() if k.startswith("attn.compressor")}, device) if self.is_kv_source else None
         self.indexer = Indexer(args, layer_id, {k[5:]: v for k, v in w.items() if k.startswith("attn.indexer")}, device, shared) if self.is_index_source else None
-        self.window_kv_cache = torch.zeros(args.max_batch_size, self.window, self.head_dim, dtype=torch.bfloat16, device=device)
+        self.window_kv_cache = torch.zeros(args.max_seqs or args.max_batch_size, self.window, self.head_dim, dtype=torch.bfloat16, device=device)
         if self.ratio:
             original_seq_len, rope_theta = args.original_seq_len, args.compress_rope_theta
         else:
