@@ -14,6 +14,7 @@ between stages, per-32 FP8 fake quantization) so the results match the unfused p
   gate_topk           : sqrt(softplus) / bias / top-k / weight normalisation of the MoE gate
   hc_post2            : (sum of routed experts + shared expert ->) bf16 -> hc_post, in place
 """
+import os
 import torch
 import triton
 import triton.language as tl
@@ -302,10 +303,11 @@ def kv_write(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch.Ten
 @triton.jit(do_not_specialize=["n_kvc", "topk"])
 def _sattn2_split_kernel(Q, KVW, KVC, IDX, POS, SEQ, PMAX, PLIM, PM, PL, PACC, n_kvc, topk, scale,
                          H: tl.constexpr, HB: tl.constexpr, D: tl.constexpr, BLOCK_T: tl.constexpr,
-                         NSPLIT: tl.constexpr, NWIN: tl.constexpr, WIN: tl.constexpr, HAS_C: tl.constexpr):
+                         NSPLIT: tl.constexpr, NB: tl.constexpr, NWIN: tl.constexpr, WIN: tl.constexpr, HAS_C: tl.constexpr):
     """Row b (a query at position POS[b] of sequence SEQ[b]) over the sequence's window ring (slot = position % WIN;
     the ring holds the positions up to PMAX[b], the newest written for that sequence, so slots holding positions
-    beyond POS[b] are masked) and the compressed cache rows IDX[b]."""
+    beyond POS[b] are masked) and the compressed cache rows IDX[b]. Split sp handles NB consecutive key blocks
+    (window blocks first, then compressed blocks) with an online softmax; the combine kernel merges the splits."""
     b = tl.program_id(0)
     hb = tl.program_id(1)
     sp = tl.program_id(2)
@@ -313,32 +315,39 @@ def _sattn2_split_kernel(Q, KVW, KVC, IDX, POS, SEQ, PMAX, PLIM, PM, PL, PACC, n
     dd = tl.arange(0, D)
     seq = tl.load(SEQ + b)
     q = tl.load(Q + (b * H + hs)[:, None] * D + dd[None, :])
-    if sp < NWIN:
-        pos = tl.load(POS + b)
-        pmax = tl.load(PMAX + b)
-        plim = tl.load(PLIM + b)  # newest ring position this row may see (== pos for ordinary decode)
-        tt = (sp * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int32)
-        held = pmax - (((pmax - tt) % WIN + WIN) % WIN)  # the position slot tt holds
-        valid = (held >= 0) & (held <= plim) & (pos - held < WIN)
-        kv = tl.load(KVW + (seq * WIN + tt)[:, None] * D + dd[None, :], mask=valid[:, None], other=0.0)
-    else:
-        tt = (sp - NWIN) * BLOCK_T + tl.arange(0, BLOCK_T)
-        if HAS_C:
-            idx = tl.load(IDX + b * topk + tt, mask=tt < topk, other=-1)
+    pos = tl.load(POS + b)
+    pmax = tl.load(PMAX + b)
+    plim = tl.load(PLIM + b)  # newest ring position this row may see (== pos for ordinary decode)
+    m_i = tl.full((HB,), -1e30, tl.float32)
+    l_i = tl.zeros((HB,), tl.float32)
+    acc = tl.zeros((HB, D), tl.float32)
+    for j in range(NB):
+        blk = sp * NB + j
+        if blk < NWIN:
+            tt = (blk * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int32)
+            held = pmax - (((pmax - tt) % WIN + WIN) % WIN)  # the position slot tt holds
+            valid = (held >= 0) & (held <= plim) & (pos - held < WIN)
+            kv = tl.load(KVW + (seq * WIN + tt)[:, None] * D + dd[None, :], mask=valid[:, None], other=0.0)
         else:
-            idx = tl.full((BLOCK_T,), -1, tl.int32)
-        valid = idx >= 0
-        kv = tl.load(KVC + (seq * n_kvc + tl.maximum(idx, 0))[:, None] * D + dd[None, :], mask=valid[:, None], other=0.0)
-    s = tl.dot(q, tl.trans(kv)).to(tl.float32) * scale
-    s = tl.where(valid[None, :], s, -1e30)
-    m = tl.max(s, axis=1)
-    p = tl.exp(s - m[:, None])
-    p = tl.where(valid[None, :], p, 0.0)
-    l = tl.sum(p, axis=1)
-    acc = tl.dot(p.to(tl.bfloat16), kv).to(tl.float32)
+            tt = (blk - NWIN) * BLOCK_T + tl.arange(0, BLOCK_T)
+            if HAS_C:
+                idx = tl.load(IDX + b * topk + tt, mask=tt < topk, other=-1)
+            else:
+                idx = tl.full((BLOCK_T,), -1, tl.int32)
+            valid = idx >= 0
+            kv = tl.load(KVC + (seq * n_kvc + tl.maximum(idx, 0))[:, None] * D + dd[None, :], mask=valid[:, None], other=0.0)
+        s = tl.dot(q, tl.trans(kv)).to(tl.float32) * scale
+        s = tl.where(valid[None, :], s, -1e30)
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+        p = tl.where(valid[None, :], p, 0.0)
+        l_i = alpha * l_i + tl.sum(p, axis=1)
+        acc = alpha[:, None] * acc + tl.dot(p.to(tl.bfloat16), kv).to(tl.float32)
+        m_i = m_new
     base = (b * H + hs) * NSPLIT + sp
-    tl.store(PM + base, m)
-    tl.store(PL + base, l)
+    tl.store(PM + base, m_i)
+    tl.store(PL + base, l_i)
     tl.store(PACC + base[:, None] * D + dd[None, :], acc)
 
 
@@ -370,6 +379,10 @@ def _sattn2_combine_kernel(PM, PL, PACC, SINK, COS, SIN, POS, O, H: tl.constexpr
     tl.store(O + (b * H + h) * D + dd, tl.reshape(tl.join(yr, yi), (D,)))
 
 
+SATTN_NB = int(os.environ.get("DSV41_SATTN_NB", "0"))  # experiment: key blocks per split (0 = by row count)
+SATTN_HB = int(os.environ.get("DSV41_SATTN_HB", "0"))  # heads per program (0 = by row count: 16 for <= 8 rows, else 32)
+
+
 def sattn2(q, kv_win, kv_c, idx, pos, attn_sink, cos, sin, rd, softmax_scale, seq, pmax, block_t: int = 64, plim=None):
     """q: [B, 1, h, d] bf16 (B query rows at positions pos [B] of sequences seq [B]); kv_win: [S, win, d] rings;
     pmax [B]: newest position written to the row's ring; kv_c: [S, n, d] compressed caches or None;
@@ -381,19 +394,23 @@ def sattn2(q, kv_win, kv_c, idx, pos, attn_sink, cos, sin, rd, softmax_scale, se
     if kv_c is None:
         kv_c, n_c, t = kv_win, 0, 0
         idx = pos  # unused
-        nsplit = triton.next_power_of_2(nwin)
+        nblk = nwin
     else:
         n_c = kv_c.shape[1]
         t = idx.shape[-1]
-        nsplit = triton.next_power_of_2(nwin + triton.cdiv(t, block_t))
-    HB = 16
+        nblk = nwin + triton.cdiv(t, block_t)
+    # key blocks per split: one row needs many splits for parallelism, many rows do not (the fp32 partials
+    # [B, h, nsplit, d] then cost more than the attention itself)
+    nb = SATTN_NB if SATTN_NB else (1 if b <= 8 else 4)
+    nsplit = triton.next_power_of_2(triton.cdiv(nblk, nb))
+    HB = SATTN_HB if SATTN_HB else (16 if b <= 8 else 32)
     pm = torch.empty(b * h * nsplit, device=q.device, dtype=torch.float32)
     pl = torch.empty_like(pm)
     pacc = torch.empty(b * h * nsplit, d, device=q.device, dtype=torch.float32)
     o = torch.empty_like(q)
     with torch.cuda.device(q.device):
         _sattn2_split_kernel[(b, h // HB, nsplit)](q, kv_win, kv_c, idx, pos, seq, pmax, plim if plim is not None else pos, pm, pl, pacc, n_c, t, softmax_scale,
-                                                   H=h, HB=HB, D=d, BLOCK_T=block_t, NSPLIT=nsplit, NWIN=nwin, WIN=win, HAS_C=t > 0, num_warps=4)
+                                                   H=h, HB=HB, D=d, BLOCK_T=block_t, NSPLIT=nsplit, NB=nb, NWIN=nwin, WIN=win, HAS_C=t > 0, num_warps=HB // 4)
         _sattn2_combine_kernel[(b, h)](pm, pl, pacc, attn_sink, cos, sin, pos, o, H=h, D=d, RD=rd, NSPLIT=nsplit, num_warps=4)
     return o
 
@@ -470,7 +487,7 @@ def _hc_post2_kernel(X, Y2, YS, R, POST, COMB, y2_row_stride, y2_sum_stride, D: 
     if NSUM > 0:
         x = tl.zeros((BLOCK_D,), tl.float32)
         for k in tl.static_range(NSUM):
-            x += tl.load(Y2 + k * y2_sum_stride + cols, mask=mask, other=0.0)
+            x += tl.load(Y2 + k * y2_sum_stride + cols, mask=mask, other=0.0).to(tl.float32)
         x += tl.load(YS + cols, mask=mask, other=0.0).to(tl.float32)
         x = x.to(tl.bfloat16).to(tl.float32)
     else:

@@ -27,6 +27,12 @@ EP_DMA_MODE = os.environ.get("DSV41_EP_DMA", "auto")
 EP_DMA_BYTES = int(os.environ.get("DSV41_EP_DMA_BYTES", "32768"))
 
 EP_TRACE = os.environ.get("DSV41_EP_TRACE", "0") == "1"  # per-layer device timestamps (owner: 6 points, peer: 2)
+# NVLink-pair relay (4 GPUs = two NV12 pairs, cross-pair links are PCIe at ~21 GB/s): the route packet goes to the
+# owner's partner over NVLink and to ONE GPU of the other pair over PCIe, which forwards it to its partner over
+# NVLink; the partials come back the same way in reverse (the far pair's leaf adds into its partner, one PCIe
+# transfer instead of two). Partials travel as bf16 (the fp32 sum over the shard's experts rounded once).
+EP_RELAY = os.environ.get("DSV41_EP_RELAY", "1") == "1"
+EP_BF16_PART = os.environ.get("DSV41_EP_BF16_PART", "1") == "1"
 from .decode import DecodeRuntime, HC_FORK
 from .fused import rmsnorm, swiglu_quant
 from .fused2 import gate_topk, hc_post2_
@@ -71,8 +77,23 @@ class EPRuntime(DecodeRuntime):
         for d in self.devs:
             self.xqp_out[d], self.eid8[d], self.wt8[d] = views(self.outbox[d])
             self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d] = views(self.inbox[d])
-        self.part_in = {d: torch.zeros(self.nd, B, dim, dtype=torch.float32, device=d) for d in self.devs}  # [sender, b, dim]
+        self.dma_route = EP_DMA_MODE == "1" or (EP_DMA_MODE == "auto" and msg_bytes > EP_DMA_BYTES)
+        self.dma_part = EP_DMA_MODE == "1" or (EP_DMA_MODE == "auto" and B * dim * 4 > EP_DMA_BYTES)
+        self.bf16_part = EP_BF16_PART and self.dma_part
+        pdt = torch.bfloat16 if self.bf16_part else torch.float32
+        self.part_in = {d: torch.zeros(self.nd, B, dim, dtype=pdt, device=d) for d in self.devs}  # [sender, b, dim]
         self.part_out = {d: torch.zeros(B, dim, dtype=torch.float32, device=d) for d in self.devs}  # a peer's summed partial before the DMA
+        self.part_out16 = {d: torch.zeros(B, dim, dtype=pdt, device=d) for d in self.devs} if self.bf16_part else self.part_out
+        # NVLink pairs (d, d ^ 1) and the relay roles: for owner o, relay(o) is the lower GPU of the other pair
+        self.partner = {d: next((p for p in self.devs if p.index == (d.index ^ 1)), None) for d in self.devs}
+        self.relay = EP_RELAY and self.dma_route and self.dma_part and self.nd == 4 and all(v is not None for v in self.partner.values())
+        self.relay_of = {}
+        if self.relay:
+            for o in self.devs:
+                far = [d for d in self.devs if d != o and d != self.partner[o]]
+                self.relay_of[o] = min(far, key=lambda dd: dd.index)
+        self.part_relay = {d: torch.zeros(B, dim, dtype=pdt, device=d) for d in self.devs}  # the leaf partner's partial
+        self.flag_relay = {d: torch.zeros(nl, dtype=torch.int32, device=d) for d in self.devs}
         self.flag_route = {d: torch.zeros(nl, dtype=torch.int32, device=d) for d in self.devs}
         self.flag_part = {d: torch.zeros(nl, self.nd, dtype=torch.int32, device=d) for d in self.devs}
         self.flag_hop = {d: torch.zeros(nl + 1, dtype=torch.int32, device=d) for d in self.devs}
@@ -80,15 +101,28 @@ class EPRuntime(DecodeRuntime):
         self.sig_route = {}
         self.sig_part = {}
         self.sig_hop = {}
+        self.sig_fwd = {}    # (L): on relay(o), the leaf's route flag
+        self.sig_relay = {}  # (L): on the leaf, relay(o)'s flag_relay
         for L, blk in enumerate(model.blocks):
             o = blk.device
             peers = [d for d in self.devs if d != o]
-            self.sig_route[L] = torch.tensor([self.flag_route[p][L].data_ptr() for p in peers], dtype=torch.int64, device=o)
+            if self.relay:
+                a = self.relay_of[o]
+                b = self.partner[a]
+                direct = [self.partner[o], a]
+                self.sig_route[L] = torch.tensor([self.flag_route[p][L].data_ptr() for p in direct], dtype=torch.int64, device=o)
+                self.sig_fwd[L] = torch.tensor([self.flag_route[b][L].data_ptr()], dtype=torch.int64, device=a)
+                self.sig_relay[L] = torch.tensor([self.flag_relay[a][L].data_ptr()], dtype=torch.int64, device=b)
+                for p in peers:  # the relay raises the owner's slots of both far GPUs; the leaf signals nobody but the relay
+                    slots = [self.idx[p]] + ([self.idx[b]] if p == a else [])
+                    self.sig_part[(L, p)] = torch.tensor([self.flag_part[o][L, i].data_ptr() for i in slots], dtype=torch.int64, device=p)
+            else:
+                self.sig_route[L] = torch.tensor([self.flag_route[p][L].data_ptr() for p in peers], dtype=torch.int64, device=o)
+                for p in peers:
+                    self.sig_part[(L, p)] = torch.tensor([self.flag_part[o][L, self.idx[p]].data_ptr()], dtype=torch.int64, device=p)
             self.sig_inbox = getattr(self, "sig_inbox", {})
             if o not in self.sig_inbox:
                 self.sig_inbox[o] = torch.tensor([self.inbox[p].data_ptr() for p in peers], dtype=torch.int64, device=o)
-            for p in peers:
-                self.sig_part[(L, p)] = torch.tensor([self.flag_part[o][L, self.idx[p]].data_ptr()], dtype=torch.int64, device=p)
             if L + 1 < nl and model.blocks[L + 1].device != o:
                 nxt = model.blocks[L + 1].device
                 self.sig_hop[L] = torch.tensor([self.flag_hop[nxt][L + 1].data_ptr()], dtype=torch.int64, device=o)
@@ -102,8 +136,6 @@ class EPRuntime(DecodeRuntime):
         for d in self.devs:
             self._tc_tables(B * topk, d, topk)
         self.mcast_counter = {d: torch.zeros(1, dtype=torch.int32, device=d) for d in self.devs}
-        self.dma_route = EP_DMA_MODE == "1" or (EP_DMA_MODE == "auto" and msg_bytes > EP_DMA_BYTES)
-        self.dma_part = EP_DMA_MODE == "1" or (EP_DMA_MODE == "auto" and B * dim * 4 > EP_DMA_BYTES)
         self.graphs = {}
         self.logits = torch.zeros(B, self.cfg["vocab_size"], dtype=torch.float32, device=self.devs[-1])
         self.first_layer = {d: min(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
@@ -171,9 +203,9 @@ class EPRuntime(DecodeRuntime):
         # routing + activation to every peer, then the flags
         if not self.dry:
             if self.dma_route:
-                for p in self.devs:
-                    if p != d:
-                        memcpy_async(self.inbox[p], self.outbox[d], d)
+                targets = [self.partner[d], self.relay_of[d]] if self.relay else [p for p in self.devs if p != d]
+                for p in targets:
+                    memcpy_async(self.inbox[p], self.outbox[d], d)
                 p2p_signal(self.sig_route[L], self.seqno[d], d)
             else:
                 p2p_multicast(self.sig_inbox[d], self.outbox[d], self.sig_route[L], self.seqno[d], d, counter=self.mcast_counter[d])
@@ -186,7 +218,11 @@ class EPRuntime(DecodeRuntime):
         with torch.cuda.stream(side2):
             ys = self._shared_expert(moe, xq)
         y_loc = self._experts_shard(d, xqp, eid, wt, moe)
-        p2p_sum_rows(self.part_in[d][self.idx[d]], y_loc, d, groups=self.B)
+        if self.bf16_part:
+            p2p_sum_rows(self.part_out[d], y_loc, d, groups=self.B)
+            self.part_in[d][self.idx[d]].copy_(self.part_out[d])
+        else:
+            p2p_sum_rows(self.part_in[d][self.idx[d]], y_loc, d, groups=self.B)
         main.wait_stream(side2)
         self._stamp(d, L, 3)
         # wait for the peers' partials (own slot is raised by a local signal so the whole row can be waited on)
@@ -218,12 +254,31 @@ class EPRuntime(DecodeRuntime):
     def _peer_layer(self, blk: Block, d):
         L = blk.layer_id
         o = blk.device
+        role = None
+        if self.relay:
+            a = self.relay_of[o]
+            role = "relay" if d == a else "leaf" if d == self.partner[a] else "partner"
         self._wait(self.flag_route[d][L : L + 1], d)
         self._stamp(d, L, 6)
+        if role == "relay" and not self.dry:  # forward the route packet to the leaf over NVLink
+            memcpy_async(self.inbox[self.partner[d]], self.inbox[d], d)
+            p2p_signal(self.sig_fwd[L], self.seqno[d], d)
         y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d], blk.ffn)
         if self.dma_part:
             p2p_sum_rows(self.part_out[d], y, d, groups=self.B)
-            memcpy_async(self.part_in[o][self.idx[d]], self.part_out[d], d)
+            if role == "leaf":  # into the relay partner, which adds it to its own partial
+                if self.bf16_part:
+                    self.part_out16[d].copy_(self.part_out[d])
+                memcpy_async(self.part_relay[a], self.part_out16[d], d)
+                self._signal(self.sig_relay[L], d)
+                self._stamp(d, L, 7)
+                return
+            if role == "relay":
+                self._wait(self.flag_relay[d][L : L + 1], d)
+                self.part_out[d].add_(self.part_relay[d])
+            if self.bf16_part:
+                self.part_out16[d].copy_(self.part_out[d])
+            memcpy_async(self.part_in[o][self.idx[d]], self.part_out16[d], d)
         else:
             p2p_sum_rows(self.part_in[o][self.idx[d]], y, d, groups=self.B)  # straight into the owner's inbox row
         self._signal(self.sig_part[(L, d)], d)
@@ -297,6 +352,7 @@ class EPRuntime(DecodeRuntime):
             self.flag_route[d].zero_()
             self.flag_part[d].zero_()
             self.flag_hop[d].zero_()
+            self.flag_relay[d].zero_()
         for _ in range(2):
             self._eager_token()
             for d in self.devs:

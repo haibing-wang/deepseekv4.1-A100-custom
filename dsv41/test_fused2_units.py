@@ -45,7 +45,7 @@ kvx = torch.randn(1, 512, device=dev, dtype=torch.bfloat16) * 2
 cache_r = torch.zeros(1, win, 512, device=dev, dtype=torch.bfloat16); cache_n = cache_r.clone()
 kv = rmsnorm(kvx.view(1, 1, 512), kvw, eps).contiguous(); rope_dev_(kv, rd, cos, sin, pos); kv = fake_quant_fp8(kv, 32)
 cache_r.index_copy_(1, torch.remainder(pos, win).view(1), kv)
-F2.kv_write(kvx, kvw, cos, sin, pos, cache_n, rd, eps)
+F2.kv_write(kvx, kvw, cos, sin, pos, cache_n, rd, eps, torch.zeros(1, dtype=torch.int64, device=dev))
 rep("kv_write", cache_n, cache_r)
 # sattn2 (window only, and with compressed cache)
 H, hd = 64, 512
@@ -58,12 +58,13 @@ for p in (50, 300):
     widx = torch.remainder(torch.arange(win, device=dev) + slot + 1, win)
     widx = torch.where(widx > pos, -1, widx).to(torch.int32).view(1, 1, win)
     o_r = sparse_attn_decode_split(q, cache, None, sink, widx, hd**-0.5); rope_dev_(o_r, rd, cos, sin, pos, inverse=True)
-    o_n = F2.sattn2(q, cache, None, None, pos, sink, cos, sin, rd, hd**-0.5)
+    seq1 = torch.zeros(1, dtype=torch.int64, device=dev)
+    o_n = F2.sattn2(q, cache, None, None, pos.view(1), sink, cos, sin, rd, hd**-0.5, seq1, pos.view(1))
     rep(f"sattn2 win pos{p}", o_n, o_r)
     ckv = torch.randn(1, 4097, hd, device=dev, dtype=torch.bfloat16)
     idx = torch.randint(0, 150, (1, 1, 512), device=dev, dtype=torch.int32); idx[..., 400:] = -1
     o_r = sparse_attn_decode_split(q, cache, ckv, sink, torch.cat([widx, torch.where(idx >= 0, idx + win, -1)], -1), hd**-0.5); rope_dev_(o_r, rd, cos, sin, pos, inverse=True)
-    o_n = F2.sattn2(q, cache, ckv, idx, pos, sink, cos, sin, rd, hd**-0.5)
+    o_n = F2.sattn2(q, cache, ckv, idx, pos.view(1), sink, cos, sin, rd, hd**-0.5, seq1, pos.view(1))
     rep(f"sattn2 win+c pos{p}", o_n, o_r)
 # gate_topk
 E, topk = 384, 6
