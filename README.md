@@ -221,13 +221,17 @@ speed = aggregate / S):
 | 1 | 15.8, 63 | 30.2, 2.52, **84** | 85 |
 | 4 | 27.2, 147 | 48.8, 2.47, **202** | 205 |
 | 8 | 33.7, 237 | 70.0, 2.50, 285 | **301** |
+| 12 | 40.0, 294 | 85.8, 2.54, **355** | 321 |
 | 16 | 46.2, 340 | 102.0, 2.54, **398** | 360 |
+| 24 | 56.6, 419 | 132.7, 2.56, **462** | 426 |
 | 32 | 66.4, 478 | 157.6, 2.60, **528** | 473 |
+| 40 | 71.7, 554 | 182.2, 2.59, **568** | – |
 | 48 | 76.0, **624** | 201.9, 2.58, 614 | – |
 | 64 | 86.1, **737** | 244.4, 2.57, 674 | – |
 
-MTP wins up to 32 contexts (5 drafts up to 8, 3 drafts beyond); from 48 contexts on the plain batched step
-is better because the verification rows touch nearly every expert of every layer. Per-context speed drops
+The best setting depends on the number of contexts: 5 drafts up to 8 contexts, 3 drafts from 12 to 40,
+no MTP from about 44 contexts on (the verification rows then touch nearly every expert of every layer, so
+the extra rows cost more bandwidth than the accepted drafts save). `engine.mtp_policy(S)` encodes this. Per-context speed drops
 from 63 tok/s alone to 11.5 tok/s at 64 contexts. The chat REPL and the server use `--mtp K`
 (`dsv41.chat --devices 2,3,0,1 --ep --mtp 5`: 61 -> 82 tok/s decode at temperature 0.6 on Japanese;
 English and code accept more drafts).

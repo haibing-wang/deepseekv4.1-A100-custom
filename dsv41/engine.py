@@ -43,6 +43,17 @@ def sample_token(logits: torch.Tensor, temperature: float, top_p: float, gen: to
 MTP_STATS = os.environ.get("DSV41_MTP_STATS") == "1"
 
 
+def mtp_policy(n_contexts: int) -> int:
+    """Drafts per step that maximise aggregate throughput for n contexts on one 4-GPU replica (measured 2026-09-12,
+    64 mixed prompts): 5 up to 8 contexts, 3 up to 40, none beyond (see README). A scheduler with continuous
+    batching should re-evaluate this per step (and lower K when the recent acceptance rate is low)."""
+    if n_contexts <= 8:
+        return 5
+    if n_contexts <= 40:
+        return 3
+    return 0
+
+
 class Engine:
     def __init__(self, ckpt: str = CKPT, devices: list[int] | None = None, max_seq_len: int = 8192,
                  budgets: dict[int, float] | None = None, use_graphs: bool = True, thinking_mode: str = "chat",
