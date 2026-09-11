@@ -10,6 +10,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--devices", default="2")
 ap.add_argument("--n-layers", type=int, default=8)
 ap.add_argument("--steps", type=int, default=6)
+ap.add_argument("--ep", action="store_true")
 a = ap.parse_args()
 from transformers import AutoTokenizer
 ckpt = "/mnt/ssd/models/DeepSeek-V4.1-Flash"
@@ -18,8 +19,10 @@ devs = [int(d) for d in a.devices.split(",")]
 PA = tok.encode("The capital of France is Paris. The capital of Germany is")
 PB = tok.encode("Once upon a time in a small village by the sea, there lived an old fisherman who")
 feed = [19920, 36300, 118795, 28859, 17706, 100003, 2000, 3000]
-model = load_model(ckpt, devs, max_seq_len=4096, max_batch=2, n_layers=a.n_layers, engram=True, tokenizer=tok)
-rt = DecodeRuntime(model, use_graphs=True)
+model = load_model(ckpt, devs, max_seq_len=4096, max_batch=2, n_layers=a.n_layers, engram=True, tokenizer=tok, ep=a.ep)
+from dsv41.ep import EPRuntime
+RT = EPRuntime if a.ep else DecodeRuntime
+rt = RT(model, use_graphs=True)
 rt.capture()
 
 def single(prompt, slot):
@@ -69,8 +72,8 @@ if a.steps >= K:
     # the runtime has 2 rows; use a 6-row runtime for the batched check
     from dsv41.load import load_model as _lm
     print("[six rows of one sequence in one step]")
-    m6 = _lm(ckpt, [3], max_seq_len=4096, max_batch=K, n_layers=a.n_layers, engram=True, tokenizer=tok)
-    r6 = DecodeRuntime(m6, use_graphs=True)
+    m6 = _lm(ckpt, devs if a.ep else [3], max_seq_len=4096, max_batch=K, n_layers=a.n_layers, engram=True, tokenizer=tok, ep=a.ep)
+    r6 = RT(m6, use_graphs=True)
     r6.capture()
     m6.forward(torch.tensor([PA]), 0)
     lg = r6.step(feed[:K], [pa + i for i in range(K)], seq=[0] * K, pmax=[pa + K - 1] * K)

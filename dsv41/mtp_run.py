@@ -10,6 +10,7 @@ ap.add_argument("--ckpt", default="/mnt/ssd/models/DeepSeek-V4.1-Flash")
 ap.add_argument("--devices", default="2,3,0,1")
 ap.add_argument("--ep", action="store_true")
 ap.add_argument("--ep-shards", default="")
+ap.add_argument("--budgets", default="", help="per-GPU GiB for the pipeline placement, e.g. 2:70,3:70")
 ap.add_argument("--seqs", type=int, default=8)
 ap.add_argument("--prompts", default="dsv41/batch_prompts16.txt")
 ap.add_argument("--max-new-tokens", type=int, default=64)
@@ -24,7 +25,8 @@ S = a.seqs
 K = 1 if a.no_mtp else 6
 devs = [int(d) for d in a.devices.split(",")]
 model = load_model(a.ckpt, devs, max_seq_len=8192, max_batch=S * K, engram=True, tokenizer=tok, ep=a.ep, n_layers=a.n_layers,
-                   ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None)
+                   ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None,
+                   budgets_gb={int(k): float(v) for k, v in (kv.split(":") for kv in a.budgets.split(",") if kv)} or None)
 if a.ep:
     from dsv41.ep import EPRuntime
     rt = EPRuntime(model, use_graphs=True)

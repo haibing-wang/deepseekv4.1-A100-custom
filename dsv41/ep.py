@@ -153,6 +153,8 @@ class EPRuntime(DecodeRuntime):
         self._stamp(d, L, 0)
         if blk.engram is not None:
             h.copy_(blk.engram.apply(h, self.eng_in[L]))
+        if L in self.main_hid:  # DSpark reads the attention inputs of its target layers
+            self.main_hid[L].copy_(h.mean(2).view(self.B, -1))
         (pre_n, post, comb), side, x, xq, _ = self._hc_sub(blk, h, blk.hc_attn, pre, blk.attn_norm_w)
         a = self.attention2(blk.attn, x, xq, d)
         self._push_cache_rows(blk, d)
