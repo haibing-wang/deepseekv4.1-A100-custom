@@ -345,6 +345,36 @@ class DecodeRuntime:
         inv = torch.empty_like(order).scatter_(0, order, ar)
         return y2s[inv]
 
+    def experts_tc_prepare(self, xqp, w13, s13, eid, wt, inter, limit, n, d, topk, shard):
+        """First half of experts_tc for B > 1: bucketing, w13 GEMM and SwiGLU. Returns (hqp, tables) for experts_tc_w2."""
+        B = n // topk
+        gmax = cukern.FP4_W_MAX if cukern.FP4_W_LAYOUT else 16
+        e = eid.reshape(-1).to(torch.int64)
+        se, order = torch.sort(e, stable=True)
+        tok_sorted = (order // topk).to(torch.int32)
+        wt_sorted = wt.reshape(-1)[order].contiguous()
+        ar = torch.arange(n, device=d)
+        is_new = torch.ones(n, dtype=torch.bool, device=d)
+        is_new[1:] = se[1:] != se[:-1]
+        if B > gmax:
+            gid0 = torch.cumsum(is_new.to(torch.int64), 0) - 1
+            first = torch.full((n,), n, dtype=torch.int64, device=d).scatter_reduce_(0, gid0, torch.where(is_new, ar, torch.full_like(ar, n)), "amin")
+            is_new = is_new | (((ar - first[gid0]) % gmax) == 0)
+        gid = torch.cumsum(is_new.to(torch.int64), 0) - 1
+        grp_expert = torch.full((n,), -1, dtype=torch.int32, device=d).scatter_(0, gid, se.to(torch.int32))
+        grp_start = torch.full((n + 1,), n, dtype=torch.int32, device=d)
+        grp_start.scatter_reduce_(0, gid, torch.where(is_new, ar, torch.full_like(ar, n)).to(torch.int32), "amin")
+        gu = fp4_gemm_tc(xqp, w13, s13, grp_expert, grp_start, tok_sorted, n, min(B, gmax), shard_start=shard[0], shard_n=shard[1], zero_out=False)
+        hqp = swiglu_quant(gu, wt_sorted, inter, limit, permute=True)
+        inv = torch.empty_like(order).scatter_(0, order, ar).to(torch.int32)  # inv[b * topk + j] = sorted row of token b's pair j
+        return hqp, {"grp_expert": grp_expert, "grp_start": grp_start, "rows": ar.to(torch.int32), "inv": inv, "n": n, "max_tokens": min(B, gmax), "shard": shard}
+
+    def experts_tc_w2(self, hqp, tabs, w2, s2, out, col0: int, ncols: int):
+        """Second half: the w2 GEMM for output columns [col0, col0 + ncols) into out (fp32 [n, dim], expert-sorted rows;
+        rows of other shards zeroed)."""
+        fp4_gemm_tc(hqp, w2[:, col0 : col0 + ncols], s2[:, col0 : col0 + ncols], tabs["grp_expert"], tabs["grp_start"], tabs["rows"], tabs["n"], tabs["max_tokens"],
+                    shard_start=tabs["shard"][0], shard_n=tabs["shard"][1], zero_out=True, out=out, out_col=col0)
+
     def moe2(self, moe, xq: torch.Tensor, xf: torch.Tensor, xqp=None):
         """Routed experts (fp32 [topk, dim], one row per selected expert, routing weight applied) and the shared expert (bf16 [1, dim])."""
         d = xq.device

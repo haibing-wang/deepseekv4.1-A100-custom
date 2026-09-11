@@ -107,6 +107,7 @@ def _splits_for(N: int, K: int) -> int:
 
 FP8_W_LAYOUT = os.environ.get("DSV41_FP8_W", "1") == "1"
 FP8_G_LAYOUT = os.environ.get("DSV41_FP8_G", "1") == "1"  # tiled kernel for > 64 rows
+FP8_G_BM128 = os.environ.get("DSV41_FP8_G_BM128", "0") == "1"  # 128-row blocks (1 block/SM): measured slower, off
 FP8_W_SPLITS = int(os.environ.get("DSV41_FP8_W_SPLITS", "0"))
 FP8_W_STAGES = int(os.environ.get("DSV41_FP8_W_STAGES", "3"))  # x stages in shared memory
 FP8_W_MW = int(os.environ.get("DSV41_FP8_W_MW", "1"))  # warps along M per block (1, 2 or 4 for 64 rows; 1 or 2 for 32)
@@ -174,9 +175,10 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
 
 def _fp8_gemm_tcg(x, w8, s8, Mo, N, K, group_cols, out_dtype, tiled=False):
     """fp8_tcg.cu: 256-thread blocks, tile 64 rows x 128 columns x 128 k, split-K with the fused epilogue."""
-    mblocks = (Mo + 63) // 64
-    splits = 1  # ~256 blocks, fp32 partials at most the weight bytes
-    while (N // 128) * mblocks * splits < 256 and splits * 2 * Mo * 4 <= K and K // (splits * 2) >= 256:
+    BM = 128 if (FP8_G_BM128 and Mo >= 128) else 64  # 128-row blocks halve the weight decode per mma (1 block/SM)
+    mblocks = (Mo + BM - 1) // BM
+    splits = 1  # ~256 blocks (128-row blocks: ~110, one per SM), fp32 partials at most the weight bytes
+    while (N // 128) * mblocks * splits < (256 if BM == 64 else 110) and splits * 2 * Mo * 4 <= K and K // (splits * 2) >= 256:
         splits *= 2
     if FP8_W_SPLITS:
         splits = FP8_W_SPLITS
@@ -184,8 +186,8 @@ def _fp8_gemm_tcg(x, w8, s8, Mo, N, K, group_cols, out_dtype, tiled=False):
     kps = -(-kps // 128) * 128
     splits = -(-K // kps)
     part = torch.empty(splits, Mo, N, device=x.device, dtype=torch.float32)
-    f = get_function("fp8_tcg.cu", "fp8_gemm_tcg", x.device)
-    shared = 2 * (128 * 128 + 64 * 256)
+    f = get_function("fp8_tcg.cu", "fp8_gemm_tcg" if BM == 64 else "fp8_gemm_tcg128", x.device)
+    shared = 2 * (128 * 128 + BM * 256)
     if (f.value, x.device.index) not in _attr_done:
         _check(_cuda.cuFuncSetAttribute(f, 8, ctypes.c_int(shared)), "cuFuncSetAttribute")
         _attr_done.add((f.value, x.device.index))
@@ -235,19 +237,21 @@ FP4_SMALL_MAX = int(os.environ.get("DSV41_FP4_SMALL_MAX", "0"))
 
 def fp4_gemm_tc(xp: torch.Tensor, w: torch.Tensor, s: torch.Tensor, grp_expert: torch.Tensor, grp_start: torch.Tensor,
                 pair_tok: torch.Tensor, n_pairs: int, max_tokens: int, shard_start: int = 0, shard_n: int = 1 << 30,
-                zero_out: bool = False, out: torch.Tensor | None = None) -> torch.Tensor:
+                zero_out: bool = False, out: torch.Tensor | None = None, out_col: int = 0) -> torch.Tensor:
     """xp: permuted bf16 [rows, K]; w: uint8 [E, N, K/2]; s: uint8 [E, N, K/32]; groups g: expert grp_expert[g] with pairs
     grp_start[g]..grp_start[g+1]-1 (<= max_tokens each), pair p uses x row pair_tok[p]. Returns fp32 [n_pairs, N].
     Groups of <= 8 tokens run on fp4_tc.cu (x as the mma A operand); larger groups (up to 64) on fp4_tcw.cu, which
     reads the expert once whatever the token count (fp4_tc.cu's 16-token variant handles 9..16 when disabled).
     Expert parallelism: ids are global, this GPU holds [shard_start, shard_start + shard_n); other groups are skipped
     (zero_out: their output rows are zeroed)."""
-    E, N, Kh = w.shape
+    E, N, Kh = w.shape  # w may be a column slice w_full[:, n0:n0+N] (n0 % 16 == 0): the same byte offset in both layouts
     K = Kh * 2
     assert xp.dtype == torch.bfloat16 and xp.is_contiguous() and K % 128 == 0 and N % 8 == 0
     G = grp_expert.numel()
     if out is None:
         out = torch.empty(n_pairs, N, device=xp.device, dtype=torch.float32)
+    ldo = out.stride(0)
+    assert out.shape[1] >= out_col + N
     WARPS = 4
     big = max_tokens > FP4_SMALL_MAX and (FP4_W_LAYOUT or max_tokens > 16 or FP4_SMALL_MAX == 0)
     assert max_tokens <= (FP4_W_MAX if big else 16)
@@ -255,7 +259,7 @@ def fp4_gemm_tc(xp: torch.Tensor, w: torch.Tensor, s: torch.Tensor, grp_expert: 
     common = [ctypes.c_void_p(xp.data_ptr()), ctypes.c_int(xp.stride(0)),
               ctypes.c_void_p(w.data_ptr()), ctypes.c_longlong(w.stride(0)), ctypes.c_void_p(s.data_ptr()), ctypes.c_longlong(s.stride(0)),
               ctypes.c_void_p(grp_expert.data_ptr()), ctypes.c_void_p(grp_start.data_ptr()), ctypes.c_void_p(pair_tok.data_ptr()),
-              ctypes.c_void_p(out.data_ptr()), ctypes.c_int(N), ctypes.c_int(N), ctypes.c_int(K),
+              ctypes.c_void_p(out.data_ptr() + out_col * 4), ctypes.c_int(ldo), ctypes.c_int(N), ctypes.c_int(K),
               ctypes.c_int(shard_start), ctypes.c_int(min(shard_n, E)), ctypes.c_int(1 if zero_out else 0)]
     tiled = [ctypes.c_int(1 if FP4_TILED else 0)]
     small_max = FP4_SMALL_MAX if (big or max_tokens <= FP4_SMALL_MAX) else 16
@@ -303,6 +307,17 @@ def p2p_sum_rows(dst: torch.Tensor, src: torch.Tensor, device: torch.device, gro
     f = get_function("p2p.cu", "p2p_sum_rows", device)
     launch(f, ((n + 255) // 256, groups, 1), (256, 1, 1), [ctypes.c_void_p(dst.data_ptr()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(rows), ctypes.c_int(n),
                                                           ctypes.c_int(groups), ctypes.c_longlong(dst_stride)], device)
+
+
+def p2p_sum_rows_idx(dst: torch.Tensor, src: torch.Tensor, idx: torch.Tensor, device: torch.device, groups: int, col0: int = 0):
+    """dst [groups, n] = per group the sum of `rows` src rows picked by idx (int32 [groups * rows]) over src columns
+    [col0, col0 + n) (src: fp32 [*, ld], any row stride)."""
+    rows = idx.numel() // groups
+    n = dst.shape[-1]
+    f = get_function("p2p.cu", "p2p_sum_rows_idx", device)
+    launch(f, ((n + 255) // 256, groups, 1), (256, 1, 1), [ctypes.c_void_p(dst.data_ptr()), ctypes.c_void_p(src.data_ptr()), ctypes.c_void_p(idx.data_ptr()),
+                                                          ctypes.c_int(rows), ctypes.c_int(n), ctypes.c_int(groups), ctypes.c_longlong(src.stride(0)),
+                                                          ctypes.c_int(col0), ctypes.c_longlong(dst.stride(0))], device)
 
 
 def p2p_signal(flag_ptrs: torch.Tensor, seq: torch.Tensor, device: torch.device):

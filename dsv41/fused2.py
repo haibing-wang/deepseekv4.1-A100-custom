@@ -473,11 +473,14 @@ def gate_topk(scores: torch.Tensor, bias: torch.Tensor, temp: float, topk: int, 
 
 # --------------------------------------------------------------------------- hc_post (in place), optionally summing the MoE outputs
 @triton.jit
-def _hc_post2_kernel(X, Y2, YS, R, POST, COMB, y2_row_stride, y2_sum_stride, D: tl.constexpr, HC: tl.constexpr, BLOCK_D: tl.constexpr, NSUM: tl.constexpr):
+def _hc_post2_kernel(X, Y2, YS, R, POST, COMB, y2_row_stride, y2_sum_stride, y2_chunk_stride, D: tl.constexpr, HC: tl.constexpr, BLOCK_D: tl.constexpr,
+                     NSUM: tl.constexpr, CC: tl.constexpr):
+    """CC: columns per chunk of Y2 (chunk c of a partial holds columns [c*CC, (c+1)*CC) as its own [rows, CC] block,
+    `y2_chunk_stride` apart; CC = D means unchunked). BLOCK_D divides CC."""
     cb = tl.program_id(0)
     row = tl.program_id(1)
     X += row * D
-    Y2 += row * y2_row_stride
+    Y2 += row * y2_row_stride + (cb * BLOCK_D // CC) * y2_chunk_stride - (cb * BLOCK_D // CC) * CC
     YS += row * D
     R += row * HC * D
     POST += row * HC
@@ -512,16 +515,24 @@ def hc_post2_(x, residual, post, comb, y2=None, ys=None, y2_sum_first=False):
     hc, d = residual.shape[-2], residual.shape[-1]
     B = residual.shape[0]
     assert hc == 4 and residual.is_contiguous()
+    cc, cs = d, 0
     if y2 is None:
         nsum, rs, ss = 0, 0, 0
     elif y2_sum_first:
         y2 = y2.contiguous()
-        nsum, rs, ss = y2.shape[0], d, y2.shape[1] * d
+        if y2.dim() == 4:  # [nsum, chunks, B, d / chunks]: column chunks of each partial stored as separate blocks
+            nsum, nch = y2.shape[0], y2.shape[1]
+            cc = d // nch
+            rs, cs, ss = cc, B * cc, nch * B * cc
+        else:
+            nsum, rs, ss = y2.shape[0], d, y2.shape[1] * d
     else:
         y2 = y2.contiguous()
         nsum, rs, ss = y2.shape[-2], y2.shape[-2] * d, d
+    block_d = 1024 if cc % 1024 == 0 else 512 if cc % 512 == 0 else 256
+    assert cc % block_d == 0
     with torch.cuda.device(residual.device):
-        _hc_post2_kernel[(triton.cdiv(d, 1024), B)](x if x is not None else residual, y2 if y2 is not None else residual,
-                                                     ys.contiguous() if ys is not None else residual,
-                                                     residual, post.contiguous(), comb.contiguous(), rs, ss, D=d, HC=hc, BLOCK_D=1024, NSUM=nsum, num_warps=4)
+        _hc_post2_kernel[(triton.cdiv(d, block_d), B)](x if x is not None else residual, y2 if y2 is not None else residual,
+                                                        ys.contiguous() if ys is not None else residual,
+                                                        residual, post.contiguous(), comb.contiguous(), rs, ss, cs, D=d, HC=hc, BLOCK_D=block_d, NSUM=nsum, CC=cc, num_warps=4)
     return residual

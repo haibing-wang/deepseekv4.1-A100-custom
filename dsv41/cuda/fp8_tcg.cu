@@ -17,7 +17,6 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-#define BM 64
 #define BN 128
 #define BK 128
 #define STAGES 2
@@ -65,11 +64,13 @@ __device__ __forceinline__ void ldmatrix_x2(uint32_t* r, const void* smem) {
 __device__ __forceinline__ int w_off(int r, int c) { return r * 128 + ((c ^ (r & 7)) << 4); }
 __device__ __forceinline__ int x_off(int r, int c) { return r * 256 + ((c ^ (r & 7)) << 4); }
 
-extern "C" __global__ void __launch_bounds__(NTHR, 2)
-fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
+template <int BM>  // token rows per block (64: 4 m-tiles per warp, 2 blocks/SM; 128: 8 m-tiles, the decoded weight
+                   // fragment feeds twice the mmas, 1 block/SM)
+__device__ __forceinline__ void fp8_gemm_tcg_body(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
              int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols,
              __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits, int tiled)
 {
+    constexpr int MTW = BM / 16;  // m-tiles (8 rows) per warp: the block's BM rows split over the 2 warp rows
     extern __shared__ __align__(128) uint8_t smem[];
     uint8_t* ws = smem;                              // STAGES * BN * 64
     uint8_t* xs = smem + STAGES * BN * BK;           // STAGES * BM * BK * 2
@@ -115,11 +116,11 @@ fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t*
         }
         cp_async_commit();
     };
-    float acc[2][4][4];
+    float acc[2][MTW][4];
 #pragma unroll
     for (int i = 0; i < 2; ++i)
 #pragma unroll
-        for (int j = 0; j < 4; ++j) { acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f; }
+        for (int j = 0; j < MTW; ++j) { acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f; }
     // ldmatrix lane addressing: W x4 over [16 rows][32 k bytes]: matrices 0,1 = rows 0-7 / 8-15 at k 0-15; 2,3 = same rows at k 16-31.
     // lane i supplies the row address of matrix i/8, row i%8.
     const int wl_row = (lane & 7) + ((lane >> 3) & 1) * 8;    // row within the 16-row n-tile
@@ -144,15 +145,15 @@ fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t*
 #pragma unroll
         for (int kh = 0; kh < BK / 32; ++kh) {
             uint32_t araw[2][4];
-            uint32_t b[2][4][2];
+            uint32_t b[2][MTW][2];
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
                 ldmatrix_x4(araw[nt], wt + w_off(wn * 32 + nt * 16 + wl_row, kh * 2 + wl_chunk));
 #pragma unroll
             for (int s = 0; s < 2; ++s)
 #pragma unroll
-                for (int mt = 0; mt < 4; ++mt)
-                    ldmatrix_x2(b[s][mt], xt + x_off(wm * 32 + mt * 8 + xl_row, (kh * 2 + s) * 2 + xl_chunk));
+                for (int mt = 0; mt < MTW; ++mt)
+                    ldmatrix_x2(b[s][mt], xt + x_off(wm * (BM / 2) + mt * 8 + xl_row, (kh * 2 + s) * 2 + xl_chunk));
             const int sc = (sc2 >> (8 * kh)) & 0xFF;
             const uint32_t fb = (sc + 120 > 0) ? ((uint32_t)(sc + 120) << 7) : 0u;
             const uint32_t f2 = fb | (fb << 16);
@@ -168,7 +169,7 @@ fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t*
                     a[nt][1] = hmul2_bf16(lo, f2); a[nt][3] = hmul2_bf16(hi, f2);
                 }
 #pragma unroll
-                for (int mt = 0; mt < 4; ++mt)
+                for (int mt = 0; mt < MTW; ++mt)
 #pragma unroll
                     for (int nt = 0; nt < 2; ++nt) mma16816(acc[nt][mt], a[nt], b[s][mt]);
             }
@@ -181,8 +182,8 @@ fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t*
     for (int nt = 0; nt < 2; ++nt) {
         const int n = n_blk + wn * 32 + nt * 16 + g;
 #pragma unroll
-        for (int mt = 0; mt < 4; ++mt) {
-            const int m = m_blk + wm * 32 + mt * 8 + 2 * t;
+        for (int mt = 0; mt < MTW; ++mt) {
+            const int m = m_blk + wm * (BM / 2) + mt * 8 + 2 * t;
             if (m < M) { o[(long long)m * ldo + n] = acc[nt][mt][0]; o[(long long)m * ldo + n + 8] = acc[nt][mt][2]; }
             if (m + 1 < M) { o[(long long)(m + 1) * ldo + n] = acc[nt][mt][1]; o[(long long)(m + 1) * ldo + n + 8] = acc[nt][mt][3]; }
         }
@@ -202,3 +203,15 @@ fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t*
         y[(long long)r * N + col] = __float2bfloat16(a);
     }
 }
+
+extern "C" __global__ void __launch_bounds__(NTHR, 2)
+fp8_gemm_tcg(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
+             int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols,
+             __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits, int tiled)
+{ fp8_gemm_tcg_body<64>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits, tiled); }
+
+extern "C" __global__ void __launch_bounds__(NTHR, 1)
+fp8_gemm_tcg128(const __nv_bfloat16* __restrict__ X, int ldx, int M, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
+             int N, int K, int Kc, float* __restrict__ out, int ldo, int k_per_split, int group_cols,
+             __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ counters, int splits, int tiled)
+{ fp8_gemm_tcg_body<128>(X, ldx, M, W, S, N, K, Kc, out, ldo, k_per_split, group_cols, y, counters, splits, tiled); }

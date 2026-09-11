@@ -27,6 +27,18 @@ extern "C" __global__ void p2p_sum_rows(float* __restrict__ dst, const float* __
     dst[(long long)g * dst_stride + i] = acc;
 }
 
+// dst[g, i] = sum_r src[idx[g * rows + r], col0 + i] for i < n (src rows `src_ld` apart; dst rows `dst_stride` apart):
+// the expert output rows of token g summed straight from the expert-sorted order, over one column chunk
+extern "C" __global__ void p2p_sum_rows_idx(float* __restrict__ dst, const float* __restrict__ src, const int* __restrict__ idx,
+                                            int rows, int n, int groups, long long src_ld, int col0, long long dst_stride) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int g = blockIdx.y;
+    if (i >= n || g >= groups) return;
+    float acc = 0.f;
+    for (int r = 0; r < rows; ++r) acc += src[(long long)idx[g * rows + r] * src_ld + col0 + i];
+    dst[(long long)g * dst_stride + i] = acc;
+}
+
 // after the preceding kernels of this stream have completed: publish `value` (read from seq_ptr) to up to 8 peer flags
 extern "C" __global__ void p2p_signal(int** flags, int n, const int* seq_ptr) {
     __threadfence_system();

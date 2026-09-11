@@ -306,13 +306,42 @@ def _swiglu_quant_kernel(GU, W, Y, n_rows, limit, INTER: tl.constexpr, GROUP: tl
     tl.store(Y + row * INTER + cols, (q * s).to(tl.bfloat16))
 
 
+@triton.jit(do_not_specialize=["n_rows"])
+def _swiglu_quant_kernel8(GU, W, Y, n_rows, limit, INTER: tl.constexpr, HAS_W: tl.constexpr, PERMUTE: tl.constexpr):
+    """Same as _swiglu_quant_kernel with 8 groups of 32 (256 columns) per program: 8x fewer programs (at 1,536 rows
+    the one-warp-per-32-columns launch cost 72 us of scheduling for 21 MB of traffic)."""
+    row = tl.program_id(0)
+    gb = tl.program_id(1)
+    cols = gb * 256 + tl.arange(0, 8)[:, None] * 32 + tl.arange(0, 32)[None, :]
+    gate = tl.load(GU + row * (2 * INTER) + cols).to(tl.float32)
+    up = tl.load(GU + row * (2 * INTER) + INTER + cols).to(tl.float32)
+    if limit > 0:
+        up = tl.minimum(tl.maximum(up, -limit), limit)
+        gate = tl.minimum(gate, limit)
+    h = gate * tl.sigmoid(gate) * up
+    if HAS_W:
+        h = h * tl.load(W + row)
+    h = h.to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(h), axis=1), 1e-4)
+    s = _pow2(_ceil_log2(libdevice.div_rn(amax, 448.0)))
+    q = _round_e4m3(tl.minimum(tl.maximum(libdevice.div_rn(h, s[:, None]), -448.0), 448.0))
+    if PERMUTE:
+        j = cols & 7
+        cols = (cols & ~7) | ((j & 1) << 2) | (j & 2) | (j >> 2)
+    tl.store(Y + row * INTER + cols, (q * s[:, None]).to(tl.bfloat16))
+
+
 def swiglu_quant(gu: torch.Tensor, weights: torch.Tensor | None, inter: int, limit: float, permute: bool = False) -> torch.Tensor:
     """gu: fp32 or bf16 [rows, 2*inter] (gate | up); weights: fp32 [rows] or None -> bf16 [rows, inter], FP8-rounded per 32."""
     rows = gu.shape[0]
     y = torch.empty(rows, inter, device=gu.device, dtype=torch.bfloat16)
     with torch.cuda.device(gu.device):
-        _swiglu_quant_kernel[(rows, inter // 32)](gu.contiguous(), weights if weights is not None else gu, y, rows, float(limit),
-                                                 INTER=inter, GROUP=32, HAS_W=weights is not None, PERMUTE=permute, num_warps=1)
+        if rows > 16 and inter % 256 == 0:
+            _swiglu_quant_kernel8[(rows, inter // 256)](gu.contiguous(), weights if weights is not None else gu, y, rows, float(limit),
+                                                      INTER=inter, HAS_W=weights is not None, PERMUTE=permute, num_warps=4)
+        else:
+            _swiglu_quant_kernel[(rows, inter // 32)](gu.contiguous(), weights if weights is not None else gu, y, rows, float(limit),
+                                                     INTER=inter, GROUP=32, HAS_W=weights is not None, PERMUTE=permute, num_warps=1)
     return y
 
 

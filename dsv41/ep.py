@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 import os
 
-from .cukern import fp4_gemm_tc, memcpy_async, p2p_copy, p2p_copy_row, p2p_multicast, p2p_seq_bump, p2p_signal, p2p_stamp, p2p_sum_rows, p2p_wait
+from .cukern import fp4_gemm_tc, memcpy_async, p2p_copy, p2p_copy_row, p2p_multicast, p2p_seq_bump, p2p_signal, p2p_stamp, p2p_sum_rows, p2p_sum_rows_idx, p2p_wait
 
 # messages by copy engine (cuMemcpyAsync) instead of kernel P2P stores: the engines win for large messages
 # (B=16: 164 KB routing packets, multicast 553 -> 76 us) while kernel stores have the lower latency for small
@@ -32,6 +32,11 @@ EP_TRACE = os.environ.get("DSV41_EP_TRACE", "0") == "1"  # per-layer device time
 # NVLink; the partials come back the same way in reverse (the far pair's leaf adds into its partner, one PCIe
 # transfer instead of two). Partials travel as bf16 (the fp32 sum over the shard's experts rounded once).
 EP_RELAY = os.environ.get("DSV41_EP_RELAY", "1") == "1"
+# Column-chunked partials (DSV41_EP_CHUNKS=2..4): the w2 GEMM runs chunk by chunk and each finished chunk is sent
+# on a second stream while the next one computes. Measured slower (S=32 K=3: 638 -> 617 tok/s, wait partials
+# 169 -> 283 us/layer): the half-width GEMM launches and the extra stream hand-offs cost more than the transfer
+# they hide, so the default is one chunk.
+EP_CHUNKS = int(os.environ.get("DSV41_EP_CHUNKS", "1"))
 EP_BF16_PART = os.environ.get("DSV41_EP_BF16_PART", "1") == "1"
 from .decode import DecodeRuntime, HC_FORK
 from .fused import rmsnorm, swiglu_quant
@@ -81,9 +86,14 @@ class EPRuntime(DecodeRuntime):
         self.dma_part = EP_DMA_MODE == "1" or (EP_DMA_MODE == "auto" and B * dim * 4 > EP_DMA_BYTES)
         self.bf16_part = EP_BF16_PART and self.dma_part
         pdt = torch.bfloat16 if self.bf16_part else torch.float32
-        self.part_in = {d: torch.zeros(self.nd, B, dim, dtype=pdt, device=d) for d in self.devs}  # [sender, b, dim]
-        self.part_out = {d: torch.zeros(B, dim, dtype=torch.float32, device=d) for d in self.devs}  # a peer's summed partial before the DMA
-        self.part_out16 = {d: torch.zeros(B, dim, dtype=pdt, device=d) for d in self.devs} if self.bf16_part else self.part_out
+        self.nch = EP_CHUNKS if (self.dma_part and B > 1 and EP_CHUNKS > 1 and dim % (EP_CHUNKS * 64) == 0) else 1
+        cc = dim // self.nch
+        self.part_in = {d: torch.zeros(self.nd, self.nch, B, cc, dtype=pdt, device=d) for d in self.devs}  # [sender, chunk, b, cc]
+        self.part_out = {d: torch.zeros(self.nch, B, cc, dtype=torch.float32, device=d) for d in self.devs}  # a peer's summed partial before the DMA
+        self.part_out16 = {d: torch.zeros(self.nch, B, cc, dtype=pdt, device=d) for d in self.devs} if self.bf16_part else self.part_out
+        self.y2_ws = {d: torch.zeros(B * topk, dim, dtype=torch.float32, device=d) for d in self.devs}  # expert-sorted w2 output
+        self.ident_idx = {d: torch.arange(B * topk, dtype=torch.int32, device=d) for d in self.devs}
+        self.comm = {d: torch.cuda.Stream(d) for d in self.devs}  # partial transfers, overlapping the next chunk's compute
         # NVLink pairs (d, d ^ 1) and the relay roles: for owner o, relay(o) is the lower GPU of the other pair
         self.partner = {d: next((p for p in self.devs if p.index == (d.index ^ 1)), None) for d in self.devs}
         self.relay = EP_RELAY and self.dma_route and self.dma_part and self.nd == 4 and all(v is not None for v in self.partner.values())
@@ -92,7 +102,7 @@ class EPRuntime(DecodeRuntime):
             for o in self.devs:
                 far = [d for d in self.devs if d != o and d != self.partner[o]]
                 self.relay_of[o] = min(far, key=lambda dd: dd.index)
-        self.part_relay = {d: torch.zeros(B, dim, dtype=pdt, device=d) for d in self.devs}  # the leaf partner's partial
+        self.part_relay = {d: torch.zeros(self.nch, B, cc, dtype=pdt, device=d) for d in self.devs}  # the leaf partner's partial
         self.flag_relay = {d: torch.zeros(nl, dtype=torch.int32, device=d) for d in self.devs}
         self.flag_route = {d: torch.zeros(nl, dtype=torch.int32, device=d) for d in self.devs}
         self.flag_part = {d: torch.zeros(nl, self.nd, dtype=torch.int32, device=d) for d in self.devs}
@@ -221,11 +231,13 @@ class EPRuntime(DecodeRuntime):
         with torch.cuda.stream(side2):
             ys = self._shared_expert(moe, xq)
         y_loc = self._experts_shard(d, xqp, eid, wt, moe)
-        if self.bf16_part:
-            p2p_sum_rows(self.part_out[d], y_loc, d, groups=self.B)
-            self.part_in[d][self.idx[d]].copy_(self.part_out[d])
-        else:
-            p2p_sum_rows(self.part_in[d][self.idx[d]], y_loc, d, groups=self.B)
+        cc = self.part_in[d].shape[-1]
+        for c in range(self.nch):  # own partial straight into the inbox row, chunk layout like the peers'
+            if self.bf16_part:
+                p2p_sum_rows_idx(self.part_out[d][c], y_loc, self.ident_idx[d], d, groups=self.B, col0=c * cc)
+                self.part_in[d][self.idx[d]][c].copy_(self.part_out[d][c])
+            else:
+                p2p_sum_rows_idx(self.part_in[d][self.idx[d]][c], y_loc, self.ident_idx[d], d, groups=self.B, col0=c * cc)
         main.wait_stream(side2)
         self._stamp(d, L, 3)
         # wait for the peers' partials (own slot is raised by a local signal so the whole row can be waited on)
@@ -266,25 +278,48 @@ class EPRuntime(DecodeRuntime):
         if role == "relay" and not self.dry:  # forward the route packet to the leaf over NVLink
             memcpy_async(self.inbox[self.partner[d]], self.inbox[d], d)
             p2p_signal(self.sig_fwd[L], self.seqno[d], d)
-        y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d], blk.ffn)
         if self.dma_part:
-            p2p_sum_rows(self.part_out[d], y, d, groups=self.B)
-            if role == "leaf":  # into the relay partner, which adds it to its own partial
+            moe = blk.ffn
+            start, n = self.shard[d]
+            sh = [x for x in moe.ep if x["device"] == d][0]
+            B, topk = self.B, self.topk_e
+            cc = self.part_in[d].shape[-1]
+            main = torch.cuda.current_stream(d)
+            comm = self.comm[d]
+            dst = self.part_relay[a] if role == "leaf" else self.part_in[o][self.idx[d]]
+            if self.nch > 1:  # w2 chunk by chunk; every finished chunk leaves on the comm stream while the next computes
+                hqp, tabs = self.experts_tc_prepare(self.inbox_x[d], sh["w13"], sh["s13"], self.inbox_eid[d], self.inbox_wt[d], moe.inter, moe.swiglu_limit,
+                                                    B * topk, d, topk, (start, n))
+                for c in range(self.nch):
+                    self.experts_tc_w2(hqp, tabs, sh["w2"], sh["s2"], self.y2_ws[d], c * cc, cc)
+                    p2p_sum_rows_idx(self.part_out[d][c], self.y2_ws[d], tabs["inv"], d, groups=B, col0=c * cc)
+                    if role == "relay":
+                        if c == 0:
+                            self._wait(self.flag_relay[d][L : L + 1], d)
+                        self.part_out[d][c].add_(self.part_relay[d][c])
+                    if self.bf16_part:
+                        self.part_out16[d][c].copy_(self.part_out[d][c])
+                    comm.wait_stream(main)
+                    with torch.cuda.stream(comm):
+                        memcpy_async(dst[c], self.part_out16[d][c], d)
+            else:
+                y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d], moe)
+                p2p_sum_rows_idx(self.part_out[d][0], y, self.ident_idx[d], d, groups=B)
+                if role == "relay":
+                    self._wait(self.flag_relay[d][L : L + 1], d)
+                    self.part_out[d].add_(self.part_relay[d])
                 if self.bf16_part:
                     self.part_out16[d].copy_(self.part_out[d])
-                memcpy_async(self.part_relay[a], self.part_out16[d], d)
-                self._signal(self.sig_relay[L], d)
-                self._stamp(d, L, 7)
-                return
-            if role == "relay":
-                self._wait(self.flag_relay[d][L : L + 1], d)
-                self.part_out[d].add_(self.part_relay[d])
-            if self.bf16_part:
-                self.part_out16[d].copy_(self.part_out[d])
-            memcpy_async(self.part_in[o][self.idx[d]], self.part_out16[d], d)
+                comm.wait_stream(main)
+                with torch.cuda.stream(comm):
+                    memcpy_async(dst, self.part_out16[d], d)
+            with torch.cuda.stream(comm):
+                self._signal(self.sig_relay[L] if role == "leaf" else self.sig_part[(L, d)], d)
+            main.wait_stream(comm)  # the partial buffers are reused next layer
         else:
-            p2p_sum_rows(self.part_in[o][self.idx[d]], y, d, groups=self.B)  # straight into the owner's inbox row
-        self._signal(self.sig_part[(L, d)], d)
+            y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d], blk.ffn)
+            p2p_sum_rows(self.part_in[o][self.idx[d]][0], y, d, groups=self.B)  # straight into the owner's inbox row
+            self._signal(self.sig_part[(L, d)], d)
         self._stamp(d, L, 7)
 
     def token_begin(self, d):
