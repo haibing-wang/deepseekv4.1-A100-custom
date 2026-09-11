@@ -113,9 +113,11 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
     M, K = x.shape
     N = w8.shape[0]
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and w8.is_contiguous() and s8.is_contiguous()
-    assert K % 64 == 0 and N % 8 == 0 and (group_cols == 0 and M <= 16 or group_cols > 0 and group_cols % 8 == 0 and N % group_cols == 0)
+    assert K % 64 == 0 and N % 8 == 0 and (group_cols == 0 or group_cols % 8 == 0 and N % group_cols == 0)
     Mo = M // (N // group_cols) if group_cols else M
-    assert Mo <= 16
+    if Mo > 16:  # the kernel handles 16 rows: chunk
+        per = (N // group_cols) if group_cols else 1
+        return torch.cat([fp8_gemm_tc(x[i * per : (i + 16) * per], w8, s8, group_cols, out_dtype) for i in range(0, Mo, 16)], dim=0)
     splits = _splits_for(N, K)
     kps = -(-K // splits)
     kps = -(-kps // 128) * 128

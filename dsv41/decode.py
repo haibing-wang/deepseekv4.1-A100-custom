@@ -296,6 +296,10 @@ class DecodeRuntime:
         ar = torch.arange(n, device=d)
         is_new = torch.ones(n, dtype=torch.bool, device=d)
         is_new[1:] = se[1:] != se[:-1]
+        if B > 16:  # a group holds at most 16 tokens: split longer runs of the same expert
+            gid0 = torch.cumsum(is_new.to(torch.int64), 0) - 1
+            first = torch.full((n,), n, dtype=torch.int64, device=d).scatter_reduce_(0, gid0, torch.where(is_new, ar, torch.full_like(ar, n)), "amin")
+            is_new = is_new | (((ar - first[gid0]) % 16) == 0)
         gid = torch.cumsum(is_new.to(torch.int64), 0) - 1
         grp_expert = torch.full((n,), -1, dtype=torch.int32, device=d).scatter_(0, gid, se.to(torch.int32))
         grp_start = torch.full((n + 1,), n, dtype=torch.int32, device=d)
