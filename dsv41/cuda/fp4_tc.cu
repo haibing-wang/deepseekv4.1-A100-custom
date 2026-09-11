@@ -53,16 +53,22 @@ template <bool M8>
 __device__ __forceinline__ void fp4_gemm_body(const __nv_bfloat16* __restrict__ X, int ldx,
         const uint8_t* __restrict__ W, long long stride_we, const uint8_t* __restrict__ S, long long stride_se,
         const int* __restrict__ grp_expert, const int* __restrict__ grp_start, const int* __restrict__ pair_tok,
-        float* __restrict__ out, int ldo, int N, int K)
+        float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out)
 {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
     const int n0 = (blockIdx.x * WARPS + warp) * 8;
     if (n0 >= N) return;
     const int grp = blockIdx.y;
-    const int e = grp_expert[grp];
     const int p0 = grp_start[grp], p1 = grp_start[grp + 1];
     const int M = p1 - p0;
+    int e = grp_expert[grp] - shard_start;
+    if (e < 0 || e >= shard_n) {  // not this GPU's expert (expert parallelism): skip, optionally zero the rows
+        if (zero_out && lane < 8) {
+            for (int r = 0; r < M; ++r) out[(long long)(p0 + r) * ldo + n0 + lane] = 0.f;
+        }
+        return;
+    }
     const int n = n0 + g;
     const uint8_t* wrow = W + (long long)e * stride_we + (long long)n * (K / 2);
     const uint8_t* srow = S + (long long)e * stride_se + (long long)n * (K / 32);
@@ -117,11 +123,11 @@ __device__ __forceinline__ void fp4_gemm_body(const __nv_bfloat16* __restrict__ 
 extern "C" __global__ void __launch_bounds__(WARPS * 32)
 fp4_gemm_tc8(const __nv_bfloat16* __restrict__ X, int ldx, const uint8_t* __restrict__ W, long long stride_we,
              const uint8_t* __restrict__ S, long long stride_se, const int* __restrict__ grp_expert, const int* __restrict__ grp_start,
-             const int* __restrict__ pair_tok, float* __restrict__ out, int ldo, int N, int K)
-{ fp4_gemm_body<true>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K); }
+             const int* __restrict__ pair_tok, float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out)
+{ fp4_gemm_body<true>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out); }
 
 extern "C" __global__ void __launch_bounds__(WARPS * 32)
 fp4_gemm_tc16(const __nv_bfloat16* __restrict__ X, int ldx, const uint8_t* __restrict__ W, long long stride_we,
               const uint8_t* __restrict__ S, long long stride_se, const int* __restrict__ grp_expert, const int* __restrict__ grp_start,
-              const int* __restrict__ pair_tok, float* __restrict__ out, int ldo, int N, int K)
-{ fp4_gemm_body<false>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K); }
+              const int* __restrict__ pair_tok, float* __restrict__ out, int ldo, int N, int K, int shard_start, int shard_n, int zero_out)
+{ fp4_gemm_body<false>(X, ldx, W, stride_we, S, stride_se, grp_expert, grp_start, pair_tok, out, ldo, N, K, shard_start, shard_n, zero_out); }

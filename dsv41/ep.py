@@ -1,0 +1,276 @@
+"""Expert-parallel decode: one CUDA graph per GPU for the whole token, no host round trips.
+
+Dense layers are pipelined over the GPUs in order (layer L's attention, norms, gate and shared expert
+run on its owner), every layer's routed experts are sharded over all GPUs. Per layer the owner pushes
+the quantized activation and the routing (6 expert ids + weights) into every peer's inbox with P2P
+stores and raises a flag; each GPU computes the selected experts it holds (a masked grouped GEMM on
+the FP4 tensor-core kernel), sums them into a partial and pushes it into the owner's inbox, raising
+another flag; the owner waits for the partials, adds the shared expert and continues. When the owner
+changes (pipeline hop) the residual stream and the attention bookkeeping travel the same way.
+
+All synchronisation is device-side (flag kernels spinning on a per-token sequence number), so the
+40 layers of a token are 4 graph launches and one host sync for the logits. Requires P2P access
+between all the GPUs (same PCIe root / socket is fine: ~10 us per message)."""
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+from .cukern import fp4_gemm_tc, p2p_copy, p2p_copy_row, p2p_seq_bump, p2p_signal, p2p_sum_rows, p2p_wait
+from .decode import DecodeRuntime, HC_FORK
+from .fused import rmsnorm, swiglu_quant
+from .fused2 import gate_topk, hc_post2_
+from .model import Block, Transformer, _hc_pre
+
+
+class EPRuntime(DecodeRuntime):
+    def __init__(self, model: Transformer, use_graphs: bool = True):
+        super().__init__(model, use_graphs=False)
+        self.use_graphs = use_graphs
+        self.devs = [torch.device(f"cuda:{d}") for d in dict.fromkeys(b.device.index for b in model.blocks)]
+        # every device in the pipeline order; expert shards live on all of them
+        shards = model.blocks[0].ffn.ep
+        assert shards is not None, "load the model with ep=True"
+        self.shard = {sh["device"]: (sh["start"], sh["n"]) for sh in shards}
+        self.devs = [sh["device"] for sh in shards]  # shard order == device order
+        self.nd = len(self.devs)
+        self.idx = {d: i for i, d in enumerate(self.devs)}
+        nl = len(model.blocks)
+        hc, dim, topk = self.cfg["hc_mult"], self.cfg["dim"], self.cfg["n_activated_experts"]
+        self.topk_e = topk
+        # peer access (torch enables it lazily on a copy)
+        for a in self.devs:
+            for b in self.devs:
+                if a != b:
+                    torch.zeros(1, device=a).to(b)
+        # static buffers
+        self.seq = {d: torch.ones(1, dtype=torch.int32, device=d) for d in self.devs}
+        self.hop_h = {d: torch.zeros(1, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devs}
+        self.hop_pre = {d: torch.zeros(hc, dtype=torch.float32, device=d) for d in self.devs}
+        self.pre_identity = {d: torch.tensor([1.0] + [0.0] * (hc - 1), dtype=torch.float32, device=d) for d in self.devs}
+        self.inbox_x = {d: torch.zeros(1, dim, dtype=torch.bfloat16, device=d) for d in self.devs}
+        self.inbox_eid = {d: torch.zeros(8, dtype=torch.int32, device=d) for d in self.devs}
+        self.inbox_wt = {d: torch.zeros(8, dtype=torch.float32, device=d) for d in self.devs}
+        self.eid8 = {d: torch.zeros(8, dtype=torch.int32, device=d) for d in self.devs}
+        self.wt8 = {d: torch.zeros(8, dtype=torch.float32, device=d) for d in self.devs}
+        self.part_in = {d: torch.zeros(self.nd, dim, dtype=torch.float32, device=d) for d in self.devs}
+        self.flag_route = {d: torch.zeros(nl, dtype=torch.int32, device=d) for d in self.devs}
+        self.flag_part = {d: torch.zeros(nl, self.nd, dtype=torch.int32, device=d) for d in self.devs}
+        self.flag_hop = {d: torch.zeros(nl + 1, dtype=torch.int32, device=d) for d in self.devs}
+        # pointer tables for the signal kernels (addresses of peers' flags)
+        self.sig_route = {}
+        self.sig_part = {}
+        self.sig_hop = {}
+        for L, blk in enumerate(model.blocks):
+            o = blk.device
+            peers = [d for d in self.devs if d != o]
+            self.sig_route[L] = torch.tensor([self.flag_route[p][L].data_ptr() for p in peers], dtype=torch.int64, device=o)
+            for p in peers:
+                self.sig_part[(L, p)] = torch.tensor([self.flag_part[o][L, self.idx[p]].data_ptr()], dtype=torch.int64, device=p)
+            if L + 1 < nl and model.blocks[L + 1].device != o:
+                nxt = model.blocks[L + 1].device
+                self.sig_hop[L] = torch.tensor([self.flag_hop[nxt][L + 1].data_ptr()], dtype=torch.int64, device=o)
+        self._ptrs = {}
+        for L, blk in enumerate(model.blocks):
+            o = blk.device
+            self._ptrs[("own", L, o)] = torch.tensor([self.flag_part[o][L, self.idx[o]].data_ptr()], dtype=torch.int64, device=o)
+        # the candidate buffers travel between devices with 16-byte copies: pad them
+        n_cand = -(-(model.args.max_seq_len + 1) // 16) * 16
+        self.cand_buf = {d: torch.zeros(1, 1, n_cand, dtype=torch.bool, device=d) for d in self.devs}
+        for d in self.devs:
+            self._tc_tables(topk, d)
+        self.graphs = {}
+        self.logits = torch.zeros(1, self.cfg["vocab_size"], dtype=torch.float32, device=self.devs[-1])
+        self.first_layer = {d: min(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
+        self.last_layer = {d: max(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
+        self.dry = False  # dry pass: no device-side waits / signals (only to compile and load every kernel)
+
+    def _wait(self, flags, d):
+        if not self.dry:
+            p2p_wait(flags, self.seq[d], d)
+
+    def _signal(self, ptrs, d):
+        if not self.dry:
+            p2p_signal(ptrs, self.seq[d], d)
+
+    # ------------------------------------------------------------------ pieces
+    def _experts_shard(self, d, xqp, eid, wt, moe):
+        start, n = self.shard[d]
+        sh = [s for s in moe.ep if s["device"] == d][0]
+        starts, tok0, rows = self._tc_tables(self.topk_e, d)
+        gu = fp4_gemm_tc(xqp, sh["w13"], sh["s13"], eid, starts, tok0, self.topk_e, 1, shard_start=start, shard_n=n, zero_out=False)
+        hqp = swiglu_quant(gu, wt, moe.inter, moe.swiglu_limit, permute=True)
+        return fp4_gemm_tc(hqp, sh["w2"], sh["s2"], eid, starts, rows, self.topk_e, 1, shard_start=start, shard_n=n, zero_out=True)
+
+    def _push_cache_rows(self, blk: Block, d):
+        """After an owner ran a KV / index source layer: mirror the written rows to the later devices."""
+        lid = blk.layer_id
+        if lid not in self.kv_row:
+            return
+        later = [dd for dd in self.devs if self.idx[dd] > self.idx[d]]
+        val, idx = self.kv_row[lid]
+        for dd in later:
+            p2p_copy_row(self.m.shared.compress_kv[(lid, dd)], idx, val, d)
+        val, idx = self.ik_row[lid]
+        for dd in later:
+            p2p_copy_row(self.m.shared.index_k[(lid, dd)], idx, val, d)
+
+    def _owner_layer(self, blk: Block, d, h, pre):
+        L = blk.layer_id
+        moe = blk.ffn
+        if blk.engram is not None:
+            h.copy_(blk.engram.apply(h, self.eng_in[L]))
+        (pre_n, post, comb), side, x, xq, _ = self._hc_sub(blk, h, blk.hc_attn, pre, blk.attn_norm_w)
+        a = self.attention2(blk.attn, x, xq, d)
+        self._push_cache_rows(blk, d)
+        self._hc_join(side, d)
+        hc_post2_(a.view(1, -1), h, post, comb)
+        (pre_out, post, comb), side, x, xq, xf, xqp = self._hc_sub(blk, h, blk.hc_ffn, pre_n, blk.ffn_norm_w, want_f32=True, want_perm=True)
+        scores = F.linear(xf, moe.gate_w)
+        eid, wt = self.eid8[d][: self.topk_e], self.wt8[d][: self.topk_e]
+        gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1, eid=eid, wt=wt)
+        # routing + activation to the peers, then the flag
+        for p in self.devs:
+            if p == d:
+                continue
+            p2p_copy(self.inbox_x[p], xqp, d)
+            p2p_copy(self.inbox_eid[p], self.eid8[d], d)
+            p2p_copy(self.inbox_wt[p], self.wt8[d], d)
+        self._signal(self.sig_route[L], d)
+        # own shard + shared expert while the peers work
+        y_loc = self._experts_shard(d, xqp, eid, wt, moe)
+        p2p_sum_rows(self.part_in[d][self.idx[d]], y_loc, d)
+        ys = self._shared_expert(moe, xq)
+        # wait for the peers' partials (own slot is raised by a local signal so the whole row can be waited on)
+        self._signal(self._own_part_ptr(L, d), d)
+        self._wait(self.flag_part[d][L], d)
+        self._hc_join(side, d)
+        hc_post2_(None, h, post, comb, y2=self.part_in[d], ys=ys)
+        return pre_out
+
+    def _own_part_ptr(self, L, d):
+        return self._ptrs[("own", L, d)]
+
+    def _shared_expert(self, moe, xq):
+        from .w8 import linear_w
+        gu_s = linear_w(xq, moe.sh_w13)
+        hs = swiglu_quant(gu_s, None, moe.inter, moe.swiglu_limit)
+        return linear_w(hs, moe.sh_w2)
+
+    def _peer_layer(self, blk: Block, d):
+        L = blk.layer_id
+        o = blk.device
+        self._wait(self.flag_route[d][L : L + 1], d)
+        y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d][: self.topk_e], self.inbox_wt[d][: self.topk_e], blk.ffn)
+        p2p_sum_rows(self.part_in[o][self.idx[d]], y, d)  # straight into the owner's inbox row
+        self._signal(self.sig_part[(L, d)], d)
+
+    def token_begin(self, d):
+        hc = self.cfg["hc_mult"]
+        if d == self.devs[0]:
+            with torch.cuda.device(d):
+                self.hop_h[d].copy_(F.embedding(self.tok, self.m.embed).unsqueeze(2).repeat(1, 1, hc, 1))
+                self.hop_pre[d].copy_(self.pre_identity[d])
+        self._pre = {dd: self.hop_pre[dd] for dd in self.devs}
+        self.kv_owner = -1
+        self.index_owner = -1
+
+    def layer_section(self, L, d):
+        """Layer L's share of the token on device d (owner or peer section)."""
+        blocks = self.m.blocks
+        blk = blocks[L]
+        h = self.hop_h[d]
+        with torch.cuda.device(d):
+            if blk.device == d:
+                if L == self.first_layer[d] and self.idx[d] > 0:
+                    self._wait(self.flag_hop[d][L : L + 1], d)
+                pre = self._owner_layer(blk, d, h, self._pre[d])
+                self._pre[d] = pre
+                if L == self.last_layer[d]:
+                    if self.idx[d] + 1 < self.nd:
+                        nxt = blocks[L + 1].device
+                        p2p_copy(self.hop_h[nxt], h, d)
+                        p2p_copy(self.hop_pre[nxt], pre, d)
+                        p2p_copy(self.topk_buf[nxt], self.topk_buf[d], d)
+                        p2p_copy(self.cand_buf[nxt], self.cand_buf[d], d)
+                        self._signal(self.sig_hop[L], d)
+                    else:
+                        hh = _hc_pre(h, pre.view(1, 1, -1))[:, -1]
+                        hh = rmsnorm(hh, self.m.norm_w, self.cfg["norm_eps"])
+                        self.logits.copy_(F.linear(hh, self.m.head).float())
+            else:
+                self._peer_layer(blk, d)
+        # bookkeeping of the source layers (attention2 on later owners reads these; same on every device)
+        if blk.attn.is_kv_source:
+            self.kv_owner = L
+        if blk.attn.is_index_source:
+            self.index_owner = L
+
+    def token_end(self, d):
+        with torch.cuda.device(d):
+            p2p_seq_bump(self.seq[d], d)
+
+    def token_graph(self, d):
+        """The whole token on device d (owner and peer sections in layer order)."""
+        self.token_begin(d)
+        for L in range(len(self.m.blocks)):
+            self.layer_section(L, d)
+        self.token_end(d)
+
+    # ------------------------------------------------------------------ driver
+    def capture(self):
+        # 1) dry pass without waits: compiles / loads every kernel on every device (a module load while the device
+        #    spins in a wait deadlocks the host), 2) two real passes with the devices interleaved per layer,
+        # 3) one graph per device
+        self.dry = True
+        for d in self.devs:
+            self.token_graph(d)
+            torch.cuda.synchronize(d)
+        self.dry = False
+        for d in self.devs:
+            self.seq[d].fill_(1)
+            self.flag_route[d].zero_()
+            self.flag_part[d].zero_()
+            self.flag_hop[d].zero_()
+        for _ in range(2):
+            for d in self.devs:
+                self.token_begin(d)
+            for L in range(len(self.m.blocks)):
+                for d in self.devs:
+                    self.layer_section(L, d)
+            for d in self.devs:
+                self.token_end(d)
+            for d in self.devs:
+                torch.cuda.synchronize(d)
+        if not self.use_graphs:
+            return
+        for d in self.devs:
+            with torch.cuda.device(d):
+                s = torch.cuda.Stream(d)
+                s.wait_stream(torch.cuda.current_stream(d))
+                torch.cuda.synchronize(d)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=s, capture_error_mode="thread_local"):
+                    self.token_graph(d)
+                self.graphs[d] = g
+        for d in self.devs:
+            torch.cuda.synchronize(d)
+
+    @torch.inference_mode()
+    def step(self, token: int, pos: int) -> torch.Tensor:
+        self.tok.fill_(token)
+        for d in self.devs:
+            self.pos[d].fill_(pos)
+        if self.m.engram_hash is not None:
+            hashes = self.m.engram_hash(self.tok, pos)
+            for blk in self.m.blocks:
+                if blk.engram is not None:
+                    emb = blk.engram.table.lookup(hashes[:, :, blk.engram.layer_hash_index, :], blk.device).flatten(-2)
+                    self.eng_in[blk.layer_id].copy_(emb)
+        for d in self.devs:
+            if self.use_graphs and d in self.graphs:
+                self.graphs[d].replay()
+            else:
+                self.token_graph(d)
+        torch.cuda.synchronize(self.devs[-1])
+        return self.logits

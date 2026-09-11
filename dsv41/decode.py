@@ -23,7 +23,7 @@ from .w8 import linear_w, oproj_a
 FUSED2 = os.environ.get("DSV41_FUSED2", "1") == "1"
 _CPU_DEBUG = os.environ.get("DSV41_CPU_DEBUG") is not None
 FP4_TC = os.environ.get("DSV41_FP4_TC", "1") == "1"  # expert GEMM on tensor cores (cuda/fp4_tc.cu) instead of the GEMV
-HC_FORK = os.environ.get("DSV41_HC_FORK", "0") == "1"  # hyper-connection mixes + sinkhorn on a side stream (a parallel graph branch)  # the ~25-launch layer (fused2.py) instead of the ~100-launch one
+HC_FORK = os.environ.get("DSV41_HC_FORK", "1") == "1"  # hyper-connection mixes + sinkhorn on a side stream (a parallel graph branch)
 
 
 class DecodeRuntime:

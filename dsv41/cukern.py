@@ -158,20 +158,67 @@ def permute_x(x: torch.Tensor) -> torch.Tensor:
 
 
 def fp4_gemm_tc(xp: torch.Tensor, w: torch.Tensor, s: torch.Tensor, grp_expert: torch.Tensor, grp_start: torch.Tensor,
-                pair_tok: torch.Tensor, n_pairs: int, max_tokens: int) -> torch.Tensor:
+                pair_tok: torch.Tensor, n_pairs: int, max_tokens: int, shard_start: int = 0, shard_n: int = 1 << 30,
+                zero_out: bool = False, out: torch.Tensor | None = None) -> torch.Tensor:
     """xp: permuted bf16 [rows, K]; w: uint8 [E, N, K/2]; s: uint8 [E, N, K/32]; groups g: expert grp_expert[g] with pairs
-    grp_start[g]..grp_start[g+1]-1 (<= 16 each), pair p uses x row pair_tok[p]. Returns fp32 [n_pairs, N]."""
+    grp_start[g]..grp_start[g+1]-1 (<= 16 each), pair p uses x row pair_tok[p]. Returns fp32 [n_pairs, N].
+    Expert parallelism: ids are global, this GPU holds [shard_start, shard_start + shard_n); other groups are skipped
+    (zero_out: their output rows are zeroed)."""
     E, N, Kh = w.shape
     K = Kh * 2
     assert xp.dtype == torch.bfloat16 and xp.is_contiguous() and K % 128 == 0 and N % 8 == 0 and max_tokens <= 16
     G = grp_expert.numel()
-    out = torch.empty(n_pairs, N, device=xp.device, dtype=torch.float32)
+    if out is None:
+        out = torch.empty(n_pairs, N, device=xp.device, dtype=torch.float32)
     f = get_function("fp4_tc.cu", "fp4_gemm_tc8" if max_tokens <= 8 else "fp4_gemm_tc16", xp.device)
     WARPS = 4
     grid = ((N // 8 + WARPS - 1) // WARPS, G, 1)
     args = [ctypes.c_void_p(xp.data_ptr()), ctypes.c_int(xp.stride(0)),
             ctypes.c_void_p(w.data_ptr()), ctypes.c_longlong(w.stride(0)), ctypes.c_void_p(s.data_ptr()), ctypes.c_longlong(s.stride(0)),
             ctypes.c_void_p(grp_expert.data_ptr()), ctypes.c_void_p(grp_start.data_ptr()), ctypes.c_void_p(pair_tok.data_ptr()),
-            ctypes.c_void_p(out.data_ptr()), ctypes.c_int(N), ctypes.c_int(N), ctypes.c_int(K)]
+            ctypes.c_void_p(out.data_ptr()), ctypes.c_int(N), ctypes.c_int(N), ctypes.c_int(K),
+            ctypes.c_int(shard_start), ctypes.c_int(min(shard_n, E)), ctypes.c_int(1 if zero_out else 0)]
     launch(f, grid, (WARPS * 32, 1, 1), args, xp.device)
     return out
+
+
+# --------------------------------------------------------------------------- device-side GPU messaging (expert parallelism)
+def p2p_copy(dst: torch.Tensor, src: torch.Tensor, device: torch.device):
+    """Copy src (contiguous, size multiple of 16 B) into dst (possibly on another GPU) with a kernel on `device`."""
+    n = src.numel() * src.element_size()
+    assert n % 16 == 0 and dst.numel() * dst.element_size() >= n
+    f = get_function("p2p.cu", "p2p_copy", device)
+    n16 = n // 16
+    launch(f, ((n16 + 255) // 256, 1, 1), (256, 1, 1), [ctypes.c_void_p(dst.data_ptr()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(n16)], device)
+
+
+def p2p_copy_row(dst_base: torch.Tensor, row_idx: torch.Tensor, src: torch.Tensor, device: torch.device):
+    """dst_base[row_idx] = src (row index is an int64 device scalar; rows are src.numel() elements)."""
+    n = src.numel() * src.element_size()
+    assert n % 16 == 0
+    f = get_function("p2p.cu", "p2p_copy_row", device)
+    n16 = n // 16
+    launch(f, ((n16 + 255) // 256, 1, 1), (256, 1, 1), [ctypes.c_void_p(dst_base.data_ptr()), ctypes.c_void_p(row_idx.data_ptr()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(n16)], device)
+
+
+def p2p_sum_rows(dst: torch.Tensor, src: torch.Tensor, device: torch.device):
+    rows, n = src.shape
+    f = get_function("p2p.cu", "p2p_sum_rows", device)
+    launch(f, ((n + 255) // 256, 1, 1), (256, 1, 1), [ctypes.c_void_p(dst.data_ptr()), ctypes.c_void_p(src.data_ptr()), ctypes.c_int(rows), ctypes.c_int(n)], device)
+
+
+def p2p_signal(flag_ptrs: torch.Tensor, seq: torch.Tensor, device: torch.device):
+    """Set the flags at the addresses in flag_ptrs (int64 device tensor on `device`) to the value of seq (int32 device scalar)."""
+    f = get_function("p2p.cu", "p2p_signal", device)
+    launch(f, (1, 1, 1), (1, 1, 1), [ctypes.c_void_p(flag_ptrs.data_ptr()), ctypes.c_int(flag_ptrs.numel()), ctypes.c_void_p(seq.data_ptr())], device)
+
+
+def p2p_wait(flags: torch.Tensor, seq: torch.Tensor, device: torch.device):
+    """Spin (one thread) until all flags (int32 [n] on `device`) >= seq."""
+    f = get_function("p2p.cu", "p2p_wait", device)
+    launch(f, (1, 1, 1), (1, 1, 1), [ctypes.c_void_p(flags.data_ptr()), ctypes.c_int(flags.numel()), ctypes.c_void_p(seq.data_ptr())], device)
+
+
+def p2p_seq_bump(seq: torch.Tensor, device: torch.device):
+    f = get_function("p2p.cu", "p2p_seq_bump", device)
+    launch(f, (1, 1, 1), (1, 1, 1), [ctypes.c_void_p(seq.data_ptr())], device)

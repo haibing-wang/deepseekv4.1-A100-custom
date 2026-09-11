@@ -58,7 +58,8 @@ def _dense(ckpt: Checkpoint, name: str, device):
     return w
 
 
-def load_layer(ckpt: Checkpoint, i: int, device, offload=False) -> dict:
+def load_layer(ckpt: Checkpoint, i: int, device, offload=False, ep: list | None = None) -> dict:
+    """ep: expert parallelism, a list of (device, first_expert, n_experts) shards; the dense part goes to `device`."""
     p = f"layers.{i}."
     w: dict[str, torch.Tensor] = {}
     for n in ckpt.names(p):
@@ -98,6 +99,25 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False) -> dict:
             w["experts.hot"] = {"w13": hw13, "s13": hs13, "w2": hw2, "s2": hs2, "slot": {int(e): k for k, e in enumerate(hot)}, "dummy": n}
         torch.cuda.synchronize(device)
         return w
+    if ep:
+        shards = []
+        for (sd, start, n) in ep:
+            g = lambda *shape: torch.empty(*shape, dtype=torch.uint8, device=sd)
+            sw13, ss13, sw2, ss2 = g(n, 2 * inter, dimh), g(n, 2 * inter, dimh * 2 // 32), g(n, dim, inter // 2), g(n, dim, inter // 32)
+            for j in range(n):
+                q = f"{p}ffn.experts.{start + j}."
+                sw13[j, :inter].copy_(ckpt.get(q + "w1.weight").view(torch.uint8), non_blocking=True)
+                sw13[j, inter:].copy_(ckpt.get(q + "w3.weight").view(torch.uint8), non_blocking=True)
+                ss13[j, :inter].copy_(ckpt.get(q + "w1.scale"), non_blocking=True)
+                ss13[j, inter:].copy_(ckpt.get(q + "w3.scale"), non_blocking=True)
+                sw2[j].copy_(ckpt.get(q + "w2.weight").view(torch.uint8), non_blocking=True)
+                ss2[j].copy_(ckpt.get(q + "w2.scale"), non_blocking=True)
+            shards.append({"device": sd, "start": start, "n": n, "w13": sw13, "s13": ss13, "w2": sw2, "s2": ss2})
+        for sh in shards:
+            torch.cuda.synchronize(sh["device"])
+        own = [sh for sh in shards if sh["device"] == device][0]
+        w.update({"experts.w13": own["w13"], "experts.s13": own["s13"], "experts.w2": own["w2"], "experts.s2": own["s2"], "experts.offload": False, "experts.ep": shards})
+        return w
     if offload:  # experts stay in page-locked host memory; the MoE streams the selected ones per token
         alloc = lambda *shape: torch.empty(*shape, dtype=torch.uint8, pin_memory=True)
     else:
@@ -127,7 +147,9 @@ def choose_hot_experts(stats_path: str, per_layer: int, n_layers: int) -> dict[i
 
 def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max_batch: int = 1,
                budgets_gb: dict[int, float] | None = None, n_layers: int | None = None, engram: bool = True,
-               tokenizer=None, offload_experts=False, hot_experts: int = 0, route_stats: str = "") -> Transformer:
+               tokenizer=None, offload_experts=False, hot_experts: int = 0, route_stats: str = "", ep: bool = False) -> Transformer:
+    """ep: expert parallelism over `devices` (dense layers pipelined over them in order, every layer's experts
+    sharded across all of them; see dsv41/ep.py)."""
     global HOT_EXPERTS
     cfg = json.load(open(os.path.join(ckpt_path, "inference", "config.json")))
     if offload_experts == "cpu" and hot_experts > 0:
@@ -142,7 +164,15 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
     args = Args(cfg, max_batch_size=max_batch, max_seq_len=max_seq_len)
     ckpt = Checkpoint(ckpt_path)
     n_layers = n_layers or cfg["n_layers"]
-    placement = plan_placement(n_layers, devices, budgets_gb, offload=offload_experts)
+    if ep:
+        nd = len(devices)
+        placement = [torch.device(f"cuda:{devices[min(i * nd // n_layers, nd - 1)]}") for i in range(n_layers)]
+        E = cfg["n_routed_experts"]
+        bounds = [E * j // nd for j in range(nd + 1)]
+        ep_shards = [(torch.device(f"cuda:{devices[j]}"), bounds[j], bounds[j + 1] - bounds[j]) for j in range(nd)]
+    else:
+        placement = plan_placement(n_layers, devices, budgets_gb, offload=offload_experts)
+        ep_shards = None
     _host_layers = []
     print("placement:", {str(d): placement.count(d) for d in dict.fromkeys(placement)}, flush=True)
     model = Transformer(args)
@@ -157,7 +187,7 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
             model.shared.index_k[(owner, d)] = torch.zeros(max_batch, rows, cfg["index_head_dim"], dtype=torch.bfloat16, device=d)
     for i in range(n_layers):
         dev = placement[i]
-        w = load_layer(ckpt, i, dev, offload=offload_experts)
+        w = load_layer(ckpt, i, dev, offload=offload_experts, ep=ep_shards)
         model.blocks.append(Block(args, i, w, dev, model.shared))
         del w
         print(f"  layer {i:2d} -> {dev}  ({time.time() - t0:5.0f}s)", flush=True)

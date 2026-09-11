@@ -363,6 +363,7 @@ class MoE:
         self.s2 = w["experts.s2"]  # uint8 [E, dim, inter/32]
         self.inter = self.w2.shape[2] * 2
         self.offload = bool(w.get("experts.offload", False))  # experts in host RAM (streamed to the GPU, or computed on the CPU)
+        self.ep = w.get("experts.ep")  # expert-parallel shards: [{device, start, n, w13, s13, w2, s2}] (see dsv41/ep.py)
         self.host = w.get("experts.host")  # HostExperts: compute the selected experts on the CPU
         self.hot = w.get("experts.hot")  # GPU-resident subset (slot map) computed on the GPU, overlapping the CPU
         if self.host is not None:
@@ -398,6 +399,33 @@ class MoE:
         gu = linear_fp8(x, self.sh_w13).float()
         h = swiglu_quant(gu, None, self.inter, self.swiglu_limit)  # bf16, already FP8-rounded for w2
         return linear_w(h, self.sh_w2).float()
+
+    def _forward_ep(self, xq, eid, tok, weights, n_tok, n_pairs):
+        """Eager / prefill path with sharded experts: each shard computes its pairs on its own device, the
+        per-token sums come back to the owner device (used for prefill; decode uses dsv41/ep.py)."""
+        y = torch.zeros(n_tok, self.dim, device=xq.device, dtype=torch.float32)
+        wflat = weights.flatten().float()
+        pair_rows = torch.arange(n_pairs, device=xq.device, dtype=torch.int32)
+        for sh in self.ep:
+            sel = ((eid >= sh["start"]) & (eid < sh["start"] + sh["n"])).nonzero().flatten()
+            if sel.numel() == 0:
+                continue
+            d = sh["device"]
+            xs = xq.to(d)
+            le = (eid[sel] - sh["start"]).to(d)
+            tk = tok[sel].to(d)
+            wt = wflat[sel].to(d)
+            m = sel.numel()
+            local_rows = torch.arange(m, device=d, dtype=torch.int32)
+            ones = torch.ones(m, device=d)
+            block_m = 64
+            p1 = GroupedPairs(le, tk, local_rows, ones, block_m)
+            gu = grouped_fp4_gemm(xs, sh["w13"], sh["s13"], p1, m)
+            hq = swiglu_quant(gu, wt.contiguous(), self.inter, self.swiglu_limit)
+            p2 = GroupedPairs(le, local_rows, tk, ones, block_m)
+            ys = grouped_fp4_gemm(hq, sh["w2"], sh["s2"], p2, n_tok)
+            y += ys.to(xq.device)
+        return y
 
     def _pair_tables(self, n_tok: int, device):
         """Constant index tensors for a dispatch of n_tok tokens (cached: no per-step allocations)."""
@@ -524,7 +552,9 @@ class MoE:
         tok, pair_rows, ones = self._pair_tables(n_tok, x.device)
         xq = fake_quant_fp8(x, 32)
         eid = indices.flatten().to(torch.int32)
-        if self.offload:
+        if self.ep:
+            y = self._forward_ep(xq, eid, tok, weights, n_tok, n_pairs)
+        elif self.offload:
             if n_tok == 1 and self.host is not None:
                 y = self._decode_cpu(xq, indices, weights)
             elif n_tok <= 16:

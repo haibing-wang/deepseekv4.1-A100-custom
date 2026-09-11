@@ -413,8 +413,8 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
         {
             const int n0 = (int)((long)N13 * node / g_nodes), n1 = (int)((long)N13 * (node + 1) / g_nodes);
             // work item size: ~8 items per thread (balance) but not below 8 rows (streaming); g_ch1 caps it
-            int CH = (int)(((long)(n1 - n0) * E) / ((long)g_cores_per_node * 8)) & ~1;
-            if (CH < 8) CH = 8;
+            int CH = (int)(((long)(n1 - n0) * E) / ((long)g_cores_per_node * 6)) & ~1;
+            if (CH < 48) CH = 48;  // shorter streams cost more than the imbalance they fix (measured)
             if (CH > g_ch1) CH = g_ch1;
             const int nch = (n1 - n0 + CH - 1) / CH, total = E * nch;
             for (;;) {
@@ -455,8 +455,8 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
         // stage 3: out[n] = sum_e h[e] . w2[e][n]  (dynamic 32-row output chunks per node; expert-outer inside a chunk)
         {
             const int n0 = (int)((long)dim * node / g_nodes), n1 = (int)((long)dim * (node + 1) / g_nodes);
-            int CH = (int)((n1 - n0) / (g_cores_per_node * 6)) & ~1;
-            if (CH < 8) CH = 8;
+            int CH = (int)((n1 - n0) / (g_cores_per_node * 4)) & ~1;
+            if (CH < 32) CH = 32;
             if (CH > g_ch3) CH = g_ch3;
             const int nch = (n1 - n0 + CH - 1) / CH;
             for (;;) {
