@@ -18,7 +18,13 @@ import torch.nn.functional as F
 
 import os
 
-from .cukern import fp4_gemm_tc, p2p_copy, p2p_copy_row, p2p_multicast, p2p_seq_bump, p2p_signal, p2p_stamp, p2p_sum_rows, p2p_wait
+from .cukern import fp4_gemm_tc, memcpy_async, p2p_copy, p2p_copy_row, p2p_multicast, p2p_seq_bump, p2p_signal, p2p_stamp, p2p_sum_rows, p2p_wait
+
+# messages by copy engine (cuMemcpyAsync) instead of kernel P2P stores: the engines win for large messages
+# (B=16: 164 KB routing packets, multicast 553 -> 76 us) while kernel stores have the lower latency for small
+# ones (B=1: 41 vs ~10 us). "auto" switches at DSV41_EP_DMA_BYTES.
+EP_DMA_MODE = os.environ.get("DSV41_EP_DMA", "auto")
+EP_DMA_BYTES = int(os.environ.get("DSV41_EP_DMA_BYTES", "32768"))
 
 EP_TRACE = os.environ.get("DSV41_EP_TRACE", "0") == "1"  # per-layer device timestamps (owner: 6 points, peer: 2)
 from .decode import DecodeRuntime, HC_FORK
@@ -65,7 +71,8 @@ class EPRuntime(DecodeRuntime):
         for d in self.devs:
             self.xqp_out[d], self.eid8[d], self.wt8[d] = views(self.outbox[d])
             self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d] = views(self.inbox[d])
-        self.part_in = {d: torch.zeros(B, self.nd, dim, dtype=torch.float32, device=d) for d in self.devs}  # [b, sender, dim]
+        self.part_in = {d: torch.zeros(self.nd, B, dim, dtype=torch.float32, device=d) for d in self.devs}  # [sender, b, dim]
+        self.part_out = {d: torch.zeros(B, dim, dtype=torch.float32, device=d) for d in self.devs}  # a peer's summed partial before the DMA
         self.flag_route = {d: torch.zeros(nl, dtype=torch.int32, device=d) for d in self.devs}
         self.flag_part = {d: torch.zeros(nl, self.nd, dtype=torch.int32, device=d) for d in self.devs}
         self.flag_hop = {d: torch.zeros(nl + 1, dtype=torch.int32, device=d) for d in self.devs}
@@ -95,12 +102,17 @@ class EPRuntime(DecodeRuntime):
         for d in self.devs:
             self._tc_tables(B * topk, d, topk)
         self.mcast_counter = {d: torch.zeros(1, dtype=torch.int32, device=d) for d in self.devs}
+        self.dma_route = EP_DMA_MODE == "1" or (EP_DMA_MODE == "auto" and msg_bytes > EP_DMA_BYTES)
+        self.dma_part = EP_DMA_MODE == "1" or (EP_DMA_MODE == "auto" and B * dim * 4 > EP_DMA_BYTES)
         self.graphs = {}
         self.logits = torch.zeros(B, self.cfg["vocab_size"], dtype=torch.float32, device=self.devs[-1])
         self.first_layer = {d: min(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
         self.last_layer = {d: max(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
         self.dry = False  # dry pass: no device-side waits / signals (only to compile and load every kernel)
-        self.trace = {d: torch.zeros(nl, 8, dtype=torch.int64, device=d) for d in self.devs} if EP_TRACE else None
+        # every device works on its own non-blocking stream: a cross-device memcpy on a legacy default stream
+        # would synchronise with the peer's default stream and deadlock against the flag waits
+        self.streams = {d: torch.cuda.Stream(d) for d in self.devs}
+        self.trace = {d: torch.zeros(nl, 16, dtype=torch.int64, device=d) for d in self.devs} if EP_TRACE else None
 
     def _stamp(self, d, L, k):
         if self.trace is not None:
@@ -149,12 +161,20 @@ class EPRuntime(DecodeRuntime):
         self._stamp(d, L, 1)
         (pre_out, post, comb), side, x, xq, xf, xqp = self._hc_sub(blk, h, blk.hc_ffn, pre_n, blk.ffn_norm_w, want_f32=True, want_perm=True,
                                                                  out={"yqp": self.xqp_out[d]})
+        self._stamp(d, L, 8)
         scores = F.linear(xf, moe.gate_w)
         eid, wt = self.eid8[d], self.wt8[d]
         gate_topk(scores, moe.gate_bias, moe.gate_temp, moe.topk, moe.route_scale, moe.score_func, moe.norm_topk_prob and moe.topk > 1, eid=eid, wt=wt)
-        # routing + activation to every peer and the flags: one launch
+        self._stamp(d, L, 9)
+        # routing + activation to every peer, then the flags
         if not self.dry:
-            p2p_multicast(self.sig_inbox[d], self.outbox[d], self.sig_route[L], self.seq[d], d, counter=self.mcast_counter[d])
+            if self.dma_route:
+                for p in self.devs:
+                    if p != d:
+                        memcpy_async(self.inbox[p], self.outbox[d], d)
+                p2p_signal(self.sig_route[L], self.seq[d], d)
+            else:
+                p2p_multicast(self.sig_inbox[d], self.outbox[d], self.sig_route[L], self.seq[d], d, counter=self.mcast_counter[d])
         self._stamp(d, L, 2)
         xqp = self.xqp_out[d]
         # own shard and, on a second stream, the shared expert, while the peers work
@@ -164,7 +184,7 @@ class EPRuntime(DecodeRuntime):
         with torch.cuda.stream(side2):
             ys = self._shared_expert(moe, xq)
         y_loc = self._experts_shard(d, xqp, eid, wt, moe)
-        p2p_sum_rows(self.part_in[d][:, self.idx[d]], y_loc, d, groups=self.B, dst_stride=self.part_in[d].stride(0))
+        p2p_sum_rows(self.part_in[d][self.idx[d]], y_loc, d, groups=self.B)
         main.wait_stream(side2)
         self._stamp(d, L, 3)
         # wait for the peers' partials (own slot is raised by a local signal so the whole row can be waited on)
@@ -172,7 +192,7 @@ class EPRuntime(DecodeRuntime):
         self._wait(self.flag_part[d][L], d)
         self._stamp(d, L, 4)
         self._hc_join(side, d)
-        hc_post2_(None, h, post, comb, y2=self.part_in[d], ys=ys)
+        hc_post2_(None, h, post, comb, y2=self.part_in[d], ys=ys, y2_sum_first=True)
         self._stamp(d, L, 5)
         return pre_out
 
@@ -199,7 +219,11 @@ class EPRuntime(DecodeRuntime):
         self._wait(self.flag_route[d][L : L + 1], d)
         self._stamp(d, L, 6)
         y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d], blk.ffn)
-        p2p_sum_rows(self.part_in[o][:, self.idx[d]], y, d, groups=self.B, dst_stride=self.part_in[o].stride(0))  # straight into the owner's inbox column
+        if self.dma_part:
+            p2p_sum_rows(self.part_out[d], y, d, groups=self.B)
+            memcpy_async(self.part_in[o][self.idx[d]], self.part_out[d], d)
+        else:
+            p2p_sum_rows(self.part_in[o][self.idx[d]], y, d, groups=self.B)  # straight into the owner's inbox row
         self._signal(self.sig_part[(L, d)], d)
         self._stamp(d, L, 7)
 
@@ -262,7 +286,8 @@ class EPRuntime(DecodeRuntime):
         # 3) one graph per device
         self.dry = True
         for d in self.devs:
-            self.token_graph(d)
+            with torch.cuda.stream(self.streams[d]):
+                self.token_graph(d)
             torch.cuda.synchronize(d)
         self.dry = False
         for d in self.devs:
@@ -271,21 +296,14 @@ class EPRuntime(DecodeRuntime):
             self.flag_part[d].zero_()
             self.flag_hop[d].zero_()
         for _ in range(2):
-            for d in self.devs:
-                self.token_begin(d)
-            for L in range(len(self.m.blocks)):
-                for d in self.devs:
-                    self.layer_section(L, d)
-            for d in self.devs:
-                self.token_end(d)
+            self._eager_token()
             for d in self.devs:
                 torch.cuda.synchronize(d)
         if not self.use_graphs:
             return
         for d in self.devs:
             with torch.cuda.device(d):
-                s = torch.cuda.Stream(d)
-                s.wait_stream(torch.cuda.current_stream(d))
+                s = self.streams[d]
                 torch.cuda.synchronize(d)
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g, stream=s, capture_error_mode="thread_local"):
@@ -293,6 +311,19 @@ class EPRuntime(DecodeRuntime):
                 self.graphs[d] = g
         for d in self.devs:
             torch.cuda.synchronize(d)
+
+    def _eager_token(self):
+        """One token without graphs, the devices interleaved per layer on their own streams."""
+        for d in self.devs:
+            with torch.cuda.stream(self.streams[d]):
+                self.token_begin(d)
+        for L in range(len(self.m.blocks)):
+            for d in self.devs:
+                with torch.cuda.stream(self.streams[d]):
+                    self.layer_section(L, d)
+        for d in self.devs:
+            with torch.cuda.stream(self.streams[d]):
+                self.token_end(d)
 
     @torch.inference_mode()
     def step(self, token, pos: int) -> torch.Tensor:
@@ -308,11 +339,11 @@ class EPRuntime(DecodeRuntime):
                 if blk.engram is not None:
                     emb = blk.engram.table.lookup(hashes[:, :, blk.engram.layer_hash_index, :], blk.device).flatten(-2)
                     self.eng_in[blk.layer_id].copy_(emb)
-        for d in self.devs:
-            if self.use_graphs and d in self.graphs:
+        if self.use_graphs and self.graphs:
+            for d in self.devs:
                 self.graphs[d].replay()
-            else:
-                self.token_graph(d)
+        else:
+            self._eager_token()
         torch.cuda.synchronize(self.devs[-1])
         return self.logits
 
@@ -329,7 +360,8 @@ def trace_report(rt: "EPRuntime") -> str:
         t = tr[o][L]
         peers = [d for d in rt.devs if d != o]
         pc = [tr[d][L, 7].item() - tr[d][L, 6].item() for d in peers]  # peer compute + push (its own clock)
-        parts = {"attn+hc": t[1] - t[0], "gate+route": t[2] - t[1], "own experts || shared": t[3] - t[2], "wait partials": t[4] - t[3],
+        parts = {"attn+hc": t[1] - t[0], "  hc_sub2": t[8] - t[1], "  gate+topk": t[9] - t[8], "  multicast": t[2] - t[9],
+                 "own experts || shared": t[3] - t[2], "wait partials": t[4] - t[3],
                  "hc_post": t[5] - t[4], "layer": t[5] - t[0], "peer compute+push (max)": max(pc), "peer compute+push (mean)": sum(pc) / len(pc)}
         for k, v in parts.items():
             agg.setdefault(k, []).append(float(v))

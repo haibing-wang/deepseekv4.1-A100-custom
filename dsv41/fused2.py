@@ -445,11 +445,11 @@ def gate_topk(scores: torch.Tensor, bias: torch.Tensor, temp: float, topk: int, 
 
 # --------------------------------------------------------------------------- hc_post (in place), optionally summing the MoE outputs
 @triton.jit
-def _hc_post2_kernel(X, Y2, YS, R, POST, COMB, D: tl.constexpr, HC: tl.constexpr, BLOCK_D: tl.constexpr, NSUM: tl.constexpr):
+def _hc_post2_kernel(X, Y2, YS, R, POST, COMB, y2_row_stride, y2_sum_stride, D: tl.constexpr, HC: tl.constexpr, BLOCK_D: tl.constexpr, NSUM: tl.constexpr):
     cb = tl.program_id(0)
     row = tl.program_id(1)
     X += row * D
-    Y2 += row * NSUM * D
+    Y2 += row * y2_row_stride
     YS += row * D
     R += row * HC * D
     POST += row * HC
@@ -459,7 +459,7 @@ def _hc_post2_kernel(X, Y2, YS, R, POST, COMB, D: tl.constexpr, HC: tl.constexpr
     if NSUM > 0:
         x = tl.zeros((BLOCK_D,), tl.float32)
         for k in tl.static_range(NSUM):
-            x += tl.load(Y2 + k * D + cols, mask=mask, other=0.0)
+            x += tl.load(Y2 + k * y2_sum_stride + cols, mask=mask, other=0.0)
         x += tl.load(YS + cols, mask=mask, other=0.0).to(tl.float32)
         x = x.to(tl.bfloat16).to(tl.float32)
     else:
@@ -477,16 +477,23 @@ def _hc_post2_kernel(X, Y2, YS, R, POST, COMB, D: tl.constexpr, HC: tl.constexpr
         tl.store(R + i * D + cols, acc.to(tl.bfloat16), mask=mask)
 
 
-def hc_post2_(x, residual, post, comb, y2=None, ys=None):
+def hc_post2_(x, residual, post, comb, y2=None, ys=None, y2_sum_first=False):
     """In-place hyper-connection post mix: residual [B, 1, hc, d] bf16 <- post * x + comb^T residual.
-    Either x (bf16 [B, d]) or the MoE pieces y2 (fp32 [B, nsum, d] or [nsum, d] for B = 1, routed expert outputs)
-    + ys (bf16 [B, d], shared expert). post [B, hc], comb [B, hc, hc] (leading B optional when B = 1)."""
+    Either x (bf16 [B, d]) or the MoE pieces y2 (fp32 [B, nsum, d], or [nsum, d] for B = 1, or [nsum, B, d] with
+    y2_sum_first) + ys (bf16 [B, d], shared expert). post [B, hc], comb [B, hc, hc] (leading B optional when B = 1)."""
     hc, d = residual.shape[-2], residual.shape[-1]
     B = residual.shape[0]
     assert hc == 4 and residual.is_contiguous()
-    nsum = 0 if y2 is None else y2.shape[-2]
+    if y2 is None:
+        nsum, rs, ss = 0, 0, 0
+    elif y2_sum_first:
+        y2 = y2.contiguous()
+        nsum, rs, ss = y2.shape[0], d, y2.shape[1] * d
+    else:
+        y2 = y2.contiguous()
+        nsum, rs, ss = y2.shape[-2], y2.shape[-2] * d, d
     with torch.cuda.device(residual.device):
-        _hc_post2_kernel[(triton.cdiv(d, 1024), B)](x if x is not None else residual, y2.contiguous() if y2 is not None else residual,
+        _hc_post2_kernel[(triton.cdiv(d, 1024), B)](x if x is not None else residual, y2 if y2 is not None else residual,
                                                      ys.contiguous() if ys is not None else residual,
-                                                     residual, post.contiguous(), comb.contiguous(), D=d, HC=hc, BLOCK_D=1024, NSUM=nsum, num_warps=4)
+                                                     residual, post.contiguous(), comb.contiguous(), rs, ss, D=d, HC=hc, BLOCK_D=1024, NSUM=nsum, num_warps=4)
     return residual

@@ -253,3 +253,15 @@ def p2p_stamp(dst: torch.Tensor, device: torch.device):
     """Write the GPU global timer (ns) into dst (int64 scalar on `device`), stream-ordered."""
     f = get_function("p2p.cu", "p2p_stamp", device)
     launch(f, (1, 1, 1), (1, 1, 1), [ctypes.c_void_p(dst.data_ptr())], device)
+
+
+_cuda.cuMemcpyAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+
+
+def memcpy_async(dst: torch.Tensor, src: torch.Tensor, device: torch.device, nbytes: int | None = None):
+    """cuMemcpyAsync(dst, src) on `device`'s current stream (unified addressing: dst may live on a peer GPU; the copy
+    engines do the transfer, which matters across sockets where kernel-initiated P2P stores crawl)."""
+    n = src.numel() * src.element_size() if nbytes is None else nbytes
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream(device).cuda_stream
+        _check(_cuda.cuMemcpyAsync(ctypes.c_void_p(dst.data_ptr()), ctypes.c_void_p(src.data_ptr()), n, ctypes.c_void_p(stream)), "cuMemcpyAsync")
