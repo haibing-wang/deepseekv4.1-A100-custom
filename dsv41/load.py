@@ -11,7 +11,7 @@ from .engram import Engram, EngramLayout, HostEngramTable, NgramHashState
 from .model import Args, Block, Transformer
 from . import cukern
 from .quant import tile_fp4, tile_fp4_scales
-from .w8 import ENABLED as W8_ENABLED, W8
+from .w8 import BF16_COPY, BF16_RESERVE_GB, ENABLED as W8_ENABLED, W8
 from .quant import dequant_fp8_block
 from .stio import Checkpoint
 
@@ -149,6 +149,28 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False, ep: list | None 
     return w
 
 
+def keep_bf16_copies(model, reserve_gb: float = BF16_RESERVE_GB) -> None:
+    """bf16 copies of the dense FP8 weights for many-row steps (w8.W8.keep_bf16), largest matrices first, on each
+    device only as long as `reserve_gb` stays free for activations, caches and graphs."""
+    per_dev: dict = {}
+    for blk in model.blocks:
+        for mod in (blk.attn, blk.ffn):
+            for v in vars(mod).values():
+                if isinstance(v, W8) and v.bf16w is None:
+                    per_dev.setdefault(v.device, []).append(v)
+    for dev, ws in per_dev.items():
+        ws.sort(key=lambda w: -(w.shape[0] * w.shape[1]))
+        kept = 0
+        for w in ws:
+            free, _ = torch.cuda.mem_get_info(dev)
+            need = w.shape[0] * w.shape[1] * 2
+            if free - need < reserve_gb * (1 << 30):
+                continue
+            w.keep_bf16()
+            kept += need
+        print(f"  bf16 dense copies on {dev}: {kept / (1 << 30):.2f} GiB", flush=True)
+
+
 def choose_hot_experts(stats_path: str, per_layer: int, n_layers: int) -> dict[int, list[int]]:
     """Top-`per_layer` experts of each layer by decode hit count (from --route-stats)."""
     st = torch.load(stats_path)
@@ -237,5 +259,7 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
             blk.engram = Engram(cfg["dim"], cfg["hc_mult"], layout, HostEngramTable(weight, scale),
                                 _dense(ckpt, p + "wkv.weight", dev), ckpt.get(p + "q_weight", dev), ckpt.get(p + "k_weight", dev), cfg["norm_eps"])
             blk.engram.layer_hash_index = li
+    if BF16_COPY and not offload_experts:
+        keep_bf16_copies(model)
     print(f"loaded in {time.time() - t0:.0f}s", flush=True)
     return model

@@ -85,3 +85,48 @@ extern "C" __global__ void p2p_stamp(long long* dst) {
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     *dst = t;
 }
+
+
+// MoE dispatch in one launch (one block): from the router's (token, expert, weight) pairs build the expert-sorted
+// tables the grouped FP4 GEMM wants — histogram, prefix, scatter, groups of <= gmax pairs — instead of a sort and
+// a dozen small kernels. The order of a token's pairs within an expert is arbitrary (atomic cursors); every pair
+// row is computed independently and summed per token in fixed j order, so the results do not depend on it.
+//   eid [n] int32, wt [n] fp32 (pair p = token p / topk) -> tok_sorted [n], wt_sorted [n], inv [n] (sorted slot of
+//   pair p), grp_expert [n] (-1 beyond the last group), grp_start [n + 1].
+#define DISPATCH_MAX_E 512
+extern "C" __global__ void moe_dispatch(const int* __restrict__ eid, const float* __restrict__ wt, int n, int topk, int E, int gmax,
+                                        int* __restrict__ tok_sorted, float* __restrict__ wt_sorted, int* __restrict__ inv,
+                                        int* __restrict__ grp_expert, int* __restrict__ grp_start) {
+    __shared__ int count[DISPATCH_MAX_E], start[DISPATCH_MAX_E], gbase[DISPATCH_MAX_E], cursor[DISPATCH_MAX_E];
+    __shared__ int total_groups;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    for (int e = tid; e < E; e += nt) { count[e] = 0; cursor[e] = 0; }
+    __syncthreads();
+    for (int p = tid; p < n; p += nt) atomicAdd(&count[eid[p]], 1);
+    __syncthreads();
+    if (tid == 0) {  // serial prefix over E experts (a few hundred): pair starts and group bases
+        int s = 0, g = 0;
+        for (int e = 0; e < E; ++e) {
+            start[e] = s; gbase[e] = g;
+            s += count[e];
+            g += (count[e] + gmax - 1) / gmax;
+        }
+        total_groups = g;
+    }
+    __syncthreads();
+    for (int p = tid; p < n; p += nt) {
+        const int e = eid[p];
+        const int pos = start[e] + atomicAdd(&cursor[e], 1);
+        tok_sorted[pos] = p / topk;
+        wt_sorted[pos] = wt[p];
+        inv[p] = pos;
+    }
+    for (int e = tid; e < E; e += nt) {
+        const int ng = (count[e] + gmax - 1) / gmax;
+        for (int g = 0; g < ng; ++g) { grp_expert[gbase[e] + g] = e; grp_start[gbase[e] + g] = start[e] + g * gmax; }
+    }
+    const int G = total_groups;
+    for (int g = G + tid; g < n; g += nt) { grp_expert[g] = -1; grp_start[g] = n; }
+    if (tid == 0) grp_start[G] = n;
+    if (tid == 0) grp_start[n] = n;
+}

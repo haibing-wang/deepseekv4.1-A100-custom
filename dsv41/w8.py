@@ -49,8 +49,13 @@ def untile(w8: torch.Tensor) -> torch.Tensor:
     return w8.view(N // 16, K // 64, 16, 64).permute(0, 2, 1, 3).reshape(N, K).contiguous()
 
 
+BF16_COPY = os.environ.get("DSV41_W8_BF16_COPY", "1") == "1"  # keep a bf16 copy for steps with many rows (see linear_w)
+BF16_ROWS = int(os.environ.get("DSV41_W8_BF16_ROWS", "64"))   # rows from which cuBLAS on the bf16 copy beats the fp8 kernels
+BF16_RESERVE_GB = float(os.environ.get("DSV41_W8_BF16_RESERVE_GB", "6"))  # free memory to leave per device when keeping copies
+
+
 class W8:
-    __slots__ = ("w8", "s8", "shape", "device", "tiled")
+    __slots__ = ("w8", "s8", "shape", "device", "tiled", "bf16w")
 
     def __init__(self, w8: torch.Tensor, s8: torch.Tensor, permuted: bool = False, tiled: bool | None = None):
         """w8: uint8 e4m3 bits [N, K] (natural k order unless permuted=True, then also already tiled if tiled=True);
@@ -68,14 +73,24 @@ class W8:
         self.s8 = s8.contiguous()
         self.shape = (N, K)
         self.device = w8.device
+        self.bf16w = None
 
     @property
     def dtype(self):
         return torch.bfloat16
 
     def bf16(self) -> torch.Tensor:
+        if self.bf16w is not None:
+            return self.bf16w
         w = untile(self.w8) if self.tiled else self.w8
         return dequant_fp8_block(unpermute_k(w).view(torch.float8_e4m3fn), self.s8)
+
+    def keep_bf16(self) -> "W8":
+        """Materialize the bf16 copy (2x the bytes): from BF16_ROWS rows on cuBLAS on it beats the fp8 kernels
+        (256 rows, N=5120 K=8192: 193 -> 113 us), and prefill no longer dequantizes per call."""
+        if self.bf16w is None:
+            self.bf16w = self.bf16().contiguous()
+        return self
 
     @staticmethod
     def cat(ws: list) -> "W8":
@@ -90,7 +105,7 @@ def linear_w(x: torch.Tensor, w) -> torch.Tensor:
         return F.linear(x, w)
     lead = x.shape[:-1]
     x2 = x.reshape(-1, x.shape[-1])
-    if x2.shape[0] <= MAX_TC_ROWS:
+    if x2.shape[0] <= MAX_TC_ROWS and (w.bf16w is None or x2.shape[0] < BF16_ROWS):
         from .cukern import fp8_gemm_tc
         y = fp8_gemm_tc(x2.contiguous().to(torch.bfloat16), w.w8, w.s8, tiled=w.tiled)
     else:
@@ -103,7 +118,7 @@ def oproj_a(o: torch.Tensor, wo_a, n_groups: int, rank: int) -> torch.Tensor:
     b, s, g, d = o.shape
     if not isinstance(wo_a, W8):
         return torch.einsum("bsgd,grd->bsgr", o, wo_a.view(n_groups, rank, -1)).flatten(2)
-    if b * s <= MAX_TC_ROWS:
+    if b * s <= MAX_TC_ROWS and (wo_a.bf16w is None or b * s < BF16_ROWS):
         from .cukern import fp8_gemm_tc
         return fp8_gemm_tc(o.reshape(b * s * g, d).contiguous(), wo_a.w8, wo_a.s8, group_cols=rank, tiled=wo_a.tiled).view(b, s, -1)
     return torch.einsum("bsgd,grd->bsgr", o, wo_a.bf16().view(n_groups, rank, -1)).flatten(2)

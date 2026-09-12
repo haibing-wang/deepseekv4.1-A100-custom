@@ -321,53 +321,26 @@ class DecodeRuntime:
             gu = fp4_gemm_tc(xqp, w13, s13, eid.reshape(-1), starts, tok, n, 1, shard_start=shard[0], shard_n=shard[1], zero_out=False)
             hqp = swiglu_quant(gu, wt.reshape(-1), inter, limit, permute=True)
             return fp4_gemm_tc(hqp, w2, s2, eid.reshape(-1), starts, rows, n, 1, shard_start=shard[0], shard_n=shard[1], zero_out=True)
-        # ---- bucket the n pairs by expert (all static shapes; padded groups have expert -1 and are skipped)
-        e = eid.reshape(-1).to(torch.int64)
-        se, order = torch.sort(e, stable=True)
-        tok_sorted = (order // topk).to(torch.int32)
-        wt_sorted = wt.reshape(-1)[order].contiguous()
-        ar = torch.arange(n, device=d)
-        is_new = torch.ones(n, dtype=torch.bool, device=d)
-        is_new[1:] = se[1:] != se[:-1]
+        # ---- bucket the n pairs by expert in one launch (static shapes; padded groups have expert -1 and are skipped)
         gmax = cukern.FP4_W_MAX if cukern.FP4_W_LAYOUT else 16  # tokens per group the kernels handle
-        if B > gmax:  # split longer runs of the same expert
-            gid0 = torch.cumsum(is_new.to(torch.int64), 0) - 1
-            first = torch.full((n,), n, dtype=torch.int64, device=d).scatter_reduce_(0, gid0, torch.where(is_new, ar, torch.full_like(ar, n)), "amin")
-            is_new = is_new | (((ar - first[gid0]) % gmax) == 0)
-        gid = torch.cumsum(is_new.to(torch.int64), 0) - 1
-        grp_expert = torch.full((n,), -1, dtype=torch.int32, device=d).scatter_(0, gid, se.to(torch.int32))
-        grp_start = torch.full((n + 1,), n, dtype=torch.int32, device=d)
-        grp_start.scatter_reduce_(0, gid, torch.where(is_new, ar, torch.full_like(ar, n)).to(torch.int32), "amin")
+        tok_sorted, wt_sorted, inv, grp_expert, grp_start = cukern.moe_dispatch(eid.reshape(-1).to(torch.int32).contiguous(), wt.reshape(-1).contiguous(),
+                                                                                topk, w13.shape[0] if shard[1] >= 1 << 29 else self.cfg["n_routed_experts"], gmax, d)
         gu = fp4_gemm_tc(xqp, w13, s13, grp_expert, grp_start, tok_sorted, n, min(B, gmax), shard_start=shard[0], shard_n=shard[1], zero_out=False)
         hqp = swiglu_quant(gu, wt_sorted, inter, limit, permute=True)
-        rows = ar.to(torch.int32)
+        rows = torch.arange(n, device=d, dtype=torch.int32)
         y2s = fp4_gemm_tc(hqp, w2, s2, grp_expert, grp_start, rows, n, min(B, gmax), shard_start=shard[0], shard_n=shard[1], zero_out=True)
-        inv = torch.empty_like(order).scatter_(0, order, ar)
-        return y2s[inv]
+        return y2s[inv.to(torch.int64)]
 
     def experts_tc_prepare(self, xqp, w13, s13, eid, wt, inter, limit, n, d, topk, shard):
         """First half of experts_tc for B > 1: bucketing, w13 GEMM and SwiGLU. Returns (hqp, tables) for experts_tc_w2."""
         B = n // topk
         gmax = cukern.FP4_W_MAX if cukern.FP4_W_LAYOUT else 16
-        e = eid.reshape(-1).to(torch.int64)
-        se, order = torch.sort(e, stable=True)
-        tok_sorted = (order // topk).to(torch.int32)
-        wt_sorted = wt.reshape(-1)[order].contiguous()
-        ar = torch.arange(n, device=d)
-        is_new = torch.ones(n, dtype=torch.bool, device=d)
-        is_new[1:] = se[1:] != se[:-1]
-        if B > gmax:
-            gid0 = torch.cumsum(is_new.to(torch.int64), 0) - 1
-            first = torch.full((n,), n, dtype=torch.int64, device=d).scatter_reduce_(0, gid0, torch.where(is_new, ar, torch.full_like(ar, n)), "amin")
-            is_new = is_new | (((ar - first[gid0]) % gmax) == 0)
-        gid = torch.cumsum(is_new.to(torch.int64), 0) - 1
-        grp_expert = torch.full((n,), -1, dtype=torch.int32, device=d).scatter_(0, gid, se.to(torch.int32))
-        grp_start = torch.full((n + 1,), n, dtype=torch.int32, device=d)
-        grp_start.scatter_reduce_(0, gid, torch.where(is_new, ar, torch.full_like(ar, n)).to(torch.int32), "amin")
+        tok_sorted, wt_sorted, inv, grp_expert, grp_start = cukern.moe_dispatch(eid.reshape(-1).to(torch.int32).contiguous(), wt.reshape(-1).contiguous(),
+                                                                                topk, self.cfg["n_routed_experts"], gmax, d)
         gu = fp4_gemm_tc(xqp, w13, s13, grp_expert, grp_start, tok_sorted, n, min(B, gmax), shard_start=shard[0], shard_n=shard[1], zero_out=False)
         hqp = swiglu_quant(gu, wt_sorted, inter, limit, permute=True)
-        inv = torch.empty_like(order).scatter_(0, order, ar).to(torch.int32)  # inv[b * topk + j] = sorted row of token b's pair j
-        return hqp, {"grp_expert": grp_expert, "grp_start": grp_start, "rows": ar.to(torch.int32), "inv": inv, "n": n, "max_tokens": min(B, gmax), "shard": shard}
+        return hqp, {"grp_expert": grp_expert, "grp_start": grp_start, "rows": torch.arange(n, device=d, dtype=torch.int32), "inv": inv, "n": n,
+                     "max_tokens": min(B, gmax), "shard": shard}
 
     def experts_tc_w2(self, hqp, tabs, w2, s2, out, col0: int, ncols: int):
         """Second half: the w2 GEMM for output columns [col0, col0 + ncols) into out (fp32 [n, dim], expert-sorted rows;

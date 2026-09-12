@@ -320,6 +320,23 @@ def p2p_sum_rows_idx(dst: torch.Tensor, src: torch.Tensor, idx: torch.Tensor, de
                                                           ctypes.c_int(col0), ctypes.c_longlong(dst.stride(0))], device)
 
 
+def moe_dispatch(eid: torch.Tensor, wt: torch.Tensor, topk: int, n_experts: int, gmax: int, device: torch.device):
+    """One-launch expert bucketing (cuda/p2p.cu moe_dispatch): eid int32 [n], wt fp32 [n] ->
+    (tok_sorted int32 [n], wt_sorted fp32 [n], inv int32 [n], grp_expert int32 [n], grp_start int32 [n+1])."""
+    n = eid.numel()
+    assert n_experts <= 512
+    tok_sorted = torch.empty(n, dtype=torch.int32, device=device)
+    wt_sorted = torch.empty(n, dtype=torch.float32, device=device)
+    inv = torch.empty(n, dtype=torch.int32, device=device)
+    grp_expert = torch.empty(n, dtype=torch.int32, device=device)
+    grp_start = torch.empty(n + 1, dtype=torch.int32, device=device)
+    f = get_function("p2p.cu", "moe_dispatch", device)
+    launch(f, (1, 1, 1), (1024, 1, 1), [ctypes.c_void_p(eid.data_ptr()), ctypes.c_void_p(wt.data_ptr()), ctypes.c_int(n), ctypes.c_int(topk),
+                                       ctypes.c_int(n_experts), ctypes.c_int(gmax), ctypes.c_void_p(tok_sorted.data_ptr()), ctypes.c_void_p(wt_sorted.data_ptr()),
+                                       ctypes.c_void_p(inv.data_ptr()), ctypes.c_void_p(grp_expert.data_ptr()), ctypes.c_void_p(grp_start.data_ptr())], device)
+    return tok_sorted, wt_sorted, inv, grp_expert, grp_start
+
+
 def p2p_signal(flag_ptrs: torch.Tensor, seq: torch.Tensor, device: torch.device):
     """Set the flags at the addresses in flag_ptrs (int64 device tensor on `device`) to the value of seq (int32 device scalar)."""
     f = get_function("p2p.cu", "p2p_signal", device)
