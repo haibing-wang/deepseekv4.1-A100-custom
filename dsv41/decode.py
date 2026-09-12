@@ -241,7 +241,10 @@ class DecodeRuntime:
             self.cand_buf[d][..., :n_pos].copy_(cand)
         elif I.uses_candidates:
             score = score.masked_fill(~self.cand_buf[d][..., :n_pos], -torch.inf)
-        idxs = score.topk(self.topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        k = min(self.topk, n_pos)  # caches shorter than the index top-k (short max_seq_len): pad with invalid slots
+        idxs = score.topk(k, dim=-1, sorted=False).indices.sort(dim=-1).values
+        if k < self.topk:  # (torch.full on the device: F.pad's fill value is a host copy, not allowed in graph capture)
+            idxs = torch.cat([idxs, torch.full(idxs.shape[:-1] + (self.topk - k,), n_pos, dtype=idxs.dtype, device=d)], dim=-1)
         if FUSED2:
             return torch.where(idxs < cl, idxs, -1).to(torch.int32)
         return torch.where(idxs < compress_len, idxs + self.win, -1).to(torch.int32)

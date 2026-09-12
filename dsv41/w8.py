@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from .quant import dequant_fp8_block
 
 ENABLED = os.environ.get("DSV41_W8", "1") == "1"
-MAX_TC_ROWS = 512  # rows handled by the tensor-core kernels (fp8_tc <= 16, fp8_tcw <= 64, fp8_tcg beyond); then dequantize + cuBLAS
+MAX_TC_ROWS = 4096  # rows handled by the tensor-core kernels (fp8_tc <= 16, fp8_tcw <= 64, fp8_tcg beyond, any M); dequantize + cuBLAS only past this (prefill)
 
 
 # Byte order of every 16-k group in memory (cuda/fp8_tcg.cu): position 4t + j holds k = 2t + j (j < 2) or 2t + 8 + j - 2,
