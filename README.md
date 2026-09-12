@@ -233,8 +233,10 @@ speed = aggregate / S):
 | 192 | 143.3, 1340 | – | – |
 | 256 | 174.5, 1467 | – | – |
 
-(measured before the tiled expert layout below; after it: S=1 K=5 91, S=8 K=5 361, S=32 K=3 633, S=32 plain
-571, S=64 plain 873, S=256 plain **1,769 tok/s** at 144.7 ms/step.)
+(measured before the tiled expert layout below; after it, the fused dispatch kernel, two n-tiles per warp for
+9-32-token expert groups, bf16 copies of the dense weights for >= 64-row steps and 97,97,97,93 shards:
+S=1 K=5 93, S=8 K=5 373, S=32 K=3 651, S=32 plain 600, S=64 plain 930, S=256 plain **1,972 tok/s** at
+129.8 ms/step — per layer at 256 rows: attention + dense 1.63 ms, experts 1.02 ms, partial exchange 0.14 ms.)
 
 The best setting depends on the number of contexts: 5 drafts up to 8 contexts, 3 drafts from 12 to 40,
 no MTP from about 44 contexts on (the verification rows then touch nearly every expert of every layer, so
@@ -262,6 +264,12 @@ stored tiled at load time (`quant.tile_fp4`: `[N/16][K/128][16 rows][64 B]`, sca
 Triton kernel reads the same layout) and every group goes through the shared-memory kernel: 1 token per expert
 1.02 -> 1.46 TB/s, 8 tokens 0.86 -> 1.35, 16 tokens 0.52 -> 1.21 TB/s; the expert phase of a 128-row step
 fell from 1.74 to 1.16 ms per layer. The same tiling on the FP8 dense weights (`w8.tile`) is worth ~5%.
+
+What did not help, measured: removing the FP4 decode entirely (+2%: the kernel is at the load ceiling for
+<= 8 tokens and at the x-tile L2 traffic for more), 8 warps per block (occupancy halves), a 128-row FP8
+block, warp phase staggering, and sending the partials in column chunks overlapped with the w2 GEMM
+(the half-width launches cost more than the transfer they hide). A one-launch MoE dispatch kernel
+(`moe_dispatch`: histogram, prefix, scatter, groups) replaced the sort-based bucketing: 148 -> 20 us at 256 rows.
 
 Why A100 can do this without FP8/FP4 units: an E4M3 byte placed as `s<<15 | e<<7 | m<<4` is a bf16 whose
 value is the FP8 value times 2^-120 (the subnormals line up too), so one bf16x2 multiply by 2^(scale-7)
