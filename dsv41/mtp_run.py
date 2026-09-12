@@ -29,7 +29,7 @@ from encoding import encode_messages
 S = a.seqs
 K = 1 if a.no_mtp else 1 + a.drafts
 devs = [int(d) for d in a.devices.split(",")]
-model = load_model(a.ckpt, devs, max_seq_len=a.max_seq_len, max_batch=S * K, max_seqs=S, engram=True, tokenizer=tok, ep=a.ep, n_layers=a.n_layers,
+model = load_model(a.ckpt, devs, max_seq_len=a.max_seq_len, max_batch=S * K, max_seqs=S, engram=True, tokenizer=tok, ep=a.ep, n_layers=a.n_layers, bf16_copies=False, last_light=3 if a.no_mtp else 12,
                    ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None,
                    budgets_gb={int(k): float(v) for k, v in (kv.split(":") for kv in a.budgets.split(",") if kv)} or None)
 if a.ep:
@@ -43,7 +43,6 @@ if a.n_layers:  # truncated model: read the last three layers instead of DSpark'
     tl_ = [nl - 3, nl - 2, nl - 1]
     rt.target_layers = tl_
     rt.main_hid = {lid: torch.zeros(S * K, model.args.dim, dtype=torch.bfloat16, device=model.blocks[lid].device) for lid in tl_}
-rt.capture()
 last = model.blocks[-1].device
 ds = None
 if not a.no_mtp:
@@ -52,6 +51,12 @@ if not a.no_mtp:
     if a.n_layers:
         ds.targets = rt.target_layers
     model.collect_main_hidden = ds.targets
+from dsv41.load import keep_bf16_copies
+from dsv41.w8 import BF16_COPY
+if BF16_COPY and not a.n_layers:  # after DSpark's weights, before the graphs are captured (they bake in the kernel choice)
+    keep_bf16_copies(model, extra_reserve_gb={last: 3.0} if ds is not None else None)  # the draft's graphs live on the last device
+rt.capture()
+if ds is not None:
     ds.capture(S)
 lines = [l.strip() for l in open(a.prompts) if l.strip()]
 lines = (lines * (-(-S // len(lines))))[:S]  # cycle the prompt file when S exceeds it

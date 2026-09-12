@@ -73,7 +73,7 @@ class Engine:
         self.model = load_model(ckpt, devices or list(range(torch.cuda.device_count())), max_seq_len=max_seq_len,
                                 budgets_gb=budgets, tokenizer=self.tok, offload_experts=offload_experts,
                                 hot_experts=hot_experts, route_stats=route_stats, ep=ep, ep_shards=ep_shards,
-                                max_batch=1 + mtp, max_seqs=1)
+                                max_batch=1 + mtp, max_seqs=1, bf16_copies=False, last_light=12 if mtp else 3)
         if offload_experts:
             from .decode import OffloadDecodeRuntime
             self.rt = OffloadDecodeRuntime(self.model, use_graphs=use_graphs)
@@ -82,14 +82,20 @@ class Engine:
             self.rt = EPRuntime(self.model, use_graphs=use_graphs)
         else:
             self.rt = DecodeRuntime(self.model, use_graphs=use_graphs)
-        if use_graphs:
-            self.rt.capture()
         if mtp:
             from .dspark import DSparkRows
             from .load import Checkpoint
             m = self.model
             self.ds = DSparkRows(Checkpoint(ckpt), m.args, m.blocks[-1].device, m.embed, m.head, m.shared, len(m.blocks), self.rt)
             m.collect_main_hidden = self.ds.targets
+        if not offload_experts:
+            from .load import keep_bf16_copies
+            from .w8 import BF16_COPY
+            if BF16_COPY:  # after every weight is loaded, before the graphs bake in the kernel choice
+                keep_bf16_copies(self.model, extra_reserve_gb={self.model.blocks[-1].device: 3.0} if mtp else None)
+        if use_graphs:
+            self.rt.capture()
+        if mtp:
             self.ds.capture(1)
         self.lock = threading.Lock()
         self.eos = self.tok.eos_token_id

@@ -51,7 +51,7 @@ def untile(w8: torch.Tensor) -> torch.Tensor:
 
 BF16_COPY = os.environ.get("DSV41_W8_BF16_COPY", "1") == "1"  # keep a bf16 copy for steps with many rows (see linear_w)
 BF16_ROWS = int(os.environ.get("DSV41_W8_BF16_ROWS", "64"))   # rows from which cuBLAS on the bf16 copy beats the fp8 kernels
-BF16_RESERVE_GB = float(os.environ.get("DSV41_W8_BF16_RESERVE_GB", "6"))  # free memory to leave per device when keeping copies
+BF16_RESERVE_GB = float(os.environ.get("DSV41_W8_BF16_RESERVE_GB", "4"))  # free memory to leave per device when keeping copies
 
 
 class W8:
